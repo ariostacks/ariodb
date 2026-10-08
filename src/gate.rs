@@ -8,32 +8,82 @@ use crate::audit::AuditLog;
 use crate::classify::{Kind, Statement};
 use crate::config::{Agent, Config};
 use crate::policy::{self, Decision, Mode};
+use crate::rules::{EffectFacts, Facts, Outcome as RuleOutcome, RuleSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 /// Everything shared across connections. The config can be swapped while
 /// running (hot reload); each decision reads the current one.
 pub struct State {
-    config: RwLock<Arc<Config>>,
+    current: RwLock<Arc<Loaded>>,
     pub config_path: PathBuf,
     pub audit: Arc<AuditLog>,
 }
 
+/// A config together with its compiled rules.
+pub struct Loaded {
+    pub config: Arc<Config>,
+    pub rules: Arc<RuleSet>,
+}
+
 impl State {
-    pub fn new(config: Config, config_path: PathBuf, audit: Arc<AuditLog>) -> Arc<State> {
-        Arc::new(State {
-            config: RwLock::new(Arc::new(config)),
+    pub fn new(
+        config: Config,
+        config_path: PathBuf,
+        audit: Arc<AuditLog>,
+    ) -> Result<Arc<State>, String> {
+        let loaded = load(config)?;
+        Ok(Arc::new(State {
+            current: RwLock::new(Arc::new(loaded)),
             config_path,
             audit,
-        })
+        }))
     }
 
     pub fn config(&self) -> Arc<Config> {
-        self.config.read().expect("config lock").clone()
+        self.current.read().expect("config lock").config.clone()
     }
 
-    pub fn replace_config(&self, config: Config) {
-        *self.config.write().expect("config lock") = Arc::new(config);
+    pub fn rules(&self) -> Arc<RuleSet> {
+        self.current.read().expect("config lock").rules.clone()
+    }
+
+    /// Swap in a new config. Rejected (and the old one kept) if its rules
+    /// do not compile.
+    pub fn replace_config(&self, config: Config) -> Result<(), String> {
+        let loaded = load(config)?;
+        *self.current.write().expect("config lock") = Arc::new(loaded);
+        Ok(())
+    }
+}
+
+fn load(config: Config) -> Result<Loaded, String> {
+    let rules = RuleSet::compile(&config.rules)?;
+    Ok(Loaded {
+        config: Arc::new(config),
+        rules: Arc::new(rules),
+    })
+}
+
+/// Watch the config file and reload it when it changes. Policy changes take
+/// effect for the next statement; listen addresses need a restart.
+pub async fn watch_config(state: Arc<State>) {
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut last = modified(&state.config_path);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let now = modified(&state.config_path);
+        if now == last {
+            continue;
+        }
+        last = now;
+        match Config::load(&state.config_path) {
+            Ok(config) => match state.replace_config(config) {
+                Ok(()) => println!("ariodb: reloaded {}", state.config_path.display()),
+                Err(e) => eprintln!("ariodb: kept the previous config: {e}"),
+            },
+            Err(e) => eprintln!("ariodb: kept the previous config: {e}"),
+        }
     }
 }
 
@@ -50,6 +100,8 @@ pub enum Plan {
 pub struct Refusal {
     pub code: &'static str,
     pub message: String,
+    /// The rule that refused, if a rule did.
+    pub rule: Option<String>,
 }
 
 impl Refusal {
@@ -57,28 +109,119 @@ impl Refusal {
         Refusal {
             code: "42501",
             message: message.into(),
+            rule: None,
+        }
+    }
+
+    pub fn by_rule(rule: &str, message: impl Into<String>) -> Refusal {
+        Refusal {
+            code: "42501",
+            message: message.into(),
+            rule: Some(rule.to_string()),
         }
     }
 }
 
-/// Decide whether an agent may run these statements, and how.
+/// Who is asking, for rules and approvals.
+pub struct Ctx<'a> {
+    pub agent: &'a Agent,
+    pub session: &'a str,
+    pub database: &'a str,
+}
+
+/// An approval a rule asked for.
+#[derive(Debug, Clone)]
+pub struct ApprovalNeed {
+    pub rule: String,
+    pub approvers: Vec<String>,
+    pub reason: String,
+}
+
+/// Decide whether an agent may run these statements, and how. The built-in
+/// policy must allow every statement, no rule may deny, and any approval a
+/// rule asks for must be granted.
 pub async fn check(
-    _state: &State,
-    agent: &Agent,
+    state: &State,
+    ctx: &Ctx<'_>,
     statements: &[Statement],
 ) -> Result<Plan, Refusal> {
-    if statements.is_empty() {
-        return Ok(Plan::Read);
-    }
     let mut plan = Plan::Read;
+    let rules = state.rules();
+    let mut needs: Vec<ApprovalNeed> = Vec::new();
     for stmt in statements {
-        match policy::decide(agent, stmt) {
+        match policy::decide(ctx.agent, stmt) {
             Decision::Deny(reason) => return Err(Refusal::new(reason)),
             Decision::Allow(Mode::CheckedWrite) => plan = Plan::Write,
             Decision::Allow(Mode::ReadOnly) => {}
         }
+        match rules.evaluate(&Facts {
+            agent: ctx.agent,
+            statement: stmt,
+            database: ctx.database,
+        }) {
+            RuleOutcome::Deny { rule, reason } => return Err(Refusal::by_rule(&rule, reason)),
+            RuleOutcome::Approve {
+                rule,
+                approvers,
+                reason,
+            } => {
+                if !needs.iter().any(|n| n.rule == rule) {
+                    needs.push(ApprovalNeed {
+                        rule,
+                        approvers,
+                        reason,
+                    });
+                }
+            }
+            RuleOutcome::Allow { .. } | RuleOutcome::NoMatch => {}
+        }
+    }
+    for need in needs {
+        crate::approvals::require(state, ctx, statements, &need).await?;
     }
     Ok(plan)
+}
+
+/// Judge a write by what it actually did, against the row limit, the
+/// agent's tables and any after-stage rules. `Err` means roll it back.
+pub async fn judge_write(
+    state: &State,
+    ctx: &Ctx<'_>,
+    statements: &[Statement],
+    effects: &[Effect],
+) -> Result<(), Refusal> {
+    let config = state.config();
+    judge_effects(&config, ctx.agent, effects)?;
+    let facts = EffectFacts {
+        agent: ctx.agent,
+        statements,
+        database: ctx.database,
+        rows: effects.iter().map(|e| e.rows).sum(),
+        tables: effects.iter().map(|e| e.table.clone()).collect(),
+    };
+    match state.rules().evaluate_effects(&facts) {
+        RuleOutcome::Deny { rule, reason } => {
+            Err(Refusal::by_rule(&rule, format!("rolled back: {reason}")))
+        }
+        RuleOutcome::Approve {
+            rule,
+            approvers,
+            reason,
+        } => {
+            let need = ApprovalNeed {
+                rule,
+                approvers,
+                reason,
+            };
+            crate::approvals::require(state, ctx, statements, &need)
+                .await
+                .map_err(|r| Refusal {
+                    message: format!("rolled back: {}", r.message),
+                    ..r
+                })
+        }
+        RuleOutcome::Allow { .. } | RuleOutcome::NoMatch => Ok(()),
+    }
 }
 
 /// One table changed inside the current transaction.

@@ -8,7 +8,7 @@
 use crate::audit::Entry;
 use crate::classify::{self, Statement};
 use crate::config::Agent;
-use crate::gate::{self, Plan, Refusal, State};
+use crate::gate::{self, Ctx, Plan, Refusal, State};
 use crate::upstream::{DbError, Upstream};
 use crate::wire::{self, WireError};
 use bytes::Bytes;
@@ -39,6 +39,8 @@ pub struct Session {
     pub agent: Agent,
     pub up: Upstream,
     pub state: Arc<State>,
+    /// The database name this session's queries run in.
+    pub database: String,
 }
 
 impl Session {
@@ -52,6 +54,7 @@ impl Session {
             agent,
             up,
             state,
+            database: target.database,
         })
     }
 
@@ -96,6 +99,14 @@ impl Session {
 
     /// Run a simple-protocol query string. Sends result frames to `sink`,
     /// but not the final ReadyForQuery (the caller sends that).
+    pub fn ctx(&self) -> Ctx<'_> {
+        Ctx {
+            agent: &self.agent,
+            session: &self.id,
+            database: &self.database,
+        }
+    }
+
     pub async fn simple<S: Sink>(&mut self, sql: &str, sink: &mut S) -> Result<(), WireError> {
         let started = Instant::now();
         let statements = match classify::classify(sql) {
@@ -114,10 +125,18 @@ impl Session {
         if statements.is_empty() {
             return sink.send(wire::frame(b'I', &[])).await;
         }
-        let plan = match gate::check(&self.state, &self.agent, &statements).await {
+        let plan = match gate::check(&self.state, &self.ctx(), &statements).await {
             Ok(p) => p,
             Err(r) => {
-                self.audit(sql, &statements, "refused", None, Some(&r.message), started);
+                self.audit_rule(
+                    sql,
+                    &statements,
+                    "refused",
+                    None,
+                    Some(&r.message),
+                    r.rule.as_deref(),
+                    started,
+                );
                 return sink
                     .send(wire::error_response(
                         r.code,
@@ -185,16 +204,16 @@ impl Session {
                 return sink.send(wire::error_response(&e.code, &e.message)).await;
             }
         };
-        let config = self.state.config();
         let rows = gate::total_rows(&effects);
-        if let Err(r) = gate::judge_effects(&config, &self.agent, &effects) {
+        if let Err(r) = gate::judge_write(&self.state, &self.ctx(), &statements, &effects).await {
             self.end(false).await?;
-            self.audit(
+            self.audit_rule(
                 sql,
                 &statements,
                 "rolled_back",
                 Some(rows),
                 Some(&r.message),
+                r.rule.as_deref(),
                 started,
             );
             return sink
@@ -221,6 +240,20 @@ impl Session {
         reason: Option<&str>,
         started: Instant,
     ) {
+        self.audit_rule(sql, statements, outcome, rows, reason, None, started);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn audit_rule(
+        &self,
+        sql: &str,
+        statements: &[Statement],
+        outcome: &str,
+        rows: Option<u64>,
+        reason: Option<&str>,
+        rule: Option<&str>,
+        started: Instant,
+    ) {
         let tables = gate::tables(statements);
         self.state.audit.record(&Entry {
             session: &self.id,
@@ -231,6 +264,7 @@ impl Session {
             outcome,
             rows,
             reason,
+            rule,
             latency_ms: Some(started.elapsed().as_millis() as u64),
         });
     }

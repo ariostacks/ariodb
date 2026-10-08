@@ -58,6 +58,8 @@ pub struct Statement {
     pub setting: Option<String>,
     /// COPY ... FROM STDIN, which streams data in a sub-protocol.
     pub copy_in: bool,
+    /// Functions the statement calls, lower case.
+    pub functions: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -105,6 +107,13 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
     let mut tables: Vec<String> = parsed.tables().iter().map(|t| normalise_table(t)).collect();
     tables.sort();
     tables.dedup();
+    let mut functions: Vec<String> = parsed
+        .functions()
+        .iter()
+        .map(|f| f.to_lowercase())
+        .collect();
+    functions.sort();
+    functions.dedup();
     Ok(Statement {
         sql: sql.to_string(),
         kind,
@@ -113,6 +122,7 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
         reason,
         setting,
         copy_in,
+        functions,
     })
 }
 
@@ -427,6 +437,12 @@ mod tests {
         assert_eq!(stmts.len(), 2);
         assert_eq!(stmts[0].tables, vec!["orders"]);
         assert_eq!(stmts[1].tables, vec!["customers"]);
+    }
+
+    #[test]
+    fn finds_functions() {
+        let stmts = classify("SELECT pg_read_file('/etc/x'), lower(name) FROM t").unwrap();
+        assert_eq!(stmts[0].functions, vec!["lower", "pg_read_file"]);
     }
 
     #[test]

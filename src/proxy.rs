@@ -565,7 +565,7 @@ impl Connection {
         // Statements prepared but not run are still checked, so a refused
         // statement fails at Parse, as an agent would expect.
         for stmts in parsed_here.values() {
-            if let Err(r) = gate::check(&self.session.state, &self.session.agent, stmts).await {
+            if let Err(r) = gate::check(&self.session.state, &self.session.ctx(), stmts).await {
                 let text = stmts
                     .iter()
                     .map(|s| s.sql.clone())
@@ -574,7 +574,7 @@ impl Connection {
                 return self.refuse(&r, &text, stmts, final_sync).await;
             }
         }
-        let plan = match gate::check(&self.session.state, &self.session.agent, &executed).await {
+        let plan = match gate::check(&self.session.state, &self.session.ctx(), &executed).await {
             Ok(p) => p,
             Err(r) => return self.refuse(&r, &sql, &executed, final_sync).await,
         };
@@ -637,7 +637,13 @@ impl Connection {
             } else {
                 let effects = gate::parse_effects(&outcome.internal_rows);
                 rows = Some(gate::total_rows(&effects));
-                let verdict = gate::judge_effects(&config, &self.session.agent, &effects);
+                let verdict = gate::judge_write(
+                    &self.session.state,
+                    &self.session.ctx(),
+                    &executed,
+                    &effects,
+                )
+                .await;
                 let end = if verdict.is_ok() { COMMIT } else { ROLLBACK };
                 let tail = end_with(end);
                 let finish = self.exchange(&tail, Hold::All).await?;

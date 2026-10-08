@@ -132,7 +132,28 @@ pub async fn setup(config: &Config) -> Result<(), String> {
     }
     println!("ok   wal_level is logical");
 
-    let tables = config.protected_tables();
+    let mut tables = config.protected_tables();
+    let wildcard = config
+        .agents
+        .iter()
+        .any(|a| a.access == crate::config::Access::ReadWrite && a.tables.iter().any(|t| t == "*"));
+    if wildcard {
+        // An agent may write to any table, so protect every user table.
+        let rows = client
+            .query(
+                "SELECT table_schema || '.' || table_name FROM information_schema.tables
+                 WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema')",
+                &[],
+            )
+            .await
+            .map_err(err)?;
+        tables.extend(
+            rows.iter()
+                .map(|r| crate::classify::normalise_table(&r.get::<_, String>(0))),
+        );
+        tables.sort();
+        tables.dedup();
+    }
     if tables.is_empty() {
         return Err("no agent has write access, so there is nothing to protect".to_string());
     }

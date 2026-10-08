@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bytes = "1.12.1"
+cel-interpreter = "0.10.0"
 clap = { version = "4.6.7", features = ["derive"] }
 futures = "0.3.34"
 hex = "0.4.3"

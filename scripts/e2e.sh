@@ -108,6 +108,19 @@ name = "support-bot"
 access = "read_only"
 tables = ["orders"]
 token_env = "E2E_BOT_TOKEN"
+
+[[rules]]
+name = "no-file-functions"
+condition = "sets.intersects(sql.functions, ['pg_read_file', 'pg_ls_dir'])"
+verdict = "deny"
+reason = "Filesystem-reaching functions are off-limits"
+
+[[rules]]
+name = "no-big-customer-changes"
+stage = "after"
+condition = "'customers' in effects.tables && effects.rows > 30"
+verdict = "deny"
+reason = "changes of over 30 rows that touch customers need a human"
 EOF
 export E2E_AGENT_TOKEN=agent-token-local-test-only E2E_BOT_TOKEN=bot-token-local-test-only
 export ARIODB_JOURNAL_URL=postgres://ariodb_journal:journal-local-test-only@127.0.0.1:$PORT/app
@@ -138,6 +151,47 @@ expect "bulk write rolled back"         "the limit is 500"       "$(agent coding
 expect "trigger side effect rolled back" "order_log"             "$(agent coding-agent $T "UPDATE orders SET status='audited' WHERE id = 5")"
 expect "BEGIN refused"                  "own transaction"        "$(agent coding-agent $T "BEGIN")"
 [ "$(fingerprint)" = "$BEFORE" ] && pass "refused statements changed nothing" || fail "data changed"
+
+echo "rules"
+expect "rule denies by function" "Filesystem-reaching" "$(agent coding-agent $T "SELECT pg_ls_dir('.')")"
+expect "after-stage rule rolls back" "over 30 rows" "$(agent coding-agent $T "DELETE FROM customers WHERE id IN (4, 5)")"
+expect "after-stage rollback left no trace" "2" "$(admin -tAc "SELECT count(*) FROM customers WHERE id IN (4, 5)")"
+cp "$WORK/ariodb.toml" "$WORK/ariodb.toml.orig"
+cat >> "$WORK/ariodb.toml" <<'TOML'
+
+[[rules]]
+name = "hot-added"
+condition = "sql.verb == 'select' && 'customers' in sql.tables"
+verdict = "deny"
+reason = "added while running"
+TOML
+sleep 3
+expect "hot reload picks up a new rule" "added while running" "$(agent coding-agent $T "SELECT count(*) FROM customers")"
+cp "$WORK/ariodb.toml.orig" "$WORK/ariodb.toml"
+sleep 3
+expect "hot reload removes it again" "(1 row)" "$(agent coding-agent $T "SELECT count(*) FROM customers")"
+printf 'this is not toml [[[' >> "$WORK/ariodb.toml"
+sleep 3
+expect "a broken config is rejected, the old one kept" "(1 row)" "$(agent coding-agent $T "SELECT count(*) FROM customers")"
+expect "and the reason is logged" "kept the previous config" "$(cat "$WORK/serve.log")"
+cp "$WORK/ariodb.toml.orig" "$WORK/ariodb.toml"
+sleep 3
+
+mkdir -p "$WORK/fixtures"
+cat > "$WORK/fixtures/policy.json" <<'JSON'
+[
+  {"name": "file functions denied", "action": {"agent": "coding-agent", "sql": {"statement": "SELECT pg_read_file('/etc/hosts')"}}, "match": {"verdict": "deny", "rule": "no-file-functions"}},
+  {"name": "drops denied by policy", "action": {"agent": "coding-agent", "sql": {"statement": "DROP TABLE orders"}}, "match": {"verdict": "deny", "rule": "policy"}},
+  {"name": "reads allowed", "action": {"agent": "support-bot", "sql": {"statement": "SELECT * FROM orders"}}, "match": {"verdict": "allow"}}
+]
+JSON
+$BIN "${CFG[@]}" test "$WORK/fixtures" >/dev/null && pass "ariodb test: fixtures match (exit 0)" || fail "fixtures should match"
+cat > "$WORK/fixtures/drift.json" <<'JSON'
+{"name": "wrong expectation", "action": {"agent": "support-bot", "sql": {"statement": "SELECT * FROM orders"}}, "match": {"verdict": "deny"}}
+JSON
+set +e; $BIN "${CFG[@]}" test "$WORK/fixtures" >/dev/null; code=$?; set -e
+[ $code -eq 1 ] && pass "ariodb test: drift exits 1" || fail "drift should exit 1, got $code"
+expect "explain shows the deciding rule" "deny  (decided by: no-file-functions)" "$($BIN "${CFG[@]}" explain --agent coding-agent "SELECT pg_read_file('x')")"
 
 echo "agent work and undo"
 OUT=$(agent coding-agent $T "UPDATE orders SET status='refunded', total=0 WHERE id IN (10,11,12); INSERT INTO customers VALUES (100,'New Co',NULL); INSERT INTO orders (customer_id,status,total) VALUES (100,'paid',9.99); DELETE FROM customers WHERE id = 3")

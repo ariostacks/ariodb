@@ -23,6 +23,9 @@ pub struct Config {
     /// Extra database logins, so different agents can use different roles.
     #[serde(default)]
     pub credentials: Vec<Credential>,
+    /// CEL rules on top of each agent's built-in policy.
+    #[serde(default)]
+    pub rules: Vec<crate::rules::RuleConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +140,7 @@ impl Agent {
         let table = crate::classify::normalise_table(table);
         self.tables
             .iter()
-            .any(|t| crate::classify::normalise_table(t) == table)
+            .any(|t| t == "*" || crate::classify::normalise_table(t) == table)
     }
 }
 
@@ -201,6 +204,7 @@ impl Config {
                 "limits.max_rows_per_write must be at least 1".to_string(),
             ));
         }
+        crate::rules::RuleSet::compile(&self.rules).map_err(ConfigError::Problem)?;
         let mut names = std::collections::HashSet::new();
         for agent in &self.agents {
             if !names.insert(agent.name.as_str()) {
@@ -274,7 +278,12 @@ impl Config {
             .agents
             .iter()
             .filter(|a| a.access == Access::ReadWrite)
-            .flat_map(|a| a.tables.iter().map(|t| crate::classify::normalise_table(t)))
+            .flat_map(|a| {
+                a.tables
+                    .iter()
+                    .filter(|t| *t != "*")
+                    .map(|t| crate::classify::normalise_table(t))
+            })
             .collect();
         tables.sort();
         tables.dedup();

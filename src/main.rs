@@ -1,3 +1,4 @@
+mod approvals;
 mod audit;
 mod classify;
 mod config;
@@ -8,6 +9,8 @@ mod mcp;
 mod pgoutput;
 mod policy;
 mod proxy;
+mod rules;
+mod testing;
 mod tls;
 mod undo;
 mod upstream;
@@ -66,6 +69,19 @@ enum Command {
     },
     /// Check the audit log has not been edited
     Audit,
+    /// Replay fixtures against the policy and report verdict drift (for CI)
+    Test {
+        /// A fixture .json file, or a directory of them
+        fixtures: PathBuf,
+    },
+    /// Show what the policy would decide for a statement, without running it
+    Explain {
+        /// The agent name from the config file
+        #[arg(long)]
+        agent: String,
+        /// The SQL to judge
+        sql: String,
+    },
 }
 
 #[tokio::main]
@@ -78,8 +94,33 @@ async fn main() -> ExitCode {
 
     let config = match Config::load(&cli.config) {
         Ok(c) => Arc::new(c),
-        Err(err) => return fail(err.to_string()),
+        Err(err) => {
+            eprintln!("error: {err}");
+            // `test` promises exit code 2 for config errors.
+            return ExitCode::from(if matches!(cli.command, Command::Test { .. }) {
+                2
+            } else {
+                1
+            });
+        }
     };
+
+    if let Command::Test { fixtures } = &cli.command {
+        return match testing::load_fixtures(fixtures).and_then(|f| testing::run(&config, &f)) {
+            Ok((passed, 0)) => {
+                println!("\n{passed} fixtures match");
+                ExitCode::SUCCESS
+            }
+            Ok((passed, drifted)) => {
+                println!("\n{drifted} drifted, {passed} match");
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
 
     let result = match cli.command {
         Command::Check => {
@@ -102,6 +143,16 @@ async fn main() -> ExitCode {
             apply,
             skip_conflicts,
         } => undo_command(&config, &session, apply, skip_conflicts).await,
+        Command::Test { .. } => unreachable!("handled above"),
+        Command::Explain { agent, sql } => rules::RuleSet::compile(&config.rules).map(|rules| {
+            let p = testing::preview(&config, &rules, &agent, &sql, "");
+            let rule = if p.rule.is_empty() {
+                "-".to_string()
+            } else {
+                p.rule.clone()
+            };
+            println!("{}  (decided by: {rule})  {}", p.verdict, p.reason);
+        }),
         Command::Audit => audit::verify(Path::new(&config.journal.dir))
             .map(|n| println!("audit log intact: {n} entries")),
     };
@@ -126,10 +177,11 @@ fn open_audit(config: &Config) -> Result<Arc<audit::AuditLog>, String> {
 fn make_state(config: &Config, path: &Path) -> Result<Arc<gate::State>, String> {
     let audit = open_audit(config)?;
     let fresh = Config::load(path).map_err(|e| e.to_string())?;
-    Ok(gate::State::new(fresh, path.to_path_buf(), audit))
+    gate::State::new(fresh, path.to_path_buf(), audit)
 }
 
 async fn serve(state: Arc<gate::State>) -> Result<(), String> {
+    tokio::spawn(gate::watch_config(state.clone()));
     let config = state.config();
     if config.journal.enabled {
         let journal_config = config.clone();
