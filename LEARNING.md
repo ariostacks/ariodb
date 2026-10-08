@@ -1,23 +1,24 @@
-# Learning Rust through ariodb
 
-One entry per concept, pointing at the code that uses it.
-
-## Stage 1: a command-line tool that reads a config file
+## Stages 2 to 6: the working system
 
 | Concept | What it is | Where |
 |---|---|---|
-| Cargo | Rust's build tool and package manager. `Cargo.toml` lists dependencies; `cargo build`, `cargo test`, `cargo run`. | `Cargo.toml` |
-| Crates | Libraries from crates.io. We use `clap` (command line), `serde` and `toml` (reading config). | `Cargo.toml` |
-| Modules | `mod config;` pulls in `src/config.rs`. `pub` makes items visible outside the module. | `src/main.rs` |
-| Structs | Named groups of fields, like a class with no methods yet. | `Config`, `Limits` in `src/config.rs` |
-| Enums | A value that is exactly one of several variants. Variants can carry data. | `FailureMode`, `Access`, `ConfigError` |
-| `match` | Handles every variant of an enum. The compiler refuses to build if you miss one. | `print_summary` in `src/main.rs` |
-| Derive | `#[derive(...)]` asks the compiler to write standard code for you, such as debug printing or config parsing. | Top of each struct |
-| `impl` blocks | Attach functions (methods) to a type. `&self` borrows the value the method is called on. | `impl Config` |
-| `Result` and `?` | Functions that can fail return `Result<Ok, Err>`. `?` returns the error early if there is one. No exceptions. | `Config::load` |
-| `map_err` | Converts one error type into another, here into our own `ConfigError`. | `Config::load`, `Config::from_toml` |
-| Traits | A shared set of methods a type promises to provide. `Display` decides how an error prints. | `impl fmt::Display for ConfigError` |
-| Borrowing (`&`) | Passing `&config` lends the value without giving it away. | `print_summary(&config)` |
-| `let ... else` | Unpacks a value, or leaves the function early if it does not match. | `redact_url` |
-| Tests | `#[cfg(test)]` code only builds for `cargo test`. `#[test]` marks a test. | Bottom of `src/config.rs` |
-| Exit codes | `ExitCode::FAILURE` lets scripts tell success from failure. | `main` |
+| Nested enums and deep `match` | The parsed SQL is a tree of enums. `match` walks it and handles each statement type. | `judge` in `src/classify.rs` |
+| `Option` and `?` on options | A value that may be missing. `.and_then`, `.as_deref` and `let ... else` handle it without null crashes. | `classify_one`, `option_is_true` |
+| Recursion | Judging `EXPLAIN ANALYZE <statement>` means judging the inner statement with the same function. | `judge` calling itself |
+| Deriving `Ord` | Lets kinds be compared, so "the most dangerous part wins" is one line. | `Kind`, `worst_of` |
+| `async` / `.await` | Code that waits on the network without blocking a thread. Tokio runs it. | `src/exec.rs`, `src/proxy.rs` |
+| `Arc` | Shared ownership across tasks: one config and one audit log, many connections. | `serve` in `src/main.rs` |
+| `Mutex` | One task at a time may use the shared value. Tokio's mutex can be held across `.await`. | `QueryHandler::session`, `AuditLog` |
+| `tokio::spawn` | Runs a task in the background, such as the journal next to the proxy. | `serve` in `src/main.rs` |
+| Traits from libraries | Implementing `SimpleQueryHandler` and `AuthSource` plugs our code into pgwire. | `src/proxy.rs` |
+| `#[async_trait]` | Lets traits have async methods. | `src/proxy.rs` |
+| `serde` derive | Turns structs into JSON and back for the journal, the audit log and MCP. | `TxnRecord` in `src/journal.rs` |
+| `#[serde(untagged)]` | Picks the enum variant by the shape of the JSON. | `Cell` in `src/journal.rs` |
+| Byte parsing | Reading big-endian integers and null-terminated strings from a byte slice, returning errors instead of panicking. | `Reader` in `src/pgoutput.rs` |
+| `HashMap` / `BTreeMap` | Lookup tables. `BTreeMap` keeps keys sorted. | `src/undo.rs` |
+| Closures | Small inline functions that capture variables, such as the error converters. | `let err = \|e\| ...` in `src/undo.rs` |
+| Iterators | `.iter().map().filter().collect()` chains instead of loops. | `effects`, `protected_tables` |
+| Database transactions from Rust | `client.transaction()`, savepoints, commit or rollback. | `apply` in `src/undo.rs` |
+| Hashing | SHA-256 chains each audit line to the one before. | `src/audit.rs` |
+| Integration testing | A shell script drives the real binary against a real database. | `scripts/e2e.sh` |

@@ -1,20 +1,32 @@
 # Example ariodb config. No real credentials belong in this file.
+# Set the real database URL in ARIODB_DATABASE_URL instead.
 
 on_failure = "closed"
 
 [database]
-url = "postgres://app:not-a-real-password@localhost:5432/app"
+url = "postgres://ariodb:not-a-real-password@localhost:5432/app"
 
 [limits]
 max_rows_per_write = 500
 statement_timeout_ms = 5000
 
+[proxy]
+listen = "127.0.0.1:6543"
+
+[journal]
+enabled = true
+dir = ".ariodb"
+slot = "ariodb"
+publication = "ariodb"
+
 [[agents]]
 name = "coding-agent"
 access = "read_write"
 tables = ["orders", "customers"]
+token_env = "ARIODB_TOKEN_CODING_AGENT"
 
 [[agents]]
 name = "support-bot"
 access = "read_only"
 tables = ["orders"]
+token_env = "ARIODB_TOKEN_SUPPORT_BOT"
