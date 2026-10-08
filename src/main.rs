@@ -3,6 +3,7 @@ mod audit;
 mod chsql;
 mod classify;
 mod clickhouse;
+mod clickhouse_native;
 mod config;
 mod dashboard;
 mod dashboard_api;
@@ -275,6 +276,12 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
     tokio::spawn(async move {
         if let Err(e) = clickhouse::serve_http(ch_state).await {
             eprintln!("ariodb: ClickHouse HTTP proxy stopped: {e}");
+        }
+    });
+    let native_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = clickhouse_native::serve(native_state).await {
+            eprintln!("ariodb: ClickHouse native proxy stopped: {e}");
         }
     });
     let dashboard_state = state.clone();

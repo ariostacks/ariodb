@@ -120,4 +120,22 @@ expect "the insert landed" "1" "$(admin "SELECT count() FROM events WHERE id = 5
 expect "query parameters pass through" "user3" "$(curl -s -u analyst:$A "http://127.0.0.1:$PROXY_HTTP/?param_id=3" --data-binary "SELECT user FROM events WHERE id = {id:UInt32}")"
 expect "decisions are logged" "decisions log intact" "$($BIN "${CFG[@]}" audit)"
 
+echo "native protocol (clickhouse-client)"
+for _ in $(seq 1 50); do nc -z 127.0.0.1 $PROXY_NATIVE 2>/dev/null && break; sleep 0.2; done
+cli() { # cli <agent> <token> <sql> [extra args]
+  local agent=$1 token=$2 sql=$3; shift 3
+  docker run --rm "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE \
+    --user "$agent" --password "$token" "$@" --query "$sql" 2>&1 || true
+}
+expect "clickhouse-client reads through ariodb" "1001" "$(cli analyst $A "SELECT count() FROM events")"
+expect "several result rows stream back" "user9" "$(cli analyst $A "SELECT DISTINCT user FROM events ORDER BY user")"
+expect "wrong token refused" "wrong token" "$(cli analyst nope "SELECT 1")"
+expect "other tables refused" "may not use table 'secrets'" "$(cli analyst $A "SELECT * FROM secrets")"
+expect "url() refused over native too" "reaches outside the server" "$(cli analyst $A "SELECT * FROM url('http://169.254.169.254/x', CSV, 'a String')")"
+expect "rules apply over native" "data hold" "$(cli analyst $A "SELECT count() FROM events WHERE user = 'user7'")"
+expect "native inserts refused with a pointer to HTTP" "use ariodb's ClickHouse HTTP interface" "$(cli loader $L "INSERT INTO events VALUES (6000, 'x', 'y')")"
+expect "client settings cannot lift read-only mode" "1001" "$(cli analyst $A "SELECT count() FROM events" --readonly 0)"
+expect "the connection keeps working after a refusal" "1001" "$(docker run --rm "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE --user analyst --password $A --multiquery --query "SELECT * FROM secrets; SELECT count() FROM events" 2>&1 || true; docker run --rm "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE --user analyst --password $A --query "SELECT count() FROM events" 2>&1)"
+expect "uncompressed clients work too" "1001" "$(cli analyst $A "SELECT count() FROM events" --compression 0)"
+
 echo "all ClickHouse checks passed"

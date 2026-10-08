@@ -329,14 +329,6 @@ pub fn classify(sql: &str) -> Result<Statement, String> {
     })
 }
 
-/// The verb rules see for a ClickHouse statement.
-pub fn verb(sql: &str) -> String {
-    tokenize(sql)
-        .ok()
-        .and_then(|t| t.first().and_then(word))
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
