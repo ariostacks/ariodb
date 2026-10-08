@@ -57,7 +57,9 @@ impl Default for Proxy {
 pub struct Credential {
     pub name: String,
     /// Environment variable holding the postgres:// URL for this login.
-    pub url_env: String,
+    pub url_env: Option<String>,
+    /// Or: the name of a secret (see `ariodb secret set`) holding the URL.
+    pub secret: Option<String>,
     pub tls: Option<TlsMode>,
     pub ca_file: Option<String>,
 }
@@ -88,6 +90,8 @@ impl Default for Journal {
 #[derive(Debug, Deserialize)]
 pub struct Database {
     pub url: String,
+    /// The name of a secret holding the URL, used instead of `url`.
+    pub secret: Option<String>,
     /// `disable`, `require` (encrypt, accept any certificate) or `verify`.
     /// Default: `disable` for a database on this host, `verify` otherwise.
     pub tls: Option<TlsMode>,
@@ -120,7 +124,11 @@ pub struct Agent {
     /// Name of the environment variable holding this agent's token.
     /// The token is what the agent uses as its password; it is never the
     /// database password.
-    pub token_env: String,
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// Or: the name of a secret holding the token.
+    #[serde(default)]
+    pub token_secret: Option<String>,
     /// Overrides `limits.max_rows_per_write` for this agent.
     pub max_rows_per_write: Option<u64>,
     /// Which database login this agent's queries run as. Default: `[database]`.
@@ -128,13 +136,6 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// The agent's token, read from its environment variable.
-    pub fn token(&self) -> Option<String> {
-        std::env::var(&self.token_env)
-            .ok()
-            .filter(|t| !t.is_empty())
-    }
-
     /// May this agent touch this table? Names are compared after normalising.
     pub fn allows_table(&self, table: &str) -> bool {
         let table = crate::classify::normalise_table(table);
@@ -221,6 +222,12 @@ impl Config {
                     agent.name
                 )));
             }
+            if agent.token_env.is_some() == agent.token_secret.is_some() {
+                return Err(ConfigError::Problem(format!(
+                    "agent '{}' needs exactly one of token_env or token_secret",
+                    agent.name
+                )));
+            }
             if agent.tables.is_empty() {
                 return Err(ConfigError::Problem(format!(
                     "agent '{}' must list at least one table",
@@ -234,7 +241,30 @@ impl Config {
     /// The real database URL. `ARIODB_DATABASE_URL` wins over the config file,
     /// so the password never needs to live in the file.
     pub fn database_url(&self) -> String {
-        std::env::var("ARIODB_DATABASE_URL").unwrap_or_else(|_| self.database.url.clone())
+        if let Ok(url) = std::env::var("ARIODB_DATABASE_URL") {
+            return url;
+        }
+        if let Some(name) = &self.database.secret {
+            if let Ok(Some(url)) = self.secret(name) {
+                return url;
+            }
+        }
+        self.database.url.clone()
+    }
+
+    /// Read a value from the encrypted secret store.
+    pub fn secret(&self, name: &str) -> Result<Option<String>, String> {
+        crate::secrets::Store::open(Path::new(&self.journal.dir))?.get(name)
+    }
+
+    /// An agent's token, from its environment variable or the secret store.
+    pub fn agent_token(&self, agent: &Agent) -> Option<String> {
+        let value = match (&agent.token_env, &agent.token_secret) {
+            (Some(env), _) => std::env::var(env).ok(),
+            (None, Some(name)) => self.secret(name).ok().flatten(),
+            (None, None) => None,
+        };
+        value.filter(|t| !t.is_empty())
     }
 
     /// Where an agent's queries go, and as which database login.
@@ -251,12 +281,14 @@ impl Config {
                     .iter()
                     .find(|c| &c.name == name)
                     .ok_or_else(|| format!("credential '{name}' is not defined"))?;
-                let url = std::env::var(&cred.url_env).map_err(|_| {
-                    format!(
-                        "credential '{name}': set {} to its postgres:// URL",
-                        cred.url_env
-                    )
-                })?;
+                let url = match (&cred.url_env, &cred.secret) {
+                    (Some(env), _) => std::env::var(env)
+                        .map_err(|_| format!("credential '{name}': set {env} to its postgres:// URL"))?,
+                    (None, Some(secret)) => self.secret(secret)?.ok_or_else(|| {
+                        format!("credential '{name}': secret '{secret}' is not set (ariodb secret set {secret})")
+                    })?,
+                    (None, None) => return Err(format!("credential '{name}' needs url_env or secret")),
+                };
                 Target::from_url(&url, cred.tls.or(self.database.tls), cred.ca_file.clone())
             }
         }

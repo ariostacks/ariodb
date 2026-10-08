@@ -19,9 +19,9 @@ pub async fn serve(state: Arc<State>, agent_name: &str) -> Result<(), String> {
         .agent(agent_name)
         .cloned()
         .ok_or_else(|| format!("unknown agent '{agent_name}'"))?;
-    let expected = agent
-        .token()
-        .ok_or_else(|| format!("set {} to the agent's token", agent.token_env))?;
+    let expected = config
+        .agent_token(&agent)
+        .ok_or_else(|| format!("agent '{}' has no token set", agent.name))?;
     let given = std::env::var("ARIODB_AGENT_TOKEN").unwrap_or_default();
     if given != expected {
         return Err("ARIODB_AGENT_TOKEN does not match this agent's token".to_string());

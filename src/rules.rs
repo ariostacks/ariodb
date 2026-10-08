@@ -345,7 +345,8 @@ mod tests {
             name: "bot".into(),
             access: Access::ReadWrite,
             tables: vec!["*".into()],
-            token_env: "UNUSED".into(),
+            token_env: Some("UNUSED".into()),
+            token_secret: None,
             max_rows_per_write: None,
             credential: None,
         }

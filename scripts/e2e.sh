@@ -77,6 +77,8 @@ CREATE ROLE ariodb_gw LOGIN PASSWORD 'gw-local-test-only';
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ariodb_gw;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ariodb_gw;
 CREATE ROLE ariodb_journal LOGIN REPLICATION PASSWORD 'journal-local-test-only';
+CREATE ROLE ariodb_ro LOGIN PASSWORD 'ro-local-test-only';
+GRANT SELECT ON orders TO ariodb_ro;
 SQL
 
 cat > "$WORK/ariodb.toml" <<EOF
@@ -107,7 +109,13 @@ token_env = "E2E_AGENT_TOKEN"
 name = "support-bot"
 access = "read_only"
 tables = ["orders"]
-token_env = "E2E_BOT_TOKEN"
+token_secret = "bot-token"
+credential = "pg-readonly"
+
+[[credentials]]
+name = "pg-readonly"
+secret = "pg-readonly"
+tls = "require"
 
 [[rules]]
 name = "no-file-functions"
@@ -127,6 +135,11 @@ export ARIODB_JOURNAL_URL=postgres://ariodb_journal:journal-local-test-only@127.
 unset ARIODB_DATABASE_URL ARIODB_ADMIN_URL
 CFG=(--config "$WORK/ariodb.toml")
 
+# Secrets: the support bot's token and its database login live only in the
+# encrypted store.
+printf '%s\n' "$E2E_BOT_TOKEN" | $BIN "${CFG[@]}" secret set bot-token >/dev/null
+printf '%s\n' "postgres://ariodb_ro:ro-local-test-only@127.0.0.1:$PORT/app" | $BIN "${CFG[@]}" secret set pg-readonly >/dev/null
+
 # Setup needs table ownership, so run it as the admin.
 ARIODB_JOURNAL_URL=postgres://postgres:local-test-only-pw@127.0.0.1:$PORT/app $BIN "${CFG[@]}" setup >/dev/null
 pass "setup"
@@ -139,6 +152,14 @@ BEFORE=$(fingerprint)
 T=$E2E_AGENT_TOKEN
 echo "database TLS"
 expect "ariodb reaches the database over TLS" "| t" "$(agent coding-agent $E2E_AGENT_TOKEN "SELECT 'ssl', ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")"
+
+echo "credentials"
+expect "secrets are listed by name" "pg-readonly" "$($BIN "${CFG[@]}" secret list)"
+grep -q 'ro-local-test-only' "$WORK/journal/secrets.json" && fail "secret stored in plaintext" || pass "secrets are encrypted at rest"
+[ "$(stat -f %Lp "$WORK/journal")" = "700" ] && pass "state directory is 0700" || fail "state directory mode is $(stat -f %Lp "$WORK/journal")"
+expect "bot logs in with a token from the store" "(1 row)" "$(agent support-bot $E2E_BOT_TOKEN "SELECT 1")"
+expect "bot's queries run as its own database login" "ariodb_ro" "$(agent support-bot $E2E_BOT_TOKEN "SELECT current_user")"
+expect "agent's queries run as the default login" "ariodb_gw" "$(agent coding-agent $E2E_AGENT_TOKEN "SELECT current_user")"
 
 echo "refusals"
 expect "wrong token is rejected"        "authentication failed"  "$(agent coding-agent wrong "SELECT 1")"

@@ -10,6 +10,7 @@ mod pgoutput;
 mod policy;
 mod proxy;
 mod rules;
+mod secrets;
 mod testing;
 mod tls;
 mod undo;
@@ -74,6 +75,11 @@ enum Command {
         /// A fixture .json file, or a directory of them
         fixtures: PathBuf,
     },
+    /// Manage encrypted secrets (database URLs, agent tokens)
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
     /// Show what the policy would decide for a statement, without running it
     Explain {
         /// The agent name from the config file
@@ -82,6 +88,16 @@ enum Command {
         /// The SQL to judge
         sql: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Store a secret. The value is read from stdin, so it stays out of shell history.
+    Set { name: String },
+    /// List secret names (never values)
+    List,
+    /// Delete a secret
+    Delete { name: String },
 }
 
 #[tokio::main]
@@ -144,6 +160,7 @@ async fn main() -> ExitCode {
             skip_conflicts,
         } => undo_command(&config, &session, apply, skip_conflicts).await,
         Command::Test { .. } => unreachable!("handled above"),
+        Command::Secret { action } => secret_command(&config, action),
         Command::Explain { agent, sql } => rules::RuleSet::compile(&config.rules).map(|rules| {
             let p = testing::preview(&config, &rules, &agent, &sql, "");
             let rule = if p.rule.is_empty() {
@@ -216,6 +233,37 @@ fn classify_command(sql: &str) -> ExitCode {
         }
         Err(e) => fail(e.to_string()),
     }
+}
+
+fn secret_command(config: &Config, action: SecretAction) -> Result<(), String> {
+    let store = secrets::Store::open(Path::new(&config.journal.dir))?;
+    match action {
+        SecretAction::Set { name } => {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_line(&mut value)
+                .map_err(|e| e.to_string())?;
+            let value = value.trim_end_matches(['\n', '\r']);
+            if value.is_empty() {
+                return Err("no value on stdin".to_string());
+            }
+            store.set(&name, value)?;
+            println!("stored secret '{name}'");
+        }
+        SecretAction::List => {
+            for name in store.names()? {
+                println!("{name}");
+            }
+        }
+        SecretAction::Delete { name } => {
+            if store.delete(&name)? {
+                println!("deleted secret '{name}'");
+            } else {
+                return Err(format!("no secret named '{name}'"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sessions_command(config: &Config) -> Result<(), String> {
@@ -311,7 +359,7 @@ fn print_summary(config: &Config) {
             Access::ReadOnly => "read only",
             Access::ReadWrite => "read and write",
         };
-        let token = if agent.token().is_some() {
+        let token = if config.agent_token(agent).is_some() {
             "token set"
         } else {
             "no token"

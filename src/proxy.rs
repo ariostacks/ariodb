@@ -124,7 +124,7 @@ async fn handle(
         .unwrap_or(&reply.body)
         .to_vec();
     let agent = config.agent(&user).cloned();
-    let token = agent.as_ref().and_then(|a| a.token());
+    let token = agent.as_ref().and_then(|a| config.agent_token(a));
     let ok = reply.tag == b'p' && token.is_some_and(|t| constant_time_eq(t.as_bytes(), &given));
     let Some(agent) = agent.filter(|_| ok) else {
         let msg = wire::fatal_response(
