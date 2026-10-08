@@ -48,9 +48,17 @@ pub fn decide(agent: &Agent, stmt: &Statement) -> Decision {
                     .to_string(),
             );
         }
-        Kind::Session => {
-            return Decision::Deny("session settings are not allowed for agents".to_string());
-        }
+        Kind::Session => match stmt.setting.as_deref() {
+            // Settings drivers send when they connect. They change formatting,
+            // not what data is reachable.
+            Some(name) if SAFE_SETTINGS.contains(&name) => Mode::ReadOnly,
+            Some(name) => {
+                return Decision::Deny(format!("agents may not change the '{name}' setting"));
+            }
+            None => {
+                return Decision::Deny("session settings are not allowed for agents".to_string());
+            }
+        },
         Kind::Unknown => {
             return Decision::Deny(format!(
                 "ariodb cannot check this statement: {}",
@@ -58,6 +66,12 @@ pub fn decide(agent: &Agent, stmt: &Statement) -> Decision {
             ));
         }
     };
+
+    if stmt.copy_in {
+        return Decision::Deny(
+            "COPY ... FROM STDIN is not supported through ariodb; use INSERT".to_string(),
+        );
+    }
 
     let blocked = stmt
         .tables
@@ -73,9 +87,29 @@ pub fn decide(agent: &Agent, stmt: &Statement) -> Decision {
     Decision::Allow(mode)
 }
 
+/// Settings that only change how results are formatted or reported.
+/// `search_path` is deliberately absent: it changes which table a name means.
+const SAFE_SETTINGS: &[&str] = &[
+    "application_name",
+    "extra_float_digits",
+    "client_encoding",
+    "datestyle",
+    "timezone",
+    "intervalstyle",
+    "bytea_output",
+    "client_min_messages",
+    "lock_timeout",
+    "statement_timeout",
+    "standard_conforming_strings",
+];
+
 /// Postgres's own catalogue. Agents may read it to discover the schema.
+/// Unqualified `pg_*` names resolve to the catalogue first, because Postgres
+/// always searches `pg_catalog` before other schemas.
 fn is_catalog(table: &str) -> bool {
-    table.starts_with("pg_catalog.") || table.starts_with("information_schema.")
+    table.starts_with("pg_catalog.")
+        || table.starts_with("information_schema.")
+        || (table.starts_with("pg_") && !table.contains('.'))
 }
 
 #[cfg(test)]
@@ -90,6 +124,7 @@ mod tests {
             tables: vec!["orders".into()],
             token_env: "UNUSED".into(),
             max_rows_per_write: None,
+            credential: None,
         }
     }
 
@@ -131,6 +166,14 @@ mod tests {
     }
 
     #[test]
+    fn driver_settings_are_allowed() {
+        assert_eq!(
+            decide_sql(Access::ReadOnly, "SET extra_float_digits = 3"),
+            Decision::Allow(Mode::ReadOnly)
+        );
+    }
+
+    #[test]
     fn catalogue_is_readable_not_writable() {
         assert_eq!(
             decide_sql(Access::ReadOnly, "SELECT relname FROM pg_catalog.pg_class"),
@@ -148,6 +191,8 @@ mod tests {
     #[test]
     fn dangerous_kinds_are_refused() {
         for sql in [
+            "SET search_path = private",
+            "COPY orders FROM STDIN",
             "DELETE FROM orders",
             "DROP TABLE orders",
             "BEGIN",

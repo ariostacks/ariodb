@@ -14,7 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
 /// One committed transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,22 +105,15 @@ fn journal_url(config: &Config) -> String {
     std::env::var("ARIODB_JOURNAL_URL").unwrap_or_else(|_| config.database_url())
 }
 
-async fn connect(url: &str) -> Result<Client, String> {
-    let (client, connection) = tokio_postgres::connect(url, NoTls)
-        .await
-        .map_err(|e| format!("cannot connect: {e}"))?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("ariodb journal: connection closed: {e}");
-        }
-    });
-    Ok(client)
+async fn connect(config: &Config, url: &str) -> Result<Client, String> {
+    let target = config.admin_target(url)?;
+    crate::upstream::admin_client(target.tls, url).await
 }
 
 /// Prepare the database: full before-images on protected tables, a
 /// publication listing them, and a replication slot. Safe to run again.
 pub async fn setup(config: &Config) -> Result<(), String> {
-    let client = connect(&journal_url(config)).await?;
+    let client = connect(config, &journal_url(config)).await?;
     let err = |e: tokio_postgres::Error| {
         e.as_db_error()
             .map(|d| d.message().to_string())
@@ -205,7 +198,7 @@ pub async fn setup(config: &Config) -> Result<(), String> {
 /// Read changes forever, appending to the journal.
 pub async fn run(config: &Config) -> Result<(), String> {
     fs::create_dir_all(&config.journal.dir).map_err(|e| e.to_string())?;
-    let client = connect(&journal_url(config)).await?;
+    let client = connect(config, &journal_url(config)).await?;
     let path = journal_path(config);
     let mut relations: HashMap<u32, (String, String, Vec<Column>)> = HashMap::new();
     println!("ariodb: journal is recording changes to {}", path.display());

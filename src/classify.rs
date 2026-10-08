@@ -54,6 +54,10 @@ pub struct Statement {
     pub tables: Vec<String>,
     /// Why the statement got this kind, for people reading logs.
     pub reason: String,
+    /// For SET and RESET: the setting's name, lower case.
+    pub setting: Option<String>,
+    /// COPY ... FROM STDIN, which streams data in a sub-protocol.
+    pub copy_in: bool,
 }
 
 #[derive(Debug)]
@@ -93,6 +97,11 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
         None => (Kind::Unknown, "empty statement".to_string()),
     };
     let command = top.map(command_of).unwrap_or("OK");
+    let (setting, copy_in) = match top.and_then(|n| n.node.as_ref()) {
+        Some(NodeEnum::VariableSetStmt(v)) => (Some(v.name.to_lowercase()), false),
+        Some(NodeEnum::CopyStmt(c)) => (None, c.is_from && c.filename.is_empty() && !c.is_program),
+        _ => (None, false),
+    };
     let mut tables: Vec<String> = parsed.tables().iter().map(|t| normalise_table(t)).collect();
     tables.sort();
     tables.dedup();
@@ -102,6 +111,8 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
         command,
         tables,
         reason,
+        setting,
+        copy_in,
     })
 }
 

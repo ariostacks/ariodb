@@ -15,6 +15,15 @@ PROXY=6544
 WORK=$(mktemp -d)
 trap 'kill $SERVE_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 
+# Wait for ariodb to listen; fail fast if it exits instead.
+wait_for_proxy() {
+  for _ in $(seq 1 100); do
+    nc -z 127.0.0.1 $PROXY 2>/dev/null && return 0
+    kill -0 $SERVE_PID 2>/dev/null || { cat "$WORK"/serve*.log; fail "ariodb exited"; }
+    sleep 0.2
+  done
+  fail "ariodb did not start"
+}
 pass() { printf '  \033[32mpass\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 
@@ -23,6 +32,11 @@ admin() { docker exec -i $PG psql -q -v ON_ERROR_STOP=1 -U postgres -d app "$@";
 agent() {
   docker run --rm -e PGPASSWORD="$2" postgres:16 \
     psql "host=host.docker.internal port=$PROXY user=$1 dbname=app sslmode=disable" -c "$3" 2>&1 || true
+}
+# Same, but the SQL is a psql script on stdin (needed for \bind).
+agent_script() {
+  printf '%s\n' "$3" | docker run --rm -i -e PGPASSWORD="$2" postgres:16 \
+    psql "host=host.docker.internal port=$PROXY user=$1 dbname=app sslmode=disable" 2>&1 || true
 }
 expect() { # expect <description> <needle> <output>
   if grep -q -- "$2" <<<"$3"; then pass "$1"; else echo "$3"; fail "$1"; fi
@@ -34,7 +48,9 @@ fingerprint() {
 echo "starting Postgres"
 docker rm -f $PG >/dev/null 2>&1 || true
 docker run -d --name $PG -e POSTGRES_PASSWORD=local-test-only-pw -e POSTGRES_DB=app \
-  -p 127.0.0.1:$PORT:5432 postgres:16 -c wal_level=logical >/dev/null
+  -p 127.0.0.1:$PORT:5432 postgres:16 -c wal_level=logical \
+  -c ssl=on -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem \
+  -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key >/dev/null
 until docker exec $PG psql -U postgres -d app -tAc 'SELECT 1' >/dev/null 2>&1; do sleep 1; done
 sleep 2
 until docker exec $PG psql -U postgres -d app -tAc 'SELECT 1' >/dev/null 2>&1; do sleep 1; done
@@ -66,6 +82,7 @@ SQL
 cat > "$WORK/ariodb.toml" <<EOF
 [database]
 url = "postgres://ariodb_gw:gw-local-test-only@127.0.0.1:$PORT/app"
+tls = "require"
 
 [limits]
 max_rows_per_write = 500
@@ -103,10 +120,13 @@ pass "setup"
 
 $BIN "${CFG[@]}" serve >"$WORK/serve.log" 2>&1 &
 SERVE_PID=$!
-until nc -z 127.0.0.1 $PROXY 2>/dev/null; do sleep 0.2; done
+wait_for_proxy
 BEFORE=$(fingerprint)
 
 T=$E2E_AGENT_TOKEN
+echo "database TLS"
+expect "ariodb reaches the database over TLS" "| t" "$(agent coding-agent $E2E_AGENT_TOKEN "SELECT 'ssl', ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")"
+
 echo "refusals"
 expect "wrong token is rejected"        "authentication failed"  "$(agent coding-agent wrong "SELECT 1")"
 expect "read-only agent cannot write"   "is read only"           "$(agent support-bot $E2E_BOT_TOKEN "UPDATE orders SET status='x' WHERE id=1")"
@@ -140,7 +160,46 @@ $BIN "${CFG[@]}" undo --session "$SESSION" --apply --skip-conflicts >/dev/null
 expect "human fix kept, other row restored" "30|human fix" "$(admin -tAc "SELECT id, status FROM orders WHERE id IN (30,31) ORDER BY id")"
 expect "row 31 restored" "31|paid" "$(admin -tAc "SELECT id, status FROM orders WHERE id = 31")"
 
+echo "drivers (extended protocol)"
+# psql's \bind sends Parse/Bind/Execute instead of a simple query.
+expect "prepared read" "(1 row)" "$(agent_script coding-agent $T 'SELECT id, status FROM orders WHERE id = $1 \bind 7 \g')"
+expect "prepared write" "UPDATE 1" "$(agent_script coding-agent $T "UPDATE orders SET status = \$1 WHERE id = \$2 \\bind 'bound' 8 \\g")"
+expect "prepared write landed" "8|bound" "$(admin -tAc "SELECT id, status FROM orders WHERE id = 8")"
+expect "prepared destructive refused" "destructive" "$(agent_script coding-agent $T 'DELETE FROM orders \bind \g')"
+expect "prepared bulk write rolled back" "the limit is 500" "$(agent_script coding-agent $T "UPDATE orders SET status = \$1 WHERE id <= 900 \\bind 'x' \\g")"
+expect "prepared bulk write left no trace" "0" "$(admin -tAc "SELECT count(*) FROM orders WHERE status = 'x'")"
+expect "statement timeout enforced" "statement timeout" "$(agent coding-agent $T "SELECT pg_sleep(8)")"
+
+cat > "$WORK/bench.sql" <<'SQL'
+\set id random(1, 1000)
+SELECT status, total FROM orders WHERE id = :id;
+UPDATE orders SET total = total WHERE id = :id;
+SQL
+for mode in extended prepared; do
+  OUT=$(docker run --rm -v "$WORK:/w" -e PGPASSWORD=$T postgres:16 pgbench -h host.docker.internal -p $PROXY \
+        -U coding-agent -n -M $mode -c 4 -t 50 -f /w/bench.sql app 2>&1 || true)
+  expect "pgbench $mode: 200 transactions" "processed: 200/200" "$OUT"
+done
+
 echo "audit"
 expect "audit chain intact" "audit log intact" "$($BIN "${CFG[@]}" audit)"
+
+echo "TLS"
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null || true
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,DNS:host.docker.internal" \
+  -keyout "$WORK/key.pem" -out "$WORK/cert.pem" >/dev/null 2>&1
+sed -i.bak "s|^\[proxy\]$|[proxy]\ntls_cert = \"$WORK/cert.pem\"\ntls_key = \"$WORK/key.pem\"\nrequire_tls = true|" "$WORK/ariodb.toml"
+$BIN "${CFG[@]}" serve >"$WORK/serve-tls.log" 2>&1 &
+SERVE_PID=$!
+wait_for_proxy
+tls_agent() {
+  docker run --rm -e PGPASSWORD="$T" postgres:16 \
+    psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=$1" -c "$2" 2>&1 || true
+}
+expect "TLS connection works" "SSL connection" "$(docker run --rm -e PGPASSWORD="$T" postgres:16 \
+  psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=require" -c '\conninfo' 2>&1 || true)"
+expect "queries work over TLS" "(1 row)" "$(tls_agent require "SELECT 1")"
+expect "plaintext refused when TLS required" "requires TLS" "$(tls_agent disable "SELECT 1")"
 
 echo "all end-to-end checks passed"

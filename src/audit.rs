@@ -20,6 +20,7 @@ pub struct Entry<'a> {
     pub outcome: &'a str,
     pub rows: Option<u64>,
     pub reason: Option<&'a str>,
+    pub latency_ms: Option<u64>,
 }
 
 pub struct AuditLog {
@@ -128,6 +129,7 @@ mod tests {
             outcome: "allowed",
             rows: Some(1),
             reason: None,
+            latency_ms: None,
         }
     }
 

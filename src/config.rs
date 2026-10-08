@@ -1,5 +1,7 @@
 //! Reading and checking the ariodb config file.
 
+use crate::tls::TlsMode;
+use crate::upstream::Target;
 use serde::Deserialize;
 use std::fmt;
 use std::fs;
@@ -18,20 +20,43 @@ pub struct Config {
     pub proxy: Proxy,
     #[serde(default)]
     pub journal: Journal,
+    /// Extra database logins, so different agents can use different roles.
+    #[serde(default)]
+    pub credentials: Vec<Credential>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct Proxy {
     /// Address agents connect to, as if it were Postgres.
     pub listen: String,
+    /// Certificate and key (PEM) for TLS between agents and ariodb.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    /// Refuse agents that do not use TLS. Tokens are sent as passwords, so
+    /// turn this on whenever agents connect over a network.
+    pub require_tls: bool,
 }
 
 impl Default for Proxy {
     fn default() -> Self {
         Proxy {
             listen: "127.0.0.1:6543".to_string(),
+            tls_cert: None,
+            tls_key: None,
+            require_tls: false,
         }
     }
+}
+
+/// A named database login. Agents pick one with `credential = "<name>"`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Credential {
+    pub name: String,
+    /// Environment variable holding the postgres:// URL for this login.
+    pub url_env: String,
+    pub tls: Option<TlsMode>,
+    pub ca_file: Option<String>,
 }
 
 /// Where and how ariodb records every row an agent changes.
@@ -60,6 +85,11 @@ impl Default for Journal {
 #[derive(Debug, Deserialize)]
 pub struct Database {
     pub url: String,
+    /// `disable`, `require` (encrypt, accept any certificate) or `verify`.
+    /// Default: `disable` for a database on this host, `verify` otherwise.
+    pub tls: Option<TlsMode>,
+    /// Extra trusted CA certificate (PEM) for `verify`.
+    pub ca_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +120,8 @@ pub struct Agent {
     pub token_env: String,
     /// Overrides `limits.max_rows_per_write` for this agent.
     pub max_rows_per_write: Option<u64>,
+    /// Which database login this agent's queries run as. Default: `[database]`.
+    pub credential: Option<String>,
 }
 
 impl Agent {
@@ -177,6 +209,14 @@ impl Config {
                     agent.name
                 )));
             }
+            if let Some(c) = &agent.credential
+                && !self.credentials.iter().any(|cred| &cred.name == c)
+            {
+                return Err(ConfigError::Problem(format!(
+                    "agent '{}' uses credential '{c}', which is not defined",
+                    agent.name
+                )));
+            }
             if agent.tables.is_empty() {
                 return Err(ConfigError::Problem(format!(
                     "agent '{}' must list at least one table",
@@ -191,6 +231,36 @@ impl Config {
     /// so the password never needs to live in the file.
     pub fn database_url(&self) -> String {
         std::env::var("ARIODB_DATABASE_URL").unwrap_or_else(|_| self.database.url.clone())
+    }
+
+    /// Where an agent's queries go, and as which database login.
+    pub fn target_for(&self, agent: &Agent) -> Result<Target, String> {
+        match &agent.credential {
+            None => Target::from_url(
+                &self.database_url(),
+                self.database.tls,
+                self.database.ca_file.clone(),
+            ),
+            Some(name) => {
+                let cred = self
+                    .credentials
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .ok_or_else(|| format!("credential '{name}' is not defined"))?;
+                let url = std::env::var(&cred.url_env).map_err(|_| {
+                    format!(
+                        "credential '{name}': set {} to its postgres:// URL",
+                        cred.url_env
+                    )
+                })?;
+                Target::from_url(&url, cred.tls.or(self.database.tls), cred.ca_file.clone())
+            }
+        }
+    }
+
+    /// The admin connection (setup, journal, undo) uses the default database settings.
+    pub fn admin_target(&self, url: &str) -> Result<Target, String> {
+        Target::from_url(url, self.database.tls, self.database.ca_file.clone())
     }
 
     pub fn agent(&self, name: &str) -> Option<&Agent> {

@@ -1,324 +1,237 @@
-//! Running statements for one agent session.
+//! Running SQL for one agent session over ariodb's own database connection.
 //!
 //! Reads run in a READ ONLY transaction. Writes run in a transaction that is
-//! measured before commit: if it touched more rows than allowed, or any table
-//! the agent may not change (through a trigger, cascade or function), it is
-//! rolled back. The check is on what actually happened, not on how the SQL
-//! was written.
+//! measured before commit, and their results are held back until the
+//! decision is made, so an agent never sees success for a write that was
+//! rolled back.
 
-use crate::audit::{AuditLog, Entry};
+use crate::audit::Entry;
 use crate::classify::{self, Statement};
-use crate::config::{Agent, Config, Limits};
-use crate::policy::{self, Decision, Mode};
+use crate::config::Agent;
+use crate::gate::{self, Plan, Refusal, State};
+use crate::upstream::{DbError, Upstream};
+use crate::wire::{self, WireError};
+use bytes::Bytes;
 use std::sync::Arc;
-use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+use std::time::Instant;
 
-/// The result of one statement, ready to send back to the agent.
-#[derive(Debug)]
-pub enum Outcome {
-    Rows {
-        columns: Vec<String>,
-        rows: Vec<Vec<Option<String>>>,
-    },
-    Done {
-        command: String,
-        rows: u64,
-    },
-    /// ariodb refused the statement, or rolled it back.
-    Refused {
-        message: String,
-    },
-    /// Postgres reported an error.
-    Failed {
-        code: String,
-        message: String,
-    },
+/// Where result frames go: an agent's socket, or a collector for MCP.
+pub trait Sink {
+    fn send(
+        &mut self,
+        frame: Bytes,
+    ) -> impl std::future::Future<Output = Result<(), WireError>> + Send;
+}
+
+/// Collects frames in memory.
+#[derive(Default)]
+pub struct Collect(pub Vec<Bytes>);
+
+impl Sink for Collect {
+    async fn send(&mut self, frame: Bytes) -> Result<(), WireError> {
+        self.0.push(frame);
+        Ok(())
+    }
 }
 
 pub struct Session {
     pub id: String,
-    agent: Agent,
-    limits: Limits,
-    journal: bool,
-    client: Client,
-    audit: Arc<AuditLog>,
-}
-
-/// One table's changes inside the current transaction.
-struct Effect {
-    table: String,
-    rows: i64,
+    pub agent: Agent,
+    pub up: Upstream,
+    pub state: Arc<State>,
 }
 
 impl Session {
-    pub async fn connect(
-        config: &Config,
-        agent: Agent,
-        audit: Arc<AuditLog>,
-    ) -> Result<Session, String> {
-        let (client, connection) = tokio_postgres::connect(&config.database_url(), NoTls)
-            .await
-            .map_err(|e| format!("cannot connect to the database: {e}"))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("ariodb: database connection closed: {e}");
-            }
-        });
-        client
-            .batch_execute(&format!(
-                "SET application_name = 'ariodb:{}'",
-                agent.name.replace('\'', "")
-            ))
-            .await
-            .map_err(|e| format!("cannot configure connection: {e}"))?;
-
+    pub async fn open(state: Arc<State>, agent: Agent) -> Result<Session, String> {
+        let config = state.config();
+        let target = config.target_for(&agent)?;
+        let up = Upstream::connect(&target, &format!("ariodb:{}", agent.name)).await?;
         let id = format!("s-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
         Ok(Session {
             id,
             agent,
-            limits: config.limits.clone(),
-            journal: config.journal.enabled,
-            client,
-            audit,
+            up,
+            state,
         })
     }
 
-    pub fn agent_name(&self) -> &str {
-        &self.agent.name
+    /// Start a transaction for a plan: BEGIN, a statement timeout, and for
+    /// writes, a tag so the journal knows which session made the change.
+    pub async fn begin(&mut self, plan: Plan) -> Result<Result<(), DbError>, WireError> {
+        let config = self.state.config();
+        let mut sql = match plan {
+            Plan::Read => "BEGIN READ ONLY".to_string(),
+            Plan::Write => "BEGIN".to_string(),
+        };
+        sql.push_str(&format!(
+            "; SET LOCAL statement_timeout = {}",
+            config.limits.statement_timeout_ms
+        ));
+        if plan == Plan::Write && config.journal.enabled {
+            let tag =
+                serde_json::json!({ "session": self.id, "agent": self.agent.name }).to_string();
+            sql.push_str(&format!(
+                "; SELECT pg_logical_emit_message(true, 'ariodb', '{}')",
+                tag.replace('\'', "''")
+            ));
+        }
+        Ok(self.up.internal(&sql).await?.map(|_| ()))
     }
 
-    /// Run a query string. Like Postgres, stop at the first statement that
-    /// fails or is refused.
-    pub async fn run(&mut self, sql: &str) -> Vec<Outcome> {
+    pub async fn effects(&mut self) -> Result<Result<Vec<gate::Effect>, DbError>, WireError> {
+        Ok(self
+            .up
+            .internal(gate::EFFECTS_SQL)
+            .await?
+            .map(|r| gate::parse_effects(&r.rows)))
+    }
+
+    pub async fn end(&mut self, commit: bool) -> Result<(), WireError> {
+        let _ = self
+            .up
+            .internal(if commit { "COMMIT" } else { "ROLLBACK" })
+            .await?;
+        Ok(())
+    }
+
+    /// Run a simple-protocol query string. Sends result frames to `sink`,
+    /// but not the final ReadyForQuery (the caller sends that).
+    pub async fn simple<S: Sink>(&mut self, sql: &str, sink: &mut S) -> Result<(), WireError> {
+        let started = Instant::now();
         let statements = match classify::classify(sql) {
             Ok(s) => s,
             Err(e) => {
-                let message = e.to_string();
-                self.log(sql, "unknown".into(), &[], "refused", None, Some(&message));
-                return vec![Outcome::Refused { message }];
+                let r = Refusal::new(e.to_string());
+                self.audit(sql, &[], "refused", None, Some(&r.message), started);
+                return sink
+                    .send(wire::error_response(
+                        r.code,
+                        &format!("ariodb: {}", r.message),
+                    ))
+                    .await;
             }
         };
-        let mut outcomes = Vec::new();
-        for stmt in &statements {
-            let outcome = self.run_one(stmt).await;
-            let stop = matches!(outcome, Outcome::Refused { .. } | Outcome::Failed { .. });
-            outcomes.push(outcome);
-            if stop {
-                break;
+        if statements.is_empty() {
+            return sink.send(wire::frame(b'I', &[])).await;
+        }
+        let plan = match gate::check(&self.state, &self.agent, &statements).await {
+            Ok(p) => p,
+            Err(r) => {
+                self.audit(sql, &statements, "refused", None, Some(&r.message), started);
+                return sink
+                    .send(wire::error_response(
+                        r.code,
+                        &format!("ariodb: {}", r.message),
+                    ))
+                    .await;
             }
-        }
-        outcomes
-    }
-
-    async fn run_one(&mut self, stmt: &Statement) -> Outcome {
-        match policy::decide(&self.agent, stmt) {
-            Decision::Deny(reason) => {
-                self.log_stmt(stmt, "refused", None, Some(&reason));
-                Outcome::Refused { message: reason }
-            }
-            Decision::Allow(Mode::ReadOnly) => self.run_read(stmt).await,
-            Decision::Allow(Mode::CheckedWrite) => self.run_write(stmt).await,
-        }
-    }
-
-    async fn run_read(&mut self, stmt: &Statement) -> Outcome {
-        let begin = format!(
-            "BEGIN READ ONLY; SET LOCAL statement_timeout = {}",
-            self.limits.statement_timeout_ms
-        );
-        if let Err(e) = self.client.batch_execute(&begin).await {
-            return self.failed(stmt, e).await;
-        }
-        let result = self.client.simple_query(&stmt.sql).await;
-        match result {
-            Ok(messages) => {
-                let _ = self.client.batch_execute("COMMIT").await;
-                let outcome = to_outcome(stmt, messages);
-                self.log_stmt(stmt, "allowed", Some(row_count(&outcome)), None);
-                outcome
-            }
-            Err(e) => self.failed(stmt, e).await,
-        }
-    }
-
-    async fn run_write(&mut self, stmt: &Statement) -> Outcome {
-        let limit = self
-            .agent
-            .max_rows_per_write
-            .unwrap_or(self.limits.max_rows_per_write);
-        let begin = format!(
-            "BEGIN; SET LOCAL statement_timeout = {}",
-            self.limits.statement_timeout_ms
-        );
-        if let Err(e) = self.client.batch_execute(&begin).await {
-            return self.failed(stmt, e).await;
-        }
-
-        // Tag the transaction so the journal knows which session made it.
-        if self.journal {
-            let tag =
-                serde_json::json!({ "session": self.id, "agent": self.agent.name }).to_string();
-            let tagged = self
-                .client
-                .execute(
-                    "SELECT pg_logical_emit_message(true, 'ariodb', $1::text)",
-                    &[&tag],
-                )
-                .await;
-            if let Err(e) = tagged {
-                return self.failed(stmt, e).await;
-            }
-        }
-
-        let messages = match self.client.simple_query(&stmt.sql).await {
-            Ok(m) => m,
-            Err(e) => return self.failed(stmt, e).await,
-        };
-        let effects = match self.effects().await {
-            Ok(e) => e,
-            Err(e) => return self.failed(stmt, e).await,
         };
 
-        let total: i64 = effects.iter().map(|e| e.rows).sum();
-        let summary = effects
-            .iter()
-            .map(|e| format!("{} {}", e.rows, e.table))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        if let Some(bad) = effects.iter().find(|e| !self.agent.allows_table(&e.table)) {
-            let reason = format!(
-                "rolled back: the statement also changed table '{}', which agent '{}' may not change ({summary})",
-                bad.table, self.agent.name
-            );
-            return self.roll_back(stmt, total, reason).await;
-        }
-        if total > limit as i64 {
-            let reason = format!(
-                "rolled back: the statement would change {total} rows ({summary}); the limit is {limit}"
-            );
-            return self.roll_back(stmt, total, reason).await;
+        if let Err(e) = self.begin(plan).await? {
+            self.audit(sql, &statements, "failed", None, Some(&e.message), started);
+            let _ = self.end(false).await;
+            return sink.send(wire::error_response(&e.code, &e.message)).await;
         }
 
-        if let Err(e) = self.client.batch_execute("COMMIT").await {
-            return self.failed(stmt, e).await;
-        }
-        let outcome = to_outcome(stmt, messages);
-        self.log_stmt(stmt, "allowed", Some(total.max(0) as u64), None);
-        outcome
-    }
-
-    /// Every table changed in the current transaction, with row counts.
-    /// Includes changes made by triggers, cascades and functions.
-    async fn effects(&self) -> Result<Vec<Effect>, tokio_postgres::Error> {
-        let rows = self
-            .client
-            .query(
-                "SELECT schemaname, relname, (n_tup_ins + n_tup_upd + n_tup_del)::bigint
-                 FROM pg_stat_xact_user_tables
-                 WHERE n_tup_ins + n_tup_upd + n_tup_del > 0
-                 ORDER BY 1, 2",
-                &[],
-            )
-            .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let schema: String = r.get(0);
-                let name: String = r.get(1);
-                Effect {
-                    table: classify::normalise_table(&format!("{schema}.{name}")),
-                    rows: r.get(2),
+        self.up.send(&wire::query(sql)).await?;
+        let mut held = Vec::new();
+        let mut failed: Option<String> = None;
+        let status;
+        loop {
+            let f = self.up.recv().await?;
+            match f.tag {
+                b'Z' => {
+                    status = f.body.first().copied().unwrap_or(b'I');
+                    break;
                 }
-            })
-            .collect())
-    }
+                b'E' => {
+                    failed.get_or_insert(wire::parse_error(&f.body).message);
+                    held.push(f.raw);
+                }
+                b'G' => {
+                    // COPY FROM STDIN slipped past the classifier. Abort it.
+                    self.up
+                        .send(&wire::frame(
+                            b'f',
+                            b"ariodb does not relay COPY FROM STDIN\0",
+                        ))
+                        .await?;
+                }
+                _ if plan == Plan::Read => sink.send(f.raw).await?,
+                _ => held.push(f.raw),
+            }
+        }
 
-    async fn roll_back(&mut self, stmt: &Statement, rows: i64, reason: String) -> Outcome {
-        let _ = self.client.batch_execute("ROLLBACK").await;
-        self.log_stmt(stmt, "rolled_back", Some(rows.max(0) as u64), Some(&reason));
-        Outcome::Refused { message: reason }
-    }
+        if status == b'E' || failed.is_some() {
+            self.end(false).await?;
+            self.audit(sql, &statements, "failed", None, failed.as_deref(), started);
+            for f in held {
+                sink.send(f).await?;
+            }
+            return Ok(());
+        }
 
-    async fn failed(&mut self, stmt: &Statement, e: tokio_postgres::Error) -> Outcome {
-        let _ = self.client.batch_execute("ROLLBACK").await;
-        let (code, message) = match e.as_db_error() {
-            Some(db) => (db.code().code().to_string(), db.message().to_string()),
-            None => ("08006".to_string(), e.to_string()),
+        if plan == Plan::Read {
+            self.end(true).await?;
+            self.audit(sql, &statements, "allowed", None, None, started);
+            return Ok(());
+        }
+
+        let effects = match self.effects().await? {
+            Ok(e) => e,
+            Err(e) => {
+                self.end(false).await?;
+                self.audit(sql, &statements, "failed", None, Some(&e.message), started);
+                return sink.send(wire::error_response(&e.code, &e.message)).await;
+            }
         };
-        self.log_stmt(stmt, "failed", None, Some(&message));
-        Outcome::Failed { code, message }
+        let config = self.state.config();
+        let rows = gate::total_rows(&effects);
+        if let Err(r) = gate::judge_effects(&config, &self.agent, &effects) {
+            self.end(false).await?;
+            self.audit(
+                sql,
+                &statements,
+                "rolled_back",
+                Some(rows),
+                Some(&r.message),
+                started,
+            );
+            return sink
+                .send(wire::error_response(
+                    r.code,
+                    &format!("ariodb: {}", r.message),
+                ))
+                .await;
+        }
+        self.end(true).await?;
+        self.audit(sql, &statements, "allowed", Some(rows), None, started);
+        for f in held {
+            sink.send(f).await?;
+        }
+        Ok(())
     }
 
-    fn log_stmt(&self, stmt: &Statement, outcome: &str, rows: Option<u64>, reason: Option<&str>) {
-        self.log(
-            &stmt.sql,
-            stmt.kind.to_string(),
-            &stmt.tables,
-            outcome,
-            rows,
-            reason,
-        );
-    }
-
-    fn log(
+    pub fn audit(
         &self,
         sql: &str,
-        kind: String,
-        tables: &[String],
+        statements: &[Statement],
         outcome: &str,
         rows: Option<u64>,
         reason: Option<&str>,
+        started: Instant,
     ) {
-        self.audit.record(&Entry {
+        let tables = gate::tables(statements);
+        self.state.audit.record(&Entry {
             session: &self.id,
             agent: &self.agent.name,
             sql,
-            kind,
-            tables,
+            kind: gate::kinds(statements),
+            tables: &tables,
             outcome,
             rows,
             reason,
+            latency_ms: Some(started.elapsed().as_millis() as u64),
         });
-    }
-}
-
-fn to_outcome(stmt: &Statement, messages: Vec<SimpleQueryMessage>) -> Outcome {
-    let mut columns: Option<Vec<String>> = None;
-    let mut rows = Vec::new();
-    let mut count = 0;
-    for m in messages {
-        match m {
-            SimpleQueryMessage::RowDescription(cols) => {
-                columns = Some(cols.iter().map(|c| c.name().to_string()).collect());
-            }
-            SimpleQueryMessage::Row(row) => {
-                if columns.is_none() {
-                    columns = Some(row.columns().iter().map(|c| c.name().to_string()).collect());
-                }
-                rows.push(
-                    (0..row.len())
-                        .map(|i| row.get(i).map(str::to_string))
-                        .collect(),
-                );
-            }
-            SimpleQueryMessage::CommandComplete(n) => count = n,
-            _ => {}
-        }
-    }
-    match columns {
-        Some(columns) => Outcome::Rows { columns, rows },
-        None => Outcome::Done {
-            command: stmt.command.to_string(),
-            rows: count,
-        },
-    }
-}
-
-fn row_count(outcome: &Outcome) -> u64 {
-    match outcome {
-        Outcome::Rows { rows, .. } => rows.len() as u64,
-        Outcome::Done { rows, .. } => *rows,
-        _ => 0,
     }
 }

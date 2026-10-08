@@ -4,20 +4,17 @@
 //! proxy. Start it with `ariodb mcp --agent <name>`; the agent's token must be
 //! in its environment variable, as for the proxy.
 
-use crate::audit::AuditLog;
-use crate::config::Config;
-use crate::exec::{Outcome, Session};
+use crate::exec::{Collect, Session};
+use crate::gate::State;
+use crate::wire;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const MAX_ROWS_RETURNED: usize = 500;
 
-pub async fn serve(
-    config: Arc<Config>,
-    audit: Arc<AuditLog>,
-    agent_name: &str,
-) -> Result<(), String> {
+pub async fn serve(state: Arc<State>, agent_name: &str) -> Result<(), String> {
+    let config = state.config();
     let agent = config
         .agent(agent_name)
         .cloned()
@@ -30,11 +27,10 @@ pub async fn serve(
         return Err("ARIODB_AGENT_TOKEN does not match this agent's token".to_string());
     }
 
-    let mut session = Session::connect(&config, agent, audit).await?;
+    let mut session = Session::open(state.clone(), agent).await?;
     eprintln!(
         "ariodb mcp: session {} for agent {}",
-        session.id,
-        session.agent_name()
+        session.id, session.agent.name
     );
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -80,7 +76,11 @@ async fn handle(session: &mut Session, request: &Value) -> Option<Value> {
             if request["params"]["name"] != "query" || sql.is_empty() {
                 tool_error("call the 'query' tool with an 'sql' argument")
             } else {
-                tool_result(session.run(sql).await)
+                let mut collect = Collect::default();
+                match session.simple(sql, &mut collect).await {
+                    Ok(()) => tool_result(collect.0),
+                    Err(e) => tool_error(&format!("connection to the database failed: {e}")),
+                }
             }
         }
         _ => {
@@ -93,41 +93,53 @@ async fn handle(session: &mut Session, request: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-fn tool_result(outcomes: Vec<Outcome>) -> Value {
+fn tool_result(frames: Vec<bytes::Bytes>) -> Value {
     let mut parts = Vec::new();
     let mut is_error = false;
-    for outcome in outcomes {
-        match outcome {
-            Outcome::Rows { columns, rows } => {
-                let total = rows.len();
-                let objects: Vec<Value> = rows
-                    .into_iter()
-                    .take(MAX_ROWS_RETURNED)
-                    .map(|row| {
-                        let map = columns
-                            .iter()
-                            .cloned()
-                            .zip(row.into_iter().map(Value::from));
-                        Value::Object(map.collect())
-                    })
-                    .collect();
-                let mut text = serde_json::to_string_pretty(&objects).unwrap_or_default();
-                if total > MAX_ROWS_RETURNED {
-                    text.push_str(&format!(
-                        "\n({total} rows; showing the first {MAX_ROWS_RETURNED})"
-                    ));
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows: Vec<Value> = Vec::new();
+    let mut total = 0usize;
+    for raw in frames {
+        let (tag, body) = (raw[0], raw.slice(5..));
+        match tag {
+            b'T' => {
+                columns = wire::parse_row_description(&body);
+                rows.clear();
+                total = 0;
+            }
+            b'D' => {
+                total += 1;
+                if rows.len() < MAX_ROWS_RETURNED {
+                    let values = wire::parse_data_row(&body).into_iter().map(Value::from);
+                    rows.push(Value::Object(columns.iter().cloned().zip(values).collect()));
                 }
-                parts.push(text);
             }
-            Outcome::Done { command, rows } => parts.push(format!("{command} {rows}")),
-            Outcome::Refused { message } => {
+            b'C' => {
+                let tag =
+                    String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(&body)).to_string();
+                if columns.is_empty() {
+                    parts.push(tag);
+                } else {
+                    let mut text = serde_json::to_string_pretty(&rows).unwrap_or_default();
+                    if total > MAX_ROWS_RETURNED {
+                        text.push_str(&format!(
+                            "\n({total} rows; showing the first {MAX_ROWS_RETURNED})"
+                        ));
+                    }
+                    parts.push(text);
+                    columns.clear();
+                    rows.clear();
+                }
+            }
+            b'E' => {
                 is_error = true;
-                parts.push(format!("Refused by ariodb: {message}"));
+                let e = wire::parse_error(&body);
+                match e.message.strip_prefix("ariodb: ") {
+                    Some(m) => parts.push(format!("Refused by ariodb: {m}")),
+                    None => parts.push(format!("Postgres error {}: {}", e.code, e.message)),
+                }
             }
-            Outcome::Failed { code, message } => {
-                is_error = true;
-                parts.push(format!("Postgres error {code}: {message}"));
-            }
+            _ => {}
         }
     }
     json!({ "content": [{ "type": "text", "text": parts.join("\n\n") }], "isError": is_error })

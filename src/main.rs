@@ -2,12 +2,16 @@ mod audit;
 mod classify;
 mod config;
 mod exec;
+mod gate;
 mod journal;
 mod mcp;
 mod pgoutput;
 mod policy;
 mod proxy;
+mod tls;
 mod undo;
+mod upstream;
+mod wire;
 
 use clap::{Parser, Subcommand};
 use config::{Access, Config, FailureMode};
@@ -84,9 +88,12 @@ async fn main() -> ExitCode {
         }
         Command::Classify { .. } => unreachable!("handled above"),
         Command::Setup => journal::setup(&config).await,
-        Command::Serve => serve(config).await,
-        Command::Mcp { agent } => match open_audit(&config) {
-            Ok(audit) => mcp::serve(config.clone(), audit, &agent).await,
+        Command::Serve => match make_state(&config, &cli.config) {
+            Ok(state) => serve(state).await,
+            Err(e) => Err(e),
+        },
+        Command::Mcp { agent } => match make_state(&config, &cli.config) {
+            Ok(state) => mcp::serve(state, &agent).await,
             Err(e) => Err(e),
         },
         Command::Sessions => sessions_command(&config),
@@ -116,8 +123,14 @@ fn open_audit(config: &Config) -> Result<Arc<audit::AuditLog>, String> {
         .map_err(|e| format!("cannot open audit log: {e}"))
 }
 
-async fn serve(config: Arc<Config>) -> Result<(), String> {
-    let audit = open_audit(&config)?;
+fn make_state(config: &Config, path: &Path) -> Result<Arc<gate::State>, String> {
+    let audit = open_audit(config)?;
+    let fresh = Config::load(path).map_err(|e| e.to_string())?;
+    Ok(gate::State::new(fresh, path.to_path_buf(), audit))
+}
+
+async fn serve(state: Arc<gate::State>) -> Result<(), String> {
+    let config = state.config();
     if config.journal.enabled {
         let journal_config = config.clone();
         tokio::spawn(async move {
@@ -126,7 +139,7 @@ async fn serve(config: Arc<Config>) -> Result<(), String> {
             }
         });
     }
-    proxy::serve(config, audit)
+    proxy::serve(state)
         .await
         .map_err(|e| format!("proxy stopped: {e}"))
 }

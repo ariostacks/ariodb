@@ -1,161 +1,809 @@
-//! A Postgres-compatible front door. Agents connect with psql or any driver,
-//! using their agent name as the user and their token as the password.
+//! The Postgres-compatible front door. Agents connect with psql or any
+//! driver, using their agent name as the user and their token as the
+//! password. Both the simple and the extended (prepared statement) protocol
+//! are supported, with TLS on both sides.
 //!
-//! Supports the simple query protocol. Drivers that need the extended
-//! protocol (prepared statements with parameters) are not supported yet.
+//! For the extended protocol, ariodb opens and closes its own transaction
+//! with hidden named statements (`__ariodb_*`) slipped into the agent's
+//! message stream, and filters their responses out. It never sends a
+//! simple query mid-stream, so the agent's own prepared statements and
+//! portals are untouched.
 
-use crate::audit::AuditLog;
-use crate::config::Config;
-use crate::exec::{Outcome, Session};
-use async_trait::async_trait;
-use futures::{StreamExt, stream};
-use pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
-use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password};
-use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use crate::classify::{self, Statement};
+use crate::exec::{Session, Sink};
+use crate::gate::{self, Plan, Refusal, State};
+use crate::tls::Io;
+use crate::upstream::{self, Target};
+use crate::wire::{self, Frame, WireError};
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tokio::net::{TcpListener, TcpStream};
 
-pub async fn serve(config: Arc<Config>, audit: Arc<AuditLog>) -> std::io::Result<()> {
-    let listener = TcpListener::bind(&config.proxy.listen).await?;
+type CancelMap = Arc<Mutex<HashMap<(i32, i32), (Target, (i32, i32))>>>;
+
+pub async fn serve(state: Arc<State>) -> Result<(), String> {
+    let config = state.config();
+    let acceptor = match (&config.proxy.tls_cert, &config.proxy.tls_key) {
+        (Some(c), Some(k)) => Some(crate::tls::server_acceptor(c, k)?),
+        (None, None) => None,
+        _ => return Err("proxy.tls_cert and proxy.tls_key must be set together".to_string()),
+    };
+    if config.proxy.require_tls && acceptor.is_none() {
+        return Err("proxy.require_tls needs proxy.tls_cert and proxy.tls_key".to_string());
+    }
+    let listener = TcpListener::bind(&config.proxy.listen)
+        .await
+        .map_err(|e| format!("cannot listen on {}: {e}", config.proxy.listen))?;
+    let tls_note = if acceptor.is_some() {
+        " (TLS available)"
+    } else {
+        ""
+    };
     println!(
-        "ariodb: agents can connect to postgres://<agent>@{}",
+        "ariodb: agents can connect to postgres://<agent>@{}{tls_note}",
         config.proxy.listen
     );
+
+    let cancels: CancelMap = Arc::new(Mutex::new(HashMap::new()));
     loop {
-        let (socket, _addr) = listener.accept().await?;
-        // One set of handlers per connection, so each connection has its own session.
-        let handlers = Arc::new(Handlers::new(config.clone(), audit.clone()));
+        let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let _ = socket.set_nodelay(true);
+        let (state, acceptor, cancels) = (state.clone(), acceptor.clone(), cancels.clone());
         tokio::spawn(async move {
-            if let Err(e) = pgwire::tokio::process_socket(socket, None, handlers).await {
-                eprintln!("ariodb: connection error: {e}");
+            if let Err(e) = handle(socket, state, acceptor, cancels).await {
+                eprintln!("ariodb: connection ended: {e}");
             }
         });
     }
 }
 
-struct Handlers {
-    startup: Arc<CleartextPasswordAuthStartupHandler<AgentAuth, DefaultServerParameterProvider>>,
-    query: Arc<QueryHandler>,
+async fn handle(
+    mut socket: TcpStream,
+    state: Arc<State>,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    cancels: CancelMap,
+) -> Result<(), String> {
+    let config = state.config();
+    let e = |e: WireError| e.to_string();
+
+    // Startup: TLS negotiation first, on the raw socket. Clients may ask
+    // for GSS encryption, then TLS, before the real startup message.
+    let mut first = wire::read_startup(&mut socket).await.map_err(e)?;
+    loop {
+        match first.code {
+            wire::GSSENC_REQUEST => {}
+            wire::SSL_REQUEST if acceptor.is_none() => {}
+            _ => break,
+        }
+        wire::write_all(&mut socket, b"N").await.map_err(e)?;
+        first = wire::read_startup(&mut socket).await.map_err(e)?;
+    }
+    let (mut io, first): (Box<dyn Io>, wire::Startup) = if first.code == wire::SSL_REQUEST {
+        let acc = acceptor.expect("checked above");
+        wire::write_all(&mut socket, b"S").await.map_err(e)?;
+        let tls = acc.accept(socket).await.map_err(|e| format!("TLS: {e}"))?;
+        let mut io: Box<dyn Io> = Box::new(tls);
+        let next = wire::read_startup(&mut io).await.map_err(e)?;
+        (io, next)
+    } else {
+        if config.proxy.require_tls && first.code == wire::PROTOCOL_3 {
+            let msg =
+                wire::fatal_response("28000", "ariodb requires TLS; connect with sslmode=require");
+            let _ = wire::write_all(&mut socket, &msg).await;
+            return Ok(());
+        }
+        (Box::new(socket), first)
+    };
+    if first.code == wire::CANCEL_REQUEST {
+        handle_cancel(&first.body, &cancels).await;
+        return Ok(());
+    }
+    if first.code != wire::PROTOCOL_3 {
+        let msg = wire::fatal_response("08P01", "unsupported protocol version");
+        let _ = wire::write_all(&mut io, &msg).await;
+        return Ok(());
+    }
+
+    let params = wire::startup_params(&first.body);
+    let user = params
+        .iter()
+        .find(|(k, _)| k == "user")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    // Agents prove who they are with their token, sent as the password.
+    wire::write_all(&mut io, &wire::auth_cleartext())
+        .await
+        .map_err(e)?;
+    let reply = wire::read_frame(&mut io).await.map_err(e)?;
+    let given = reply
+        .body
+        .strip_suffix(&[0])
+        .unwrap_or(&reply.body)
+        .to_vec();
+    let agent = config.agent(&user).cloned();
+    let token = agent.as_ref().and_then(|a| a.token());
+    let ok = reply.tag == b'p' && token.is_some_and(|t| constant_time_eq(t.as_bytes(), &given));
+    let Some(agent) = agent.filter(|_| ok) else {
+        let msg = wire::fatal_response(
+            "28P01",
+            &format!("password authentication failed for user \"{user}\""),
+        );
+        let _ = wire::write_all(&mut io, &msg).await;
+        return Ok(());
+    };
+
+    let mut session = match Session::open(state.clone(), agent).await {
+        Ok(s) => s,
+        Err(message) => {
+            let _ = wire::write_all(
+                &mut io,
+                &wire::fatal_response("08006", &format!("ariodb: {message}")),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    if let Err(message) = prepare_internal(&mut session).await {
+        let _ = wire::write_all(
+            &mut io,
+            &wire::fatal_response("08006", &format!("ariodb: {message}")),
+        )
+        .await;
+        return Ok(());
+    }
+
+    let our_key = (rand::random::<i32>().abs(), rand::random::<i32>());
+    let target = state.config().target_for(&session.agent)?;
+    cancels
+        .lock()
+        .expect("cancel map")
+        .insert(our_key, (target, session.up.cancel_key));
+
+    let mut hello = vec![wire::auth_ok()];
+    hello.extend(session.up.parameter_frames.iter().cloned());
+    hello.push(wire::backend_key(our_key.0, our_key.1));
+    hello.push(wire::ready(b'I'));
+    for f in &hello {
+        io.write_all_frame(f).await.map_err(e)?;
+    }
+    io.flush_all().await.map_err(e)?;
+
+    let result = Connection::new(session, io).run().await;
+    cancels.lock().expect("cancel map").remove(&our_key);
+    result
 }
 
-impl Handlers {
-    fn new(config: Arc<Config>, audit: Arc<AuditLog>) -> Handlers {
-        let auth = AgentAuth {
-            config: config.clone(),
-        };
-        Handlers {
-            startup: Arc::new(CleartextPasswordAuthStartupHandler::new(
-                auth,
-                DefaultServerParameterProvider::default(),
-            )),
-            query: Arc::new(QueryHandler {
-                config,
-                audit,
-                session: Mutex::new(None),
-            }),
+async fn handle_cancel(body: &[u8], cancels: &CancelMap) {
+    if body.len() < 8 {
+        return;
+    }
+    let key = (
+        i32::from_be_bytes(body[0..4].try_into().unwrap()),
+        i32::from_be_bytes(body[4..8].try_into().unwrap()),
+    );
+    let found = cancels.lock().expect("cancel map").get(&key).cloned();
+    if let Some((target, upstream_key)) = found {
+        upstream::cancel(&target, upstream_key).await;
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Small extension so a boxed stream can write frames and flush.
+trait FrameIo {
+    async fn write_all_frame(&mut self, f: &[u8]) -> Result<(), WireError>;
+    async fn flush_all(&mut self) -> Result<(), WireError>;
+}
+
+impl FrameIo for Box<dyn Io> {
+    async fn write_all_frame(&mut self, f: &[u8]) -> Result<(), WireError> {
+        tokio::io::AsyncWriteExt::write_all(self, f).await?;
+        Ok(())
+    }
+    async fn flush_all(&mut self) -> Result<(), WireError> {
+        tokio::io::AsyncWriteExt::flush(self).await?;
+        Ok(())
+    }
+}
+
+struct ClientSink<'a>(&'a mut Box<dyn Io>);
+
+impl Sink for ClientSink<'_> {
+    async fn send(&mut self, frame: Bytes) -> Result<(), WireError> {
+        self.0.write_all_frame(&frame).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hidden statements ariodb uses to run its own transaction control.
+
+const BEGIN_RO: &str = "__ariodb_begin_ro";
+const BEGIN_RW: &str = "__ariodb_begin_rw";
+const TIMEOUT: &str = "__ariodb_timeout";
+const TAG: &str = "__ariodb_tag";
+const EFFECTS: &str = "__ariodb_effects";
+const COMMIT: &str = "__ariodb_commit";
+const ROLLBACK: &str = "__ariodb_rollback";
+
+async fn prepare_internal(session: &mut Session) -> Result<(), String> {
+    let statements = [
+        (BEGIN_RO, "BEGIN READ ONLY"),
+        (BEGIN_RW, "BEGIN"),
+        (TIMEOUT, "SELECT set_config('statement_timeout', $1, true)"),
+        (
+            TAG,
+            "SELECT pg_logical_emit_message(true, 'ariodb', $1::text)",
+        ),
+        (EFFECTS, gate::EFFECTS_SQL),
+        (COMMIT, "COMMIT"),
+        (ROLLBACK, "ROLLBACK"),
+    ];
+    let mut out = Vec::new();
+    for (name, sql) in statements {
+        out.extend_from_slice(&wire::parse_message(name, sql));
+    }
+    out.extend_from_slice(&wire::sync_message());
+    let up = &mut session.up;
+    up.send(&out).await.map_err(|e| e.to_string())?;
+    loop {
+        let f = up.recv().await.map_err(|e| e.to_string())?;
+        match f.tag {
+            b'E' => {
+                return Err(format!(
+                    "cannot prepare internal statements: {}",
+                    wire::parse_error(&f.body).message
+                ));
+            }
+            b'Z' => return Ok(()),
+            _ => {}
         }
     }
 }
 
-impl PgWireServerHandlers for Handlers {
-    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        self.query.clone()
-    }
-
-    fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
-        self.startup.clone()
-    }
+/// An internal operation: Bind and Execute one hidden statement.
+fn internal_op(statement: &str, params: &[&str]) -> Vec<Out> {
+    let portal = format!("{statement}_p");
+    vec![
+        Out::Internal(
+            wire::bind_with_params(&portal, statement, params),
+            Expect::Bind,
+        ),
+        Out::Internal(wire::execute_message(&portal), Expect::Execute),
+    ]
 }
 
-/// Agents log in with their name and token. Unknown agents cannot log in.
-#[derive(Debug)]
-struct AgentAuth {
-    config: Arc<Config>,
+/// Run one hidden statement, then Sync.
+fn end_with(statement: &str) -> Vec<Out> {
+    let mut out = internal_op(statement, &[]);
+    out.push(Out::Internal(wire::sync_message(), Expect::Sync));
+    out
 }
 
-#[async_trait]
-impl AuthSource for AgentAuth {
-    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
-        let user = login.user().unwrap_or_default();
-        match self.config.agent(user).and_then(|a| a.token()) {
-            Some(token) => Ok(Password::new(None, token.into_bytes())),
-            None => Err(PgWireError::InvalidPassword(user.to_string())),
+// ---------------------------------------------------------------------------
+// The per-connection loop.
+
+/// What a forwarded message will produce in response.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Expect {
+    Parse,
+    Bind,
+    Close,
+    DescribeStatement,
+    DescribePortal,
+    Execute,
+    Sync,
+    Nothing,
+}
+
+impl Expect {
+    fn of(f: &Frame) -> Expect {
+        match f.tag {
+            b'P' => Expect::Parse,
+            b'B' => Expect::Bind,
+            b'C' => Expect::Close,
+            b'D' if f.body.first() == Some(&b'S') => Expect::DescribeStatement,
+            b'D' => Expect::DescribePortal,
+            b'E' => Expect::Execute,
+            b'S' => Expect::Sync,
+            _ => Expect::Nothing,
+        }
+    }
+
+    /// Is this response the last one for the message?
+    fn done_by(self, tag: u8) -> bool {
+        match self {
+            Expect::Parse => tag == b'1',
+            Expect::Bind => tag == b'2',
+            Expect::Close => tag == b'3',
+            Expect::DescribeStatement | Expect::DescribePortal => tag == b'T' || tag == b'n',
+            Expect::Execute => matches!(tag, b'C' | b'I' | b's'),
+            Expect::Sync => tag == b'Z',
+            Expect::Nothing => true,
         }
     }
 }
 
-struct QueryHandler {
-    config: Arc<Config>,
-    audit: Arc<AuditLog>,
-    session: Mutex<Option<Session>>,
+enum Out {
+    Client(Frame),
+    Internal(Bytes, Expect),
 }
 
-#[async_trait]
-impl SimpleQueryHandler for QueryHandler {
-    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
-    where
-        C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
-        C::PortalStore: PortalStore,
-    {
-        if query.trim().is_empty() {
-            return Ok(vec![Response::EmptyQuery]);
+impl Out {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Out::Client(f) => &f.raw,
+            Out::Internal(b, _) => b,
         }
-        let mut guard = self.session.lock().await;
-        if guard.is_none() {
-            let user = client.metadata().get("user").cloned().unwrap_or_default();
-            let Some(agent) = self.config.agent(&user).cloned() else {
-                return Ok(vec![error("28000", format!("unknown agent '{user}'"))]);
+    }
+    fn expect(&self) -> Expect {
+        match self {
+            Out::Client(f) => Expect::of(f),
+            Out::Internal(_, e) => *e,
+        }
+    }
+    fn is_internal(&self) -> bool {
+        matches!(self, Out::Internal(..))
+    }
+}
+
+struct Prepared {
+    statements: Vec<Statement>,
+}
+
+struct Connection {
+    session: Session,
+    client: Box<dyn Io>,
+    prepared: HashMap<String, Prepared>,
+    portals: HashMap<String, String>,
+    batch: Vec<Frame>,
+    /// After an error mid-batch, ignore messages until Sync.
+    skipping: bool,
+    /// A Flush ran the batch early; the next Sync only needs ReadyForQuery.
+    ran_early: bool,
+}
+
+impl Connection {
+    fn new(session: Session, client: Box<dyn Io>) -> Connection {
+        Connection {
+            session,
+            client,
+            prepared: HashMap::new(),
+            portals: HashMap::new(),
+            batch: Vec::new(),
+            skipping: false,
+            ran_early: false,
+        }
+    }
+
+    async fn run(mut self) -> Result<(), String> {
+        let e = |e: WireError| e.to_string();
+        loop {
+            let f = match wire::read_frame(&mut self.client).await {
+                Ok(f) => f,
+                Err(WireError::TooLarge(n)) => {
+                    self.session.audit(
+                        "<too large>",
+                        &[],
+                        "refused",
+                        None,
+                        Some("statement over 1 MiB"),
+                        Instant::now(),
+                    );
+                    let msg =
+                        format!("ariodb: message of {n} bytes is over the 1 MiB inspection limit");
+                    self.client
+                        .write_all_frame(&wire::error_response("54000", &msg))
+                        .await
+                        .map_err(e)?;
+                    self.batch.clear();
+                    self.skipping = true;
+                    self.client.flush_all().await.map_err(e)?;
+                    continue;
+                }
+                Err(WireError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(());
+                }
+                Err(err) => return Err(err.to_string()),
             };
-            match Session::connect(&self.config, agent, self.audit.clone()).await {
-                Ok(session) => *guard = Some(session),
-                Err(message) => return Ok(vec![error("08006", message)]),
+            match f.tag {
+                b'Q' => {
+                    let sql = wire::take_cstr(&mut f.body.clone()).map_err(e)?;
+                    self.skipping = false;
+                    self.session
+                        .simple(&sql, &mut ClientSink(&mut self.client))
+                        .await
+                        .map_err(e)?;
+                    self.client
+                        .write_all_frame(&wire::ready(b'I'))
+                        .await
+                        .map_err(e)?;
+                    self.client.flush_all().await.map_err(e)?;
+                }
+                b'P' | b'B' | b'D' | b'E' | b'C' => {
+                    if !self.skipping {
+                        self.batch.push(f);
+                    }
+                }
+                b'H' => {
+                    if !self.skipping && !self.batch.is_empty() {
+                        self.run_batch(false).await.map_err(e)?;
+                        self.ran_early = true;
+                    }
+                    self.client.flush_all().await.map_err(e)?;
+                }
+                b'S' => {
+                    if self.skipping || (self.ran_early && self.batch.is_empty()) {
+                        self.skipping = false;
+                        self.ran_early = false;
+                        self.client
+                            .write_all_frame(&wire::ready(b'I'))
+                            .await
+                            .map_err(e)?;
+                    } else {
+                        self.ran_early = false;
+                        self.run_batch(true).await.map_err(e)?;
+                    }
+                    self.client.flush_all().await.map_err(e)?;
+                }
+                b'X' => return Ok(()),
+                b'F' => {
+                    let msg = "ariodb: the function-call protocol is not supported";
+                    self.client
+                        .write_all_frame(&wire::error_response("0A000", msg))
+                        .await
+                        .map_err(e)?;
+                    self.client
+                        .write_all_frame(&wire::ready(b'I'))
+                        .await
+                        .map_err(e)?;
+                    self.client.flush_all().await.map_err(e)?;
+                }
+                _ => {} // stray COPY data and the like
             }
         }
-        let session = guard.as_mut().expect("session was just created");
-        let outcomes = session.run(query).await;
-        Ok(outcomes.into_iter().map(to_response).collect())
     }
-}
 
-fn to_response(outcome: Outcome) -> Response {
-    match outcome {
-        Outcome::Rows { columns, rows } => {
-            let fields: Vec<FieldInfo> = columns
-                .into_iter()
-                .map(|name| FieldInfo::new(name, None, None, Type::TEXT, FieldFormat::Text))
-                .collect();
-            let schema = Arc::new(fields);
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            let data = stream::iter(rows).map(move |row| {
-                for value in &row {
-                    encoder.encode_field(value)?;
+    /// Refuse the current batch: error, then (at Sync) ReadyForQuery.
+    async fn refuse(
+        &mut self,
+        r: &Refusal,
+        sql: &str,
+        statements: &[Statement],
+        final_sync: bool,
+    ) -> Result<(), WireError> {
+        self.session.audit(
+            sql,
+            statements,
+            "refused",
+            None,
+            Some(&r.message),
+            Instant::now(),
+        );
+        self.batch.clear();
+        self.client
+            .write_all_frame(&wire::error_response(
+                r.code,
+                &format!("ariodb: {}", r.message),
+            ))
+            .await?;
+        if final_sync {
+            self.client.write_all_frame(&wire::ready(b'I')).await?;
+        } else {
+            self.skipping = true;
+        }
+        Ok(())
+    }
+
+    async fn run_batch(&mut self, final_sync: bool) -> Result<(), WireError> {
+        let started = Instant::now();
+        let batch = std::mem::take(&mut self.batch);
+
+        // 1. Understand every statement the batch prepares or runs.
+        let mut parsed_here: HashMap<String, Vec<Statement>> = HashMap::new();
+        let mut portals = self.portals.clone();
+        let mut executed: Vec<Statement> = Vec::new();
+        let mut closed: Vec<String> = Vec::new();
+        let mut sql_text = Vec::new();
+        for f in &batch {
+            match f.tag {
+                b'P' => {
+                    let (name, sql) = wire::parse_parse(&f.body)?;
+                    match classify::classify(&sql) {
+                        Ok(stmts) => {
+                            parsed_here.insert(name, stmts);
+                        }
+                        Err(err) => {
+                            let r = Refusal::new(err.to_string());
+                            return self.refuse(&r, &sql, &[], final_sync).await;
+                        }
+                    }
                 }
-                Ok(encoder.take_row())
-            });
-            Response::Query(QueryResponse::new(schema, data))
+                b'B' => {
+                    let (portal, statement) = wire::parse_bind(&f.body)?;
+                    portals.insert(portal, statement);
+                }
+                b'C' => {
+                    let (kind, name) = wire::parse_close(&f.body)?;
+                    if kind == b'S' {
+                        closed.push(name);
+                    } else {
+                        portals.remove(&name);
+                    }
+                }
+                b'E' => {
+                    let portal = wire::parse_execute(&f.body)?;
+                    let stmts = portals.get(&portal).and_then(|s| {
+                        parsed_here
+                            .get(s)
+                            .or_else(|| self.prepared.get(s).map(|p| &p.statements))
+                    });
+                    match stmts {
+                        Some(s) => {
+                            sql_text.extend(s.iter().map(|x| x.sql.clone()));
+                            executed.extend(s.iter().cloned());
+                        }
+                        None => {
+                            let r =
+                                Refusal::new(format!("ariodb has no record of portal '{portal}'"));
+                            return self.refuse(&r, "", &[], final_sync).await;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
-        Outcome::Done { command, rows } => {
-            let tag = Tag::new(&command).with_rows(rows as usize);
-            Response::Execution(if command == "INSERT" {
-                tag.with_oid(0)
+        let sql = sql_text.join("; ");
+
+        // Statements prepared but not run are still checked, so a refused
+        // statement fails at Parse, as an agent would expect.
+        for stmts in parsed_here.values() {
+            if let Err(r) = gate::check(&self.session.state, &self.session.agent, stmts).await {
+                let text = stmts
+                    .iter()
+                    .map(|s| s.sql.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return self.refuse(&r, &text, stmts, final_sync).await;
+            }
+        }
+        let plan = match gate::check(&self.session.state, &self.session.agent, &executed).await {
+            Ok(p) => p,
+            Err(r) => return self.refuse(&r, &sql, &executed, final_sync).await,
+        };
+
+        // 2. Build what goes to the database.
+        let has_execute = batch.iter().any(|f| f.tag == b'E');
+        let config = self.session.state.config();
+        let mut out: Vec<Out> = Vec::new();
+        let mut opened = false;
+        for f in batch {
+            if f.tag == b'E' && !opened {
+                opened = true;
+                let begin = if plan == Plan::Write {
+                    BEGIN_RW
+                } else {
+                    BEGIN_RO
+                };
+                out.extend(internal_op(begin, &[]));
+                let timeout = config.limits.statement_timeout_ms.to_string();
+                out.extend(internal_op(TIMEOUT, &[&timeout]));
+                if plan == Plan::Write && config.journal.enabled {
+                    let tag = serde_json::json!({ "session": self.session.id, "agent": self.session.agent.name }).to_string();
+                    out.extend(internal_op(TAG, &[&tag]));
+                }
+            }
+            out.push(Out::Client(f));
+        }
+
+        // 3. Send, read back, decide.
+        let outcome = if !has_execute {
+            out.push(Out::Internal(wire::sync_message(), Expect::Sync));
+            self.exchange(&out, Hold::Stream).await?
+        } else if plan == Plan::Read {
+            out.extend(internal_op(COMMIT, &[]));
+            out.push(Out::Internal(wire::sync_message(), Expect::Sync));
+            self.exchange(&out, Hold::Stream).await?
+        } else {
+            out.extend(internal_op(EFFECTS, &[]));
+            out.push(Out::Internal(wire::flush_message(), Expect::Nothing));
+            self.exchange(&out, Hold::All).await?
+        };
+
+        let mut status = outcome.status;
+        let mut audit_outcome = if outcome.error.is_some() {
+            "failed"
+        } else {
+            "allowed"
+        };
+        let mut reason = outcome.error.clone();
+        let mut rows = None;
+        let mut send = outcome.held;
+
+        if has_execute && plan == Plan::Write {
+            if outcome.error.is_some() {
+                // The database is skipping to Sync; finish and roll back.
+                let tail = [Out::Internal(wire::sync_message(), Expect::Sync)];
+                self.exchange(&tail, Hold::All).await?;
+                let tail = end_with(ROLLBACK);
+                status = self.exchange(&tail, Hold::All).await?.status;
             } else {
-                tag
-            })
+                let effects = gate::parse_effects(&outcome.internal_rows);
+                rows = Some(gate::total_rows(&effects));
+                let verdict = gate::judge_effects(&config, &self.session.agent, &effects);
+                let end = if verdict.is_ok() { COMMIT } else { ROLLBACK };
+                let tail = end_with(end);
+                let finish = self.exchange(&tail, Hold::All).await?;
+                status = finish.status;
+                if let Some(err) = finish.error {
+                    audit_outcome = "failed";
+                    reason = Some(err);
+                    send.extend(finish.held);
+                } else if let Err(r) = verdict {
+                    audit_outcome = "rolled_back";
+                    reason = Some(r.message.clone());
+                    send = outcome.before_execute;
+                    send.push(wire::error_response(
+                        r.code,
+                        &format!("ariodb: {}", r.message),
+                    ));
+                }
+            }
         }
-        Outcome::Refused { message } => error("42501", format!("ariodb: {message}")),
-        Outcome::Failed { code, message } => error(&code, message),
+        if status == b'E' || status == b'T' {
+            // A transaction is still open (an error in a read batch). Close it.
+            let tail = end_with(ROLLBACK);
+            self.exchange(&tail, Hold::All).await?;
+        }
+
+        for f in send {
+            self.client.write_all_frame(&f).await?;
+        }
+        if final_sync {
+            self.client.write_all_frame(&wire::ready(b'I')).await?;
+        }
+        if has_execute {
+            self.session.audit(
+                &sql,
+                &executed,
+                audit_outcome,
+                rows,
+                reason.as_deref(),
+                started,
+            );
+        }
+
+        // 4. Remember what was prepared; portals end with the transaction.
+        if outcome.error.is_none() {
+            for (name, statements) in parsed_here {
+                self.prepared.insert(name, Prepared { statements });
+            }
+            for name in closed {
+                self.prepared.remove(&name);
+            }
+            self.portals = if has_execute || final_sync {
+                HashMap::new()
+            } else {
+                portals
+            };
+        }
+        Ok(())
+    }
+
+    /// Send messages and read every response they produce. Responses to the
+    /// agent's messages are streamed or held; responses to ariodb's own
+    /// messages are consumed.
+    async fn exchange(&mut self, out: &[Out], hold: Hold) -> Result<Exchange, WireError> {
+        let mut bytes = Vec::new();
+        for o in out {
+            bytes.extend_from_slice(o.bytes());
+        }
+        self.session.up.send(&bytes).await?;
+
+        let mut ex = Exchange {
+            status: b'I',
+            error: None,
+            held: Vec::new(),
+            before_execute: Vec::new(),
+            internal_rows: Vec::new(),
+        };
+        let mut i = 0;
+        let skip_to_sync = |i: &mut usize| {
+            while *i < out.len() && out[*i].expect() != Expect::Sync {
+                *i += 1;
+            }
+        };
+        // Messages that produce no response are passed over.
+        let advance = |i: &mut usize| {
+            while *i < out.len() && out[*i].expect() == Expect::Nothing {
+                *i += 1;
+            }
+        };
+        advance(&mut i);
+        while i < out.len() {
+            let f = self.session.up.recv().await?;
+            // Notices and notifications can arrive at any time.
+            if matches!(f.tag, b'N' | b'A' | b'S') {
+                if !out[i].is_internal() {
+                    self.forward(&f, hold, &mut ex, false).await?;
+                }
+                continue;
+            }
+            let current = &out[i];
+            if f.tag == b'E' {
+                ex.error.get_or_insert(wire::parse_error(&f.body).message);
+                self.forward(&f, hold, &mut ex, false).await?;
+                skip_to_sync(&mut i);
+                if i >= out.len() {
+                    break; // no Sync in this exchange; the database waits for one
+                }
+                continue;
+            }
+            if f.tag == b'Z' {
+                ex.status = f.body.first().copied().unwrap_or(b'I');
+                i += 1;
+                advance(&mut i);
+                continue;
+            }
+            if current.is_internal() {
+                if f.tag == b'D' {
+                    ex.internal_rows.push(wire::parse_data_row(&f.body));
+                }
+            } else {
+                let before_execute = current.expect() != Expect::Execute;
+                self.forward(&f, hold, &mut ex, before_execute).await?;
+            }
+            if current.expect().done_by(f.tag) {
+                i += 1;
+                advance(&mut i);
+            }
+        }
+        if hold == Hold::Stream {
+            self.client.flush_all().await?;
+        }
+        Ok(ex)
+    }
+
+    async fn forward(
+        &mut self,
+        f: &Frame,
+        hold: Hold,
+        ex: &mut Exchange,
+        before_execute: bool,
+    ) -> Result<(), WireError> {
+        match hold {
+            Hold::Stream => self.client.write_all_frame(&f.raw).await,
+            Hold::All => {
+                ex.held.push(f.raw.clone());
+                if before_execute {
+                    ex.before_execute.push(f.raw.clone());
+                }
+                Ok(())
+            }
+        }
     }
 }
 
-fn error(code: &str, message: String) -> Response {
-    Response::Error(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        code.to_string(),
-        message,
-    )))
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Hold {
+    /// Send to the agent as it arrives (reads).
+    Stream,
+    /// Keep until ariodb decides (writes).
+    All,
+}
+
+struct Exchange {
+    status: u8,
+    error: Option<String>,
+    held: Vec<Bytes>,
+    /// Held responses from before the first Execute (ParseComplete and so on).
+    before_execute: Vec<Bytes>,
+    internal_rows: Vec<Vec<Option<String>>>,
 }

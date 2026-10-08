@@ -8,7 +8,7 @@
 use crate::config::Config;
 use crate::journal::{Cell, Change, Op, TxnRecord, quote_ident, quote_table};
 use std::collections::{BTreeMap, HashMap};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
 /// A summary line for `ariodb sessions`.
 pub struct SessionSummary {
@@ -95,13 +95,8 @@ pub struct Plan {
 
 pub async fn connect(config: &Config) -> Result<Client, String> {
     let url = std::env::var("ARIODB_ADMIN_URL").unwrap_or_else(|_| config.database_url());
-    let (client, connection) = tokio_postgres::connect(&url, NoTls)
-        .await
-        .map_err(|e| format!("cannot connect: {e}"))?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(client)
+    let target = config.admin_target(&url)?;
+    crate::upstream::admin_client(target.tls, &url).await
 }
 
 pub async fn plan(client: &Client, records: &[TxnRecord], session: &str) -> Result<Plan, String> {
