@@ -8,6 +8,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 BIN=./target/debug/ariodb
 PG=ariodb-e2e-pg
 PORT=55433
@@ -43,7 +44,7 @@ agent_script() {
     psql "host=host.docker.internal port=$PROXY user=$1 dbname=app sslmode=disable" 2>&1 || true
 }
 expect() { # expect <description> <needle> <output>
-  if grep -q -- "$2" <<<"$3"; then pass "$1"; else echo "$3"; fail "$1"; fi
+  if grep -qF -- "$2" <<<"$3"; then pass "$1"; else echo "$3"; fail "$1"; fi
 }
 fingerprint() {
   admin -tAc "SELECT md5(string_agg(t, '|' ORDER BY t)) FROM (SELECT c::text AS t FROM customers c UNION ALL SELECT o::text FROM orders o) x"
@@ -369,6 +370,20 @@ expect "model request: default model with fallback" '"anthropic-beta": "server-s
 expect "model request: structured output" '"format": "json_schema"' "$LAST"
 expect "model decisions are recorded" "model:claude-opus-5-5" "$($BIN "${CFG[@]}" approvals --all)"
 
+echo "dashboard API"
+api() { curl -s -b "$WORK/cj" -H "$JSONH" -H "x-ariodb-csrf: $CSRF" "$@"; }
+expect "decisions are listed and filterable" '"outcome":"refused"' "$(api "$D/api/decisions?outcome=refused&limit=5")"
+expect "decision search by text" "pg_ls_dir" "$(api "$D/api/decisions?q=pg_ls_dir")"
+DEC=$(api "$D/api/decisions?q=pg_ls_dir" | python3 -c "import json,sys;print(json.load(sys.stdin)['decisions'][0]['id'])")
+expect "a decision exports as a fixture" '"rule":"no-file-functions"' "$(api "$D/api/decisions/$DEC/fixture")"
+expect "block-like-this previews a rule" '"applied":false' "$(api -X POST -d "{\"decision\":$DEC}" $D/api/block-like)"
+APPLY_BODY=$(printf '{"decision":%s,"apply":true}' "$DEC")
+expect "block-like-this cannot write when config writes are off" "may not change the config" "$(api -X POST -d "$APPLY_BODY" $D/api/block-like)"
+expect "config is shown with passwords masked" 'ariodb_gw:***@' "$(api $D/api/config)"
+expect "explain through the API" '"rule":"no-file-functions"' "$(api -X POST -d '{"agent":"coding-agent","sql":"SELECT pg_read_file(1)"}' $D/api/explain)"
+expect "audit chain verified through the API" '"ok":true' "$(api $D/api/audit/verify)"
+expect "overview counts pending approvals" '"pending_approvals":0' "$(api $D/api/overview)"
+
 echo "agent work and undo"
 OUT=$(agent coding-agent $T "UPDATE orders SET status='refunded', total=0 WHERE id IN (10,11,12); INSERT INTO customers VALUES (100,'New Co',NULL); INSERT INTO orders (customer_id,status,total) VALUES (100,'paid',9.99); DELETE FROM customers WHERE id = 3")
 expect "normal writes allowed" "DELETE 1" "$OUT"
@@ -379,6 +394,12 @@ expect "undo restores 26 rows incl. cascade" "26 rows restored" "$($BIN "${CFG[@
 [ "$(fingerprint)" = "$BEFORE" ] && pass "data identical to before" || fail "data differs after undo"
 sleep 1.5
 expect "second undo refused" "already undone" "$($BIN "${CFG[@]}" undo --session "$SESSION" --apply 2>&1 || true)"
+agent coding-agent $T "UPDATE orders SET status = 'via-api' WHERE id IN (40, 41)" >/dev/null
+sleep 1.5
+S2=$($BIN "${CFG[@]}" sessions | awk 'NR==2{print $1}')
+expect "undo plan through the dashboard API" "restore public.orders row" "$(api $D/api/sessions/$S2/plan)"
+expect "undo through the dashboard API" '"restored":2' "$(api -X POST -d '{}' $D/api/sessions/$S2/undo)"
+expect "API undo restored the rows" "2" "$(admin -tAc "SELECT count(*) FROM orders WHERE id IN (40, 41) AND status = 'paid'")"
 
 echo "conflicts"
 agent coding-agent $T "UPDATE orders SET status='agent' WHERE id IN (30,31)" >/dev/null
@@ -412,7 +433,7 @@ for mode in extended prepared; do
 done
 
 echo "audit"
-expect "audit chain intact" "audit log intact" "$($BIN "${CFG[@]}" audit)"
+expect "audit chain intact" "decisions log intact" "$($BIN "${CFG[@]}" audit)"
 
 echo "TLS"
 kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null || true

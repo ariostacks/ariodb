@@ -125,26 +125,27 @@ impl Session {
         if statements.is_empty() {
             return sink.send(wire::frame(b'I', &[])).await;
         }
-        let plan = match gate::check(&self.state, &self.ctx(), &statements).await {
-            Ok(p) => p,
-            Err(r) => {
-                self.audit_rule(
-                    sql,
-                    &statements,
-                    "refused",
-                    None,
-                    Some(&r.message),
-                    r.rule.as_deref(),
-                    started,
-                );
-                return sink
-                    .send(wire::error_response(
-                        r.code,
-                        &format!("ariodb: {}", r.message),
-                    ))
-                    .await;
-            }
-        };
+        let (plan, approved) =
+            match gate::check_detailed(&self.state, &self.ctx(), &statements).await {
+                Ok(p) => p,
+                Err(r) => {
+                    self.audit_rule(
+                        sql,
+                        &statements,
+                        "refused",
+                        None,
+                        Some(&r.message),
+                        r.rule.as_deref(),
+                        started,
+                    );
+                    return sink
+                        .send(wire::error_response(
+                            r.code,
+                            &format!("ariodb: {}", r.message),
+                        ))
+                        .await;
+                }
+            };
 
         if let Err(e) = self.begin(plan).await? {
             self.audit(sql, &statements, "failed", None, Some(&e.message), started);
@@ -192,7 +193,15 @@ impl Session {
 
         if plan == Plan::Read {
             self.end(true).await?;
-            self.audit(sql, &statements, "allowed", None, None, started);
+            self.audit_rule(
+                sql,
+                &statements,
+                "allowed",
+                None,
+                None,
+                approved.as_deref(),
+                started,
+            );
             return Ok(());
         }
 
@@ -224,7 +233,15 @@ impl Session {
                 .await;
         }
         self.end(true).await?;
-        self.audit(sql, &statements, "allowed", Some(rows), None, started);
+        self.audit_rule(
+            sql,
+            &statements,
+            "allowed",
+            Some(rows),
+            None,
+            approved.as_deref(),
+            started,
+        );
         for f in held {
             sink.send(f).await?;
         }

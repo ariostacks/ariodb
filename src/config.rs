@@ -11,6 +11,7 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub database: Database,
+    #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
     pub on_failure: FailureMode,
@@ -33,6 +34,8 @@ pub struct Config {
     pub approvals: crate::approvals::Settings,
     #[serde(default)]
     pub dashboard: Dashboard,
+    #[serde(default)]
+    pub audit: crate::audit::Settings,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +98,7 @@ pub struct Credential {
 
 /// Where and how ariodb records every row an agent changes.
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct Journal {
     pub enabled: bool,
     /// Directory for the change journal and audit log.
@@ -129,9 +133,19 @@ pub struct Database {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Limits {
     pub max_rows_per_write: u64,
     pub statement_timeout_ms: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_rows_per_write: 500,
+            statement_timeout_ms: 5000,
+        }
+    }
 }
 
 /// What ariodb does when its own checks cannot run.
@@ -274,10 +288,10 @@ impl Config {
         if let Ok(url) = std::env::var("ARIODB_DATABASE_URL") {
             return url;
         }
-        if let Some(name) = &self.database.secret {
-            if let Ok(Some(url)) = self.secret(name) {
-                return url;
-            }
+        if let Some(name) = &self.database.secret
+            && let Ok(Some(url)) = self.secret(name)
+        {
+            return url;
         }
         self.database.url.clone()
     }

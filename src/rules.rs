@@ -47,7 +47,7 @@ pub struct RuleConfig {
     pub stage: Stage,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Allow,
@@ -55,7 +55,7 @@ pub enum Verdict {
     Approve,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     #[default]
@@ -135,10 +135,6 @@ impl RuleSet {
         // Highest priority first; ties keep file order.
         rules.sort_by_key(|r| std::cmp::Reverse(r.config.priority));
         Ok(RuleSet { rules })
-    }
-
-    pub fn names(&self) -> Vec<&RuleConfig> {
-        self.rules.iter().map(|r| &r.config).collect()
     }
 
     pub fn evaluate(&self, facts: &Facts) -> Outcome {

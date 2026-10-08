@@ -150,6 +150,17 @@ pub async fn check(
     ctx: &Ctx<'_>,
     statements: &[Statement],
 ) -> Result<Plan, Refusal> {
+    check_detailed(state, ctx, statements)
+        .await
+        .map(|(plan, _)| plan)
+}
+
+/// Like `check`, and also names the rule whose approval let it through.
+pub async fn check_detailed(
+    state: &State,
+    ctx: &Ctx<'_>,
+    statements: &[Statement],
+) -> Result<(Plan, Option<String>), Refusal> {
     let mut plan = Plan::Read;
     let rules = state.rules();
     let mut needs: Vec<ApprovalNeed> = Vec::new();
@@ -181,10 +192,11 @@ pub async fn check(
             RuleOutcome::Allow { .. } | RuleOutcome::NoMatch => {}
         }
     }
+    let approved = needs.first().map(|n| n.rule.clone());
     for need in needs {
         crate::approvals::require(state, ctx, statements, &need).await?;
     }
-    Ok(plan)
+    Ok((plan, approved))
 }
 
 /// Judge a write by what it actually did, against the row limit, the

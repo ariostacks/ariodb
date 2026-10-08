@@ -75,6 +75,7 @@ async fn index() -> impl IntoResponse {
                 "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
             ),
             (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CACHE_CONTROL, "no-store"),
         ],
         Html(crate::dashboard_ui::PAGE),
     )

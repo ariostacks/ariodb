@@ -84,6 +84,14 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Write recorded decisions as test fixtures for `ariodb test`
+    ExportFixtures {
+        /// Directory to write recorded.json into
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+    },
     /// Approve a pending request
     Approve {
         id: String,
@@ -188,6 +196,14 @@ async fn main() -> ExitCode {
         Command::Test { .. } => unreachable!("handled above"),
         Command::Secret { action } => secret_command(&config, action),
         Command::Approvals { all } => approvals_command(&config, all),
+        Command::ExportFixtures { out, limit } => {
+            audit::export_fixtures(Path::new(&config.journal.dir), &out, limit).map(|n| {
+                println!(
+                    "wrote {n} fixtures to {}",
+                    out.join("recorded.json").display()
+                )
+            })
+        }
         Command::Approve { id, note } => decide_command(&config, &id, true, note),
         Command::Deny { id, note } => decide_command(&config, &id, false, note),
         Command::DashboardPassword { user } => store::Db::open(Path::new(&config.journal.dir))
@@ -210,7 +226,7 @@ async fn main() -> ExitCode {
             println!("{}  (decided by: {rule})  {}", p.verdict, p.reason);
         }),
         Command::Audit => audit::verify(Path::new(&config.journal.dir))
-            .map(|n| println!("audit log intact: {n} entries")),
+            .map(|n| println!("decisions log intact: {n} entries checked")),
     };
 
     match result {
@@ -225,9 +241,9 @@ fn fail(message: String) -> ExitCode {
 }
 
 fn open_audit(config: &Config) -> Result<Arc<audit::AuditLog>, String> {
-    audit::AuditLog::open(Path::new(&config.journal.dir))
+    audit::AuditLog::open(Path::new(&config.journal.dir), &config.audit)
         .map(Arc::new)
-        .map_err(|e| format!("cannot open audit log: {e}"))
+        .map_err(|e| format!("cannot open the decisions log: {e}"))
 }
 
 fn make_state(config: &Config, path: &Path) -> Result<Arc<gate::State>, String> {
@@ -238,6 +254,21 @@ fn make_state(config: &Config, path: &Path) -> Result<Arc<gate::State>, String> 
 
 async fn serve(state: Arc<gate::State>) -> Result<(), String> {
     tokio::spawn(gate::watch_config(state.clone()));
+    let prune_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let config = prune_state.config();
+            match audit::prune(Path::new(&config.journal.dir), &config.audit) {
+                Ok(0) => {}
+                Ok(n) => println!(
+                    "ariodb: removed {n} decisions older than {} days",
+                    config.audit.retention_days
+                ),
+                Err(e) => eprintln!("ariodb: could not prune the decisions log: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
     let dashboard_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = dashboard::serve(dashboard_state).await {

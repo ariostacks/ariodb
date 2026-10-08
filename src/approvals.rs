@@ -76,7 +76,7 @@ pub struct ApproverConfig {
     pub effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApproverKind {
     Dashboard,
@@ -472,10 +472,9 @@ async fn ask_model(
         .as_ref()
         .and_then(|m| m.get(&key))
         .cloned()
+        && at.elapsed() < ttl
     {
-        if at.elapsed() < ttl {
-            return verdict;
-        }
+        return verdict;
     }
 
     let verdict = match judge(&config, approver, ctx, statements, need).await {
@@ -669,7 +668,7 @@ fn parse_judgement(text: &str) -> Judged {
             .iter()
             .filter(|b| b["type"] == "text")
             .filter_map(|b| b["text"].as_str())
-            .last()
+            .next_back()
     }) else {
         return Judged::Unavailable("no text in the response".into());
     };

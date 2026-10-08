@@ -70,7 +70,12 @@ async fn handle(
 
     // Startup: TLS negotiation first, on the raw socket. Clients may ask
     // for GSS encryption, then TLS, before the real startup message.
-    let mut first = wire::read_startup(&mut socket).await.map_err(e)?;
+    let mut first = match wire::read_startup(&mut socket).await {
+        Ok(f) => f,
+        // Port checks and load balancers connect and hang up; that is not an error.
+        Err(WireError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
     loop {
         match first.code {
             wire::GSSENC_REQUEST => {}
@@ -574,10 +579,11 @@ impl Connection {
                 return self.refuse(&r, &text, stmts, final_sync).await;
             }
         }
-        let plan = match gate::check(&self.session.state, &self.session.ctx(), &executed).await {
-            Ok(p) => p,
-            Err(r) => return self.refuse(&r, &sql, &executed, final_sync).await,
-        };
+        let (plan, approved) =
+            match gate::check_detailed(&self.session.state, &self.session.ctx(), &executed).await {
+                Ok(p) => p,
+                Err(r) => return self.refuse(&r, &sql, &executed, final_sync).await,
+            };
 
         // 2. Build what goes to the database.
         let has_execute = batch.iter().any(|f| f.tag == b'E');
@@ -676,12 +682,18 @@ impl Connection {
             self.client.write_all_frame(&wire::ready(b'I')).await?;
         }
         if has_execute {
-            self.session.audit(
+            let rule = if audit_outcome == "allowed" {
+                approved.as_deref()
+            } else {
+                None
+            };
+            self.session.audit_rule(
                 &sql,
                 &executed,
                 audit_outcome,
                 rows,
                 reason.as_deref(),
+                rule,
                 started,
             );
         }
