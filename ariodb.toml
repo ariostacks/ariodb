@@ -1,0 +1,20 @@
+# Example ariodb config. No real credentials belong in this file.
+
+on_failure = "closed"
+
+[database]
+url = "postgres://app:not-a-real-password@localhost:5432/app"
+
+[limits]
+max_rows_per_write = 500
+statement_timeout_ms = 5000
+
+[[agents]]
+name = "coding-agent"
+access = "read_write"
+tables = ["orders", "customers"]
+
+[[agents]]
+name = "support-bot"
+access = "read_only"
+tables = ["orders"]
