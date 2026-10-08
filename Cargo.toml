@@ -4,16 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+argon2 = "0.6.0"
+axum = "0.8.9"
 base64 = "0.23.1"
 bytes = "1.12.1"
 cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.7", features = ["derive"] }
+form_urlencoded = "1.2.2"
 futures = "0.3.34"
 hex = "0.4.3"
+hmac = "0.13.0"
 pg_query = "6.2.1"
 postgres-protocol = "0.6.12"
 rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls = "0.23.45"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }

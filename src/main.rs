@@ -2,6 +2,9 @@ mod approvals;
 mod audit;
 mod classify;
 mod config;
+mod dashboard;
+mod dashboard_api;
+mod dashboard_ui;
 mod exec;
 mod gate;
 mod journal;
@@ -11,6 +14,7 @@ mod policy;
 mod proxy;
 mod rules;
 mod secrets;
+mod store;
 mod testing;
 mod tls;
 mod undo;
@@ -74,6 +78,28 @@ enum Command {
     Test {
         /// A fixture .json file, or a directory of them
         fixtures: PathBuf,
+    },
+    /// List approval requests (pending ones unless --all)
+    Approvals {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Approve a pending request
+    Approve {
+        id: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Deny a pending request
+    Deny {
+        id: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Set a dashboard password (read from stdin). The first user is "root".
+    DashboardPassword {
+        #[arg(long, default_value = "root")]
+        user: String,
     },
     /// Manage encrypted secrets (database URLs, agent tokens)
     Secret {
@@ -161,6 +187,19 @@ async fn main() -> ExitCode {
         } => undo_command(&config, &session, apply, skip_conflicts).await,
         Command::Test { .. } => unreachable!("handled above"),
         Command::Secret { action } => secret_command(&config, action),
+        Command::Approvals { all } => approvals_command(&config, all),
+        Command::Approve { id, note } => decide_command(&config, &id, true, note),
+        Command::Deny { id, note } => decide_command(&config, &id, false, note),
+        Command::DashboardPassword { user } => store::Db::open(Path::new(&config.journal.dir))
+            .and_then(|db| {
+                let mut password = String::new();
+                std::io::stdin()
+                    .read_line(&mut password)
+                    .map_err(|e| e.to_string())?;
+                dashboard::set_password(&db, &user, password.trim_end_matches(['\n', '\r']))?;
+                println!("password set for '{user}'");
+                Ok(())
+            }),
         Command::Explain { agent, sql } => rules::RuleSet::compile(&config.rules).map(|rules| {
             let p = testing::preview(&config, &rules, &agent, &sql, "");
             let rule = if p.rule.is_empty() {
@@ -199,6 +238,12 @@ fn make_state(config: &Config, path: &Path) -> Result<Arc<gate::State>, String> 
 
 async fn serve(state: Arc<gate::State>) -> Result<(), String> {
     tokio::spawn(gate::watch_config(state.clone()));
+    let dashboard_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = dashboard::serve(dashboard_state).await {
+            eprintln!("ariodb: dashboard stopped: {e}");
+        }
+    });
     let config = state.config();
     if config.journal.enabled {
         let journal_config = config.clone();
@@ -232,6 +277,51 @@ fn classify_command(sql: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => fail(e.to_string()),
+    }
+}
+
+fn approvals_command(config: &Config, all: bool) -> Result<(), String> {
+    let db = store::Db::open(Path::new(&config.journal.dir))?;
+    let items = db.approvals(!all, 100)?;
+    if items.is_empty() {
+        println!(
+            "{}",
+            if all {
+                "no approval requests"
+            } else {
+                "nothing waiting for approval"
+            }
+        );
+    }
+    for a in items {
+        let by = a
+            .decided_by
+            .as_deref()
+            .map(|b| format!("by {b}"))
+            .unwrap_or_default();
+        println!(
+            "{}  {:<8} agent {:<14} rule {:<16} {:<28} {}",
+            a.id, a.status, a.agent, a.rule, by, a.sql
+        );
+    }
+    Ok(())
+}
+
+fn decide_command(
+    config: &Config,
+    id: &str,
+    allow: bool,
+    note: Option<String>,
+) -> Result<(), String> {
+    let db = store::Db::open(Path::new(&config.journal.dir))?;
+    let who = format!("cli:{}", std::env::var("USER").unwrap_or_default());
+    if db.decide(id, allow, &who, note.as_deref())? {
+        println!("{} {id}", if allow { "approved" } else { "denied" });
+        Ok(())
+    } else {
+        Err(format!(
+            "{id} is not pending (already decided, expired, or unknown)"
+        ))
     }
 }
 

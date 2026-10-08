@@ -18,6 +18,7 @@ pub struct State {
     current: RwLock<Arc<Loaded>>,
     pub config_path: PathBuf,
     pub audit: Arc<AuditLog>,
+    pub db: Arc<crate::store::Db>,
 }
 
 /// A config together with its compiled rules.
@@ -32,11 +33,15 @@ impl State {
         config_path: PathBuf,
         audit: Arc<AuditLog>,
     ) -> Result<Arc<State>, String> {
+        let db = Arc::new(crate::store::Db::open(std::path::Path::new(
+            &config.journal.dir,
+        ))?);
         let loaded = load(config)?;
         Ok(Arc::new(State {
             current: RwLock::new(Arc::new(loaded)),
             config_path,
             audit,
+            db,
         }))
     }
 

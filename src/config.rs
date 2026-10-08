@@ -26,6 +26,35 @@ pub struct Config {
     /// CEL rules on top of each agent's built-in policy.
     #[serde(default)]
     pub rules: Vec<crate::rules::RuleConfig>,
+    /// Who can approve statements that rules hold for approval.
+    #[serde(default)]
+    pub approvers: Vec<crate::approvals::ApproverConfig>,
+    #[serde(default)]
+    pub approvals: crate::approvals::Settings,
+    #[serde(default)]
+    pub dashboard: Dashboard,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct Dashboard {
+    /// Where the dashboard and approval callbacks listen. Empty turns it off.
+    pub listen: String,
+    /// The address people and Slack use to reach the dashboard, for links.
+    pub public_url: String,
+    /// Let the dashboard save edits to the config file. Leave off when the
+    /// config is managed in Git; the dashboard then shows the edit to copy.
+    pub config_writes: bool,
+}
+
+impl Default for Dashboard {
+    fn default() -> Self {
+        Dashboard {
+            listen: "127.0.0.1:8080".to_string(),
+            public_url: "http://127.0.0.1:8080".to_string(),
+            config_writes: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +235,7 @@ impl Config {
             ));
         }
         crate::rules::RuleSet::compile(&self.rules).map_err(ConfigError::Problem)?;
+        crate::approvals::validate(&self.approvers, &self.rules).map_err(ConfigError::Problem)?;
         let mut names = std::collections::HashSet::new();
         for agent in &self.agents {
             if !names.insert(agent.name.as_str()) {

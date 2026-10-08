@@ -12,8 +12,12 @@ BIN=./target/debug/ariodb
 PG=ariodb-e2e-pg
 PORT=55433
 PROXY=6544
+DASH=8091
+MOCK=8092
 WORK=$(mktemp -d)
-trap 'kill $SERVE_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+trap 'kill $SERVE_PID $MOCK_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+python3 -I "$(dirname "$0")/mock_services.py" $MOCK "$WORK/mock.log" &
+MOCK_PID=$!
 
 # Wait for ariodb to listen; fail fast if it exits instead.
 wait_for_proxy() {
@@ -117,6 +121,74 @@ name = "pg-readonly"
 secret = "pg-readonly"
 tls = "require"
 
+[dashboard]
+listen = "127.0.0.1:$DASH"
+public_url = "http://127.0.0.1:$DASH"
+
+[approvals]
+timeout_seconds = 30
+llm_fail_mode = "closed"
+
+[[approvers]]
+name = "ops"
+type = "dashboard"
+
+[[approvers]]
+name = "ops-quick"
+type = "dashboard"
+timeout_seconds = 3
+
+[[approvers]]
+name = "slack-ops"
+type = "slack"
+channel = "#agent-ops"
+bot_token_env = "E2E_SLACK_BOT"
+signing_secret_env = "E2E_SLACK_SIGNING"
+interactive = true
+
+[[approvers]]
+name = "pager"
+type = "webhook"
+url = "http://127.0.0.1:$MOCK/hook"
+hmac_secret_env = "E2E_HOOK_KEY"
+
+[[approvers]]
+name = "judge"
+type = "llm"
+api_key_env = "E2E_ANTHROPIC_KEY"
+policy = "Allow reads of orders. Deny anything else."
+
+[[rules]]
+name = "ask-dashboard"
+condition = "sql.statement.contains('/*ask-dashboard*/')"
+verdict = "approve"
+approve = ["ops"]
+reason = "marked for a human"
+
+[[rules]]
+name = "ask-quick"
+condition = "sql.statement.contains('/*ask-quick*/')"
+verdict = "approve"
+approve = ["ops-quick"]
+
+[[rules]]
+name = "ask-slack"
+condition = "sql.statement.contains('/*ask-slack*/')"
+verdict = "approve"
+approve = ["slack-ops"]
+
+[[rules]]
+name = "ask-hook"
+condition = "sql.statement.contains('/*ask-hook*/')"
+verdict = "approve"
+approve = ["pager"]
+
+[[rules]]
+name = "ask-model"
+condition = "sql.statement.contains('/*ask-model*/')"
+verdict = "approve"
+approve = ["judge"]
+
 [[rules]]
 name = "no-file-functions"
 condition = "sets.intersects(sql.functions, ['pg_read_file', 'pg_ls_dir'])"
@@ -131,6 +203,9 @@ verdict = "deny"
 reason = "changes of over 30 rows that touch customers need a human"
 EOF
 export E2E_AGENT_TOKEN=agent-token-local-test-only E2E_BOT_TOKEN=bot-token-local-test-only
+export E2E_SLACK_BOT=xoxb-not-a-real-token E2E_SLACK_SIGNING=slack-signing-test-only
+export E2E_HOOK_KEY=hook-key-test-only E2E_ANTHROPIC_KEY=sk-ant-not-a-real-key
+export ARIODB_SLACK_API=http://127.0.0.1:$MOCK/slack ARIODB_ANTHROPIC_API=http://127.0.0.1:$MOCK/anthropic
 export ARIODB_JOURNAL_URL=postgres://ariodb_journal:journal-local-test-only@127.0.0.1:$PORT/app
 unset ARIODB_DATABASE_URL ARIODB_ADMIN_URL
 CFG=(--config "$WORK/ariodb.toml")
@@ -213,6 +288,86 @@ JSON
 set +e; $BIN "${CFG[@]}" test "$WORK/fixtures" >/dev/null; code=$?; set -e
 [ $code -eq 1 ] && pass "ariodb test: drift exits 1" || fail "drift should exit 1, got $code"
 expect "explain shows the deciding rule" "deny  (decided by: no-file-functions)" "$($BIN "${CFG[@]}" explain --agent coding-agent "SELECT pg_read_file('x')")"
+
+echo "approvals"
+# Print the id of the newest pending approval, waiting for it to appear.
+wait_for_pending() {
+  for _ in $(seq 1 100); do
+    id=$($BIN "${CFG[@]}" approvals | awk '/ pending /{print $1; exit}')
+    [ -n "$id" ] && { echo "$id"; return 0; }
+    sleep 0.2
+  done
+  fail "no pending approval appeared"
+}
+OUT="$WORK/held.out"
+(agent coding-agent $T "SELECT /*ask-dashboard*/ count(*) FROM orders" > "$OUT") & BG=$!
+ID=$(wait_for_pending); $BIN "${CFG[@]}" approve "$ID" >/dev/null; wait $BG
+expect "held statement runs once approved (CLI)" "(1 row)" "$(cat "$OUT")"
+(agent coding-agent $T "SELECT /*ask-dashboard*/ 1 FROM orders" > "$OUT") & BG=$!
+ID=$(wait_for_pending); $BIN "${CFG[@]}" deny "$ID" --note "not during the freeze" >/dev/null; wait $BG
+expect "denied statement is refused with the note" "not during the freeze" "$(cat "$OUT")"
+expect "approval timeout refuses" "no decision from 'ops-quick' within 3 seconds" "$(agent coding-agent $T "SELECT /*ask-quick*/ 1 FROM orders")"
+
+D=http://127.0.0.1:$DASH
+JSONH='content-type: application/json'
+expect "dashboard API needs a login" "log in first" "$(curl -s $D/api/approvals)"
+curl -s -c "$WORK/cj" -X POST -H "$JSONH" -d '{"password":"dashboard-test-only-pw"}' $D/api/setup > "$WORK/setup.json"
+expect "first dashboard password set from this machine" '"user":"root"' "$(cat "$WORK/setup.json")"
+CSRF=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['csrf'])" "$WORK/setup.json")
+expect "a second first-run setup is refused" "already set" "$(curl -s -X POST -H "$JSONH" -d '{"password":"another-password-x"}' $D/api/setup)"
+expect "wrong password refused" "wrong user name or password" "$(curl -s -X POST -H "$JSONH" -d '{"password":"nope-nope-nope"}' $D/api/login)"
+(agent coding-agent $T "SELECT /*ask-dashboard*/ count(*) + 2 FROM orders" > "$OUT") & BG=$!
+ID=$(wait_for_pending)
+expect "dashboard lists the pending request" "$ID" "$(curl -s -b "$WORK/cj" $D/api/approvals)"
+expect "decision without CSRF token refused" "CSRF" "$(curl -s -b "$WORK/cj" -X POST -H "$JSONH" -d '{"verdict":"allow"}' $D/api/approvals/$ID)"
+expect "cross-site decision refused" "cross-site" "$(curl -s -b "$WORK/cj" -X POST -H "x-ariodb-csrf: $CSRF" -H 'Origin: http://evil.example' -H "$JSONH" -d '{"verdict":"allow"}' $D/api/approvals/$ID)"
+expect "decision through the dashboard API" '"ok":true' "$(curl -s -b "$WORK/cj" -X POST -H "x-ariodb-csrf: $CSRF" -H "$JSONH" -d '{"verdict":"allow"}' $D/api/approvals/$ID)"
+wait $BG
+expect "dashboard-approved statement runs" "(1 row)" "$(cat "$OUT")"
+
+expect "webhook approver: approve link followed" "(1 row)" "$(agent coding-agent $T "SELECT /*ask-hook*/ count(*) + 3 FROM orders")"
+expect "webhook approver: deny link followed" "denied by webhook" "$(agent coding-agent $T "SELECT /*ask-hook*/ 'deny-me' FROM orders")"
+expect "webhook payload is signed" '"signature": "sha256=' "$(grep '"webhook"' "$WORK/mock.log" | head -1)"
+expect "a forged webhook link is rejected" "not valid" "$(curl -s "$D/hooks/approvals/$ID?verdict=allow&token=forged")"
+
+(agent coding-agent $T "SELECT /*ask-slack*/ count(*) + 4 FROM orders" > "$OUT") & BG=$!
+ID=$(wait_for_pending)
+expect "Slack message posted with buttons" '"action_id": "approve"' "$(grep '"slack"' "$WORK/mock.log" | tail -1)"
+expect "Slack request uses the bot token" "Bearer xoxb-not-a-real-token" "$(grep '"slack"' "$WORK/mock.log" | tail -1)"
+slack_post() { # slack_post <id> <action> <signing-secret>
+  python3 -I - "$1" "$2" "$3" "$D/slack/actions" <<'PY'
+import hashlib, hmac, json, sys, time, urllib.parse, urllib.request
+aid, action, secret, url = sys.argv[1:]
+payload = {"user": {"username": "pat"}, "actions": [{"action_id": action, "value": aid}]}
+body = "payload=" + urllib.parse.quote(json.dumps(payload))
+ts = str(int(time.time()))
+sig = "v0=" + hmac.new(secret.encode(), f"v0:{ts}:{body}".encode(), hashlib.sha256).hexdigest()
+req = urllib.request.Request(url, data=body.encode(), headers={
+    "x-slack-request-timestamp": ts, "x-slack-signature": sig,
+    "content-type": "application/x-www-form-urlencoded"})
+try:
+    print(urllib.request.urlopen(req).read().decode())
+except urllib.error.HTTPError as e:
+    print(e.code, e.read().decode())
+PY
+}
+expect "Slack callback with a bad signature is rejected" "401" "$(slack_post "$ID" approve wrong-secret)"
+expect "Slack button approves" "Approved by pat" "$(slack_post "$ID" approve "$E2E_SLACK_SIGNING")"
+wait $BG
+expect "Slack-approved statement runs" "(1 row)" "$(cat "$OUT")"
+
+expect "model approver allows" "(1 row)" "$(agent coding-agent $T "SELECT /*ask-model*/ count(*) FROM orders")"
+expect "model approver denies with its reason" "mock judge said deny" "$(agent coding-agent $T "SELECT /*ask-model*/ 'deny-me' FROM orders")"
+expect "model outage fails closed" "failing closed" "$(agent coding-agent $T "SELECT /*ask-model*/ 'explode' FROM orders")"
+CALLS=$(grep -c '"anthropic"' "$WORK/mock.log")
+agent coding-agent $T "SELECT /*ask-model*/ count(*) FROM orders" >/dev/null
+[ "$(grep -c '"anthropic"' "$WORK/mock.log")" = "$CALLS" ] && pass "model decisions are cached" || fail "model was asked again"
+LAST=$(grep '"anthropic"' "$WORK/mock.log" | head -1)
+expect "model request: API key header" '"x-api-key": "sk-ant-not-a-real-key"' "$LAST"
+expect "model request: API version header" '"anthropic-version": "2023-06-01"' "$LAST"
+expect "model request: default model with fallback" '"anthropic-beta": "server-side-fallback-2026-07-01", "model": "claude-opus-5-5"' "$LAST"
+expect "model request: structured output" '"format": "json_schema"' "$LAST"
+expect "model decisions are recorded" "model:claude-opus-5-5" "$($BIN "${CFG[@]}" approvals --all)"
 
 echo "agent work and undo"
 OUT=$(agent coding-agent $T "UPDATE orders SET status='refunded', total=0 WHERE id IN (10,11,12); INSERT INTO customers VALUES (100,'New Co',NULL); INSERT INTO orders (customer_id,status,total) VALUES (100,'paid',9.99); DELETE FROM customers WHERE id = 3")
