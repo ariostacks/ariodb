@@ -18,7 +18,7 @@ hmac = "0.13.0"
 pg_query = "6.2.1"
 postgres-protocol = "0.6.12"
 rand = "0.10.3"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls = "0.23.45"
 rustls-pemfile = "2.2.0"

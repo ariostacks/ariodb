@@ -36,6 +36,50 @@ pub struct Config {
     pub dashboard: Dashboard,
     #[serde(default)]
     pub audit: crate::audit::Settings,
+    #[serde(default)]
+    pub clickhouse: ClickHouse,
+}
+
+/// ClickHouse: ariodb fronts its HTTP interface and its native protocol.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ClickHouse {
+    /// Where agents send ClickHouse HTTP requests. Empty turns it off.
+    pub http_listen: String,
+    /// The real ClickHouse HTTP interface, such as http://127.0.0.1:8123.
+    pub http_url: String,
+    /// Where agents connect with the native protocol (clickhouse-client). Empty turns it off.
+    pub native_listen: String,
+    /// The real ClickHouse native port, such as 127.0.0.1:9000.
+    pub native_addr: String,
+    /// The ClickHouse login ariodb uses; agents never see it.
+    pub user: String,
+    pub password_env: Option<String>,
+    pub password_secret: Option<String>,
+    /// For https:// upstreams with a private CA.
+    pub accept_invalid_certificate: bool,
+}
+
+impl Default for ClickHouse {
+    fn default() -> Self {
+        ClickHouse {
+            http_listen: String::new(),
+            http_url: "http://127.0.0.1:8123".to_string(),
+            native_listen: String::new(),
+            native_addr: "127.0.0.1:9000".to_string(),
+            user: "default".to_string(),
+            password_env: None,
+            password_secret: None,
+            accept_invalid_certificate: false,
+        }
+    }
+}
+
+/// An agent's ClickHouse access, separate from its Postgres access.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClickHouseAccess {
+    pub access: Access,
+    pub tables: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +220,9 @@ pub struct Agent {
     pub max_rows_per_write: Option<u64>,
     /// Which database login this agent's queries run as. Default: `[database]`.
     pub credential: Option<String>,
+    /// ClickHouse access, if this agent may use ClickHouse.
+    #[serde(default)]
+    pub clickhouse: Option<ClickHouseAccess>,
 }
 
 impl Agent {
@@ -299,6 +346,20 @@ impl Config {
     /// Read a value from the encrypted secret store.
     pub fn secret(&self, name: &str) -> Result<Option<String>, String> {
         crate::secrets::Store::open(Path::new(&self.journal.dir))?.get(name)
+    }
+
+    /// The ClickHouse password ariodb uses upstream.
+    pub fn clickhouse_password(&self) -> Result<String, String> {
+        match (
+            &self.clickhouse.password_secret,
+            &self.clickhouse.password_env,
+        ) {
+            (Some(name), _) => self
+                .secret(name)?
+                .ok_or_else(|| format!("secret '{name}' is not set")),
+            (None, Some(env)) => std::env::var(env).map_err(|_| format!("{env} is not set")),
+            (None, None) => Ok(String::new()),
+        }
     }
 
     /// An agent's token, from its environment variable or the secret store.

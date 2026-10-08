@@ -60,6 +60,8 @@ pub struct Statement {
     pub copy_in: bool,
     /// Functions the statement calls, lower case.
     pub functions: Vec<String>,
+    /// `postgres` or `clickhouse`.
+    pub engine: &'static str,
 }
 
 #[derive(Debug)]
@@ -123,6 +125,7 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
         setting,
         copy_in,
         functions,
+        engine: "postgres",
     })
 }
 

@@ -10,6 +10,7 @@
 //! | `sql.functions` | list | Functions called, lower case |
 //! | `sql.statement` | string | The statement as sent |
 //! | `sql.database` | string | The database the agent connected to |
+//! | `sql.engine` | string | `postgres` or `clickhouse` |
 //! | `agent.name`, `agent.access` | string | Who is asking |
 //! | `effects.rows` | int | Rows actually changed (after-stage rules only) |
 //! | `effects.tables` | list | Tables actually changed, including by triggers (after-stage only) |
@@ -307,6 +308,7 @@ fn context_for(
         ("functions", list(functions)),
         ("statement", s(&statement_text)),
         ("database", s(database)),
+        ("engine", s(first.map(|st| st.engine).unwrap_or("postgres"))),
     ]);
     let access = match agent.access {
         crate::config::Access::ReadOnly => "read_only",
@@ -343,6 +345,7 @@ mod tests {
             tables: vec!["*".into()],
             token_env: Some("UNUSED".into()),
             token_secret: None,
+            clickhouse: None,
             max_rows_per_write: None,
             credential: None,
         }

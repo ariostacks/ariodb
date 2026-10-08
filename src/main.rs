@@ -1,6 +1,8 @@
 mod approvals;
 mod audit;
+mod chsql;
 mod classify;
+mod clickhouse;
 mod config;
 mod dashboard;
 mod dashboard_api;
@@ -267,6 +269,12 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
                 Err(e) => eprintln!("ariodb: could not prune the decisions log: {e}"),
             }
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
+    let ch_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = clickhouse::serve_http(ch_state).await {
+            eprintln!("ariodb: ClickHouse HTTP proxy stopped: {e}");
         }
     });
     let dashboard_state = state.clone();

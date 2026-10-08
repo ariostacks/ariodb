@@ -73,10 +73,9 @@ pub fn decide(agent: &Agent, stmt: &Statement) -> Decision {
         );
     }
 
-    let blocked = stmt
-        .tables
-        .iter()
-        .find(|t| !agent.allows_table(t) && !(mode == Mode::ReadOnly && is_catalog(t)));
+    let blocked = stmt.tables.iter().find(|t| {
+        !agent.allows_table(t) && !(mode == Mode::ReadOnly && is_catalog(stmt.engine, t))
+    });
     if let Some(table) = blocked {
         return Decision::Deny(format!(
             "agent '{}' may not use table '{}'",
@@ -106,7 +105,14 @@ const SAFE_SETTINGS: &[&str] = &[
 /// Postgres's own catalogue. Agents may read it to discover the schema.
 /// Unqualified `pg_*` names resolve to the catalogue first, because Postgres
 /// always searches `pg_catalog` before other schemas.
-fn is_catalog(table: &str) -> bool {
+fn is_catalog(engine: &str, table: &str) -> bool {
+    if engine == "clickhouse" {
+        // Schema discovery only; not query_log, users or other servers' data.
+        return matches!(
+            table,
+            "system.tables" | "system.columns" | "system.databases" | "system.functions"
+        ) || table.starts_with("information_schema.");
+    }
     table.starts_with("pg_catalog.")
         || table.starts_with("information_schema.")
         || (table.starts_with("pg_") && !table.contains('.'))
@@ -124,6 +130,7 @@ mod tests {
             tables: vec!["orders".into()],
             token_env: Some("UNUSED".into()),
             token_secret: None,
+            clickhouse: None,
             max_rows_per_write: None,
             credential: None,
         }
