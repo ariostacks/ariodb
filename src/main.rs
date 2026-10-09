@@ -12,6 +12,7 @@ mod exec;
 mod gate;
 mod doctor;
 mod journal;
+mod llm;
 mod mysql_journal;
 mod mysql_proxy;
 mod mysql_sql;
