@@ -132,6 +132,59 @@ type = "dashboard"           # decide in the dashboard or with `ariodb approve`
 # url = "https://hooks.example.com/ariodb"
 # hmac_secret_env = "ARIODB_WEBHOOK_SECRET"
 #
+# Chat, paging and email channels. Each posts the request with Approve and
+# Deny links to the dashboard's confirmation page, so set [dashboard]
+# public_url to an address approvers can open. Webhook URLs hold their own
+# token, so they go in url_secret or url_env, never in this file.
+#
+# [[approvers]]
+# name = "ops-discord"
+# type = "discord"
+# url_env = "ARIODB_DISCORD_WEBHOOK_URL"     # or url_secret
+#
+# [[approvers]]
+# name = "ops-telegram"
+# type = "telegram"
+# bot_token_env = "ARIODB_TELEGRAM_BOT_TOKEN"   # or bot_token_secret
+# chat_id = -1001234567890                   # or "@channelusername"
+#
+# [[approvers]]
+# name = "ops-teams"
+# type = "teams"                             # a Workflows webhook flow
+# url_secret = "teams-webhook-url"
+#
+# [[approvers]]
+# name = "ops-chat"
+# type = "google_chat"
+# url_secret = "google-chat-webhook-url"
+#
+# [[approvers]]
+# name = "ops-mattermost"
+# type = "mattermost"
+# url_env = "ARIODB_MATTERMOST_WEBHOOK_URL"
+# channel = "agent-ops"                      # optional
+#
+# [[approvers]]
+# name = "on-call"
+# type = "pagerduty"                         # Events API v2; resolved once decided
+# routing_key_env = "ARIODB_PAGERDUTY_ROUTING_KEY"
+# region = "us"                              # or "eu"
+#
+# [[approvers]]
+# name = "on-call-opsgenie"
+# type = "opsgenie"                          # closed once decided
+# api_key_secret = "opsgenie-key"            # or api_key_env
+# region = "us"                              # or "eu"
+#
+# [[approvers]]
+# name = "ops-email"
+# type = "email"
+# smtp_host = "smtp.example.com"
+# smtp_tls = "starttls"                      # default (587); "tls" (465); "none" only for this machine
+# smtp_user = "ariodb@example.com"
+# smtp_password_env = "ARIODB_SMTP_PASSWORD" # or smtp_password_secret
+# from = "ariodb <ariodb@example.com>"
+# to = ["dba-oncall@example.com"]
 #
 # A model judging against a written policy. The statements, the policy and
 # the agent's name are sent to the provider, so they leave your network
@@ -188,11 +241,11 @@ llm_fail_mode = "closed"     # model unreachable: "closed" refuses, "open" allow
 llm_cache_seconds = 300
 
 # ---------------------------------------------------------------------------
-# The dashboard, and the callbacks Slack and webhooks use.
+# The dashboard, and the callbacks Slack and the approval links use.
 
 [dashboard]
 listen = "127.0.0.1:8080"    # "" switches it off
-public_url = "http://127.0.0.1:8080"   # the address people and Slack use
+public_url = "http://127.0.0.1:8080"   # the address people, Slack and approval links use
 config_writes = false        # true lets the dashboard save this file
 
 [audit]

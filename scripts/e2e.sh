@@ -24,10 +24,11 @@ PORT=$((55433 + OFF))
 PROXY=$((6544 + OFF))
 DASH=$((8091 + OFF))
 MOCK=$((8092 + OFF))
+SMTP=$((8093 + OFF))
 WORK=$(mktemp -d)
 SERVE_PID=""
 trap 'kill $SERVE_PID $MOCK_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
-python3 -I "$(dirname "$0")/mock_services.py" $MOCK "$WORK/mock.log" &
+python3 -I "$(dirname "$0")/mock_services.py" $MOCK "$WORK/mock.log" $SMTP &
 MOCK_PID=$!
 
 # Wait for ariodb to listen; fail fast if it exits instead.
@@ -184,6 +185,55 @@ url = "http://127.0.0.1:$MOCK/hook"
 hmac_secret_env = "E2E_HOOK_KEY"
 
 [[approvers]]
+name = "discord-ops"
+type = "discord"
+url_env = "E2E_DISCORD_URL"
+
+[[approvers]]
+name = "telegram-ops"
+type = "telegram"
+bot_token_env = "E2E_TELEGRAM_BOT"
+chat_id = -1001234567890
+
+[[approvers]]
+name = "teams-ops"
+type = "teams"
+url_env = "E2E_TEAMS_URL"
+
+[[approvers]]
+name = "gchat-ops"
+type = "google_chat"
+url_secret = "gchat-webhook"
+
+[[approvers]]
+name = "mattermost-ops"
+type = "mattermost"
+url_env = "E2E_MATTERMOST_URL"
+channel = "agent-ops"
+
+[[approvers]]
+name = "pagerduty-ops"
+type = "pagerduty"
+routing_key_env = "E2E_PAGERDUTY_KEY"
+
+[[approvers]]
+name = "opsgenie-ops"
+type = "opsgenie"
+api_key_secret = "opsgenie-key"
+region = "eu"
+
+[[approvers]]
+name = "email-ops"
+type = "email"
+smtp_host = "127.0.0.1"
+smtp_port = $SMTP
+smtp_tls = "none"
+smtp_user = "ariodb"
+smtp_password_env = "E2E_SMTP_PASSWORD"
+from = "ariodb <ariodb@example.test>"
+to = ["ops@example.test", "Second Approver <second@example.test>"]
+
+[[approvers]]
 name = "judge"
 type = "llm"
 api_key_env = "E2E_ANTHROPIC_KEY"
@@ -256,6 +306,62 @@ verdict = "approve"
 approve = ["pager"]
 
 [[rules]]
+name = "ask-discord"
+condition = "sql.statement.contains('/*ask-channel:discord*/')"
+verdict = "approve"
+approve = ["discord-ops"]
+reason = "marked for a person on Discord"
+
+[[rules]]
+name = "ask-telegram"
+condition = "sql.statement.contains('/*ask-channel:telegram*/')"
+verdict = "approve"
+approve = ["telegram-ops"]
+reason = "marked for a person on Telegram"
+
+[[rules]]
+name = "ask-teams"
+condition = "sql.statement.contains('/*ask-channel:teams*/')"
+verdict = "approve"
+approve = ["teams-ops"]
+reason = "marked for a person on Teams"
+
+[[rules]]
+name = "ask-gchat"
+condition = "sql.statement.contains('/*ask-channel:gchat*/')"
+verdict = "approve"
+approve = ["gchat-ops"]
+reason = "marked for a person on Google Chat"
+
+[[rules]]
+name = "ask-mattermost"
+condition = "sql.statement.contains('/*ask-channel:mattermost*/')"
+verdict = "approve"
+approve = ["mattermost-ops"]
+reason = "marked for a person on Mattermost"
+
+[[rules]]
+name = "ask-pagerduty"
+condition = "sql.statement.contains('/*ask-channel:pagerduty*/')"
+verdict = "approve"
+approve = ["pagerduty-ops"]
+reason = "marked for the on-call person"
+
+[[rules]]
+name = "ask-opsgenie"
+condition = "sql.statement.contains('/*ask-channel:opsgenie*/')"
+verdict = "approve"
+approve = ["opsgenie-ops"]
+reason = "marked for the on-call person"
+
+[[rules]]
+name = "ask-email"
+condition = "sql.statement.contains('/*ask-channel:email*/')"
+verdict = "approve"
+approve = ["email-ops"]
+reason = "marked for a person by email"
+
+[[rules]]
 name = "ask-model"
 condition = "sql.statement.contains('/*ask-model*/')"
 verdict = "approve"
@@ -311,6 +417,12 @@ export E2E_OPENAI_KEY=sk-not-a-real-key-openai E2E_GEMINI_KEY=gemini-key-local-t
 export E2E_AZURE_KEY=azure-key-local-test-only E2E_COMPAT_KEY=sk-not-a-real-key-compat
 export ARIODB_SLACK_API=http://127.0.0.1:$MOCK/slack ARIODB_ANTHROPIC_API=http://127.0.0.1:$MOCK/anthropic
 export ARIODB_OPENAI_API=http://127.0.0.1:$MOCK/openai ARIODB_GEMINI_API=http://127.0.0.1:$MOCK/gemini
+export E2E_DISCORD_URL=http://127.0.0.1:$MOCK/discord/api/webhooks/123/not-a-real-token
+export E2E_TELEGRAM_BOT=123456:not-a-real-token E2E_TEAMS_URL=http://127.0.0.1:$MOCK/teams/workflows/not-a-real-sig
+export E2E_MATTERMOST_URL=http://localhost:$MOCK/mattermost/hooks/not-a-real-hook
+export E2E_PAGERDUTY_KEY=not-a-real-routing-key E2E_SMTP_PASSWORD=smtp-local-test-only
+export ARIODB_TELEGRAM_API=http://127.0.0.1:$MOCK/telegram ARIODB_PAGERDUTY_API=http://127.0.0.1:$MOCK/pagerduty
+export ARIODB_OPSGENIE_API=http://127.0.0.1:$MOCK/opsgenie
 export ARIODB_JOURNAL_URL=postgres://ariodb_journal:journal-local-test-only@127.0.0.1:$PORT/app
 unset ARIODB_DATABASE_URL ARIODB_ADMIN_URL
 CFG=(--config "$WORK/ariodb.toml")
@@ -319,6 +431,8 @@ CFG=(--config "$WORK/ariodb.toml")
 # encrypted store.
 printf '%s\n' "$E2E_BOT_TOKEN" | $BIN "${CFG[@]}" secret set bot-token >/dev/null
 printf '%s\n' "postgres://ariodb_ro:ro-local-test-only@127.0.0.1:$PORT/app" | $BIN "${CFG[@]}" secret set pg-readonly >/dev/null
+printf '%s\n' "http://127.0.0.1:$MOCK/gchat/v1/spaces/AAAA/messages?key=not-a-real-key&token=not-a-real-token" | $BIN "${CFG[@]}" secret set gchat-webhook >/dev/null
+printf '%s\n' "not-a-real-genie-key" | $BIN "${CFG[@]}" secret set opsgenie-key >/dev/null
 
 echo "doctor"
 DOC=$($BIN "${CFG[@]}" doctor 2>&1 || true)
@@ -469,6 +583,70 @@ expect "and decides nothing" "pending" "$($BIN "${CFG[@]}" approvals | grep "$ID
 expect "the confirmation button records the decision" "Recorded: approved" "$(curl -s -X POST "$LINK")"
 wait $BG
 expect "webhook-confirmed statement runs" "(1 row)" "$(cat "$OUT")"
+
+echo "approval channels"
+# The mock records each channel's message with the links found where that
+# channel puts them (buttons, card actions, markdown links, the mail's text
+# part). Follow them as a person would: open the link (a confirmation
+# page), then press its button (a POST).
+channel_link() { # channel_link <service> <approval id> <allow|deny>
+  local link
+  for _ in $(seq 1 50); do
+    link=$(python3 -I - "$WORK/mock.log" "$1" "$2" "$3" <<'PY'
+import json, sys
+log, service, aid, verdict = sys.argv[1:]
+for line in open(log):
+    e = json.loads(line)
+    if e.get("service") == service and aid in e.get("links", {}).get(verdict, ""):
+        print(e["links"][verdict])
+PY
+)
+    [ -n "$link" ] && { echo "$link" | tail -1; return 0; }
+    sleep 0.2
+  done
+  fail "$1: no message for $2" >&2
+}
+N=10
+for c in discord telegram teams gchat mattermost pagerduty opsgenie email; do
+  N=$((N + 1))
+  (agent coding-agent $T "SELECT /*ask-channel:$c*/ count(*) + $N FROM orders" > "$OUT") & BG=$!
+  ID=$(wait_for_pending)
+  LINK=$(channel_link $c "$ID" allow)
+  expect "$c: the Approve link opens the confirmation page" "Approve this request" "$(curl -s "$LINK")"
+  expect "$c: and its button records the decision" "Recorded: approved" "$(curl -s -X POST "$LINK")"
+  wait $BG
+  expect "$c: the approved statement runs" "(1 row)" "$(cat "$OUT")"
+  (agent coding-agent $T "SELECT /*ask-channel:$c*/ count(*) - $N FROM orders" > "$OUT") & BG=$!
+  ID=$(wait_for_pending)
+  LINK=$(channel_link $c "$ID" deny)
+  expect "$c: the Deny link records a denial" "Recorded: denied" "$(curl -s -X POST "$LINK")"
+  wait $BG
+  expect "$c: the denied statement is refused" "denied by webhook" "$(cat "$OUT")"
+  OUTR=$(agent coding-agent $T "SELECT /*ask-channel:$c*/ 'reject-me' FROM orders")
+  expect "$c: a channel that turns the message away refuses the statement" "could not reach approver '" "$OUTR"
+  if grep -q 'not-a-real' <<<"$OUTR"; then echo "$OUTR"; fail "$c: a credential reached the agent"; else pass "$c: and the refusal names no credential"; fi
+done
+[ -z "$(grep '"wrong"' "$WORK/mock.log")" ] && pass "every channel message passed the mock's checks" || { grep '"wrong"' "$WORK/mock.log"; fail "malformed channel messages"; }
+expect "a message turned away is recorded as denied by ariodb" "by ariodb" "$($BIN "${CFG[@]}" approvals --all | grep "denied.*reject-me" | head -1)"
+mock_entry() { grep "\"service\": \"$1\"" "$WORK/mock.log" | grep '"links"' | tail -1; }
+expect "discord: markdown content" '"content": "**ariodb approval needed**' "$(mock_entry discord)"
+expect "telegram: the bot token in the path, the chat id as a number" '"token": "123456:not-a-real-token", "chat_id": -1001234567890' "$(mock_entry telegram)"
+expect "teams: an Adaptive Card" '"version": "1.4"' "$(mock_entry teams)"
+expect "mattermost: posted to the configured channel" '"channel": "agent-ops"' "$(mock_entry mattermost)"
+expect "pagerduty: the approval id is the dedup key" '"routing_key": "not-a-real-routing-key", "dedup_key": "a-' "$(mock_entry pagerduty)"
+expect "opsgenie: the key from the secret store, as GenieKey" '"auth": "GenieKey not-a-real-genie-key"' "$(mock_entry opsgenie)"
+expect "email: signed in and sent to every address" '"auth": "ariodb", "from": "<ariodb@example.test>", "to": ["<ops@example.test>", "<second@example.test>"]' "$(mock_entry email)"
+expect "email: text and HTML parts" '"type": "multipart/alternative"' "$(mock_entry email)"
+for _ in $(seq 1 25); do [ "$(grep -c '"closed"' "$WORK/mock.log")" -ge 2 ] && break; sleep 0.2; done
+expect "pagerduty: the incident is resolved once decided" '"resolved": "a-' "$(grep '"resolved"' "$WORK/mock.log" | tail -1)"
+expect "opsgenie: the alert is closed once decided" '"note": "ariodb: denied by webhook' "$(grep '"closed"' "$WORK/mock.log" | tail -1)"
+expect "the link key lives in the secret store" "approval-link-key" "$($BIN "${CFG[@]}" secret list)"
+sed -e 's|^url_secret = "gchat-webhook"|url = "https://chat.example.test/hook"|' "$WORK/ariodb.toml" > "$WORK/plain-url.toml"
+expect "a webhook URL in the config file is refused at load" "the URL itself is the credential" \
+  "$($BIN --config "$WORK/plain-url.toml" check 2>&1 || true)"
+sed -e 's|^smtp_host = "127.0.0.1"|smtp_host = "smtp.example.test"|' "$WORK/ariodb.toml" > "$WORK/plain-smtp.toml"
+expect "unencrypted SMTP to another machine is refused at load" "only allowed for a mail server on this machine" \
+  "$($BIN --config "$WORK/plain-smtp.toml" check 2>&1 || true)"
 
 (agent coding-agent $T "SELECT /*ask-slack*/ count(*) + 4 FROM orders" > "$OUT") & BG=$!
 ID=$(wait_for_pending)

@@ -1,5 +1,6 @@
 mod approvals;
 mod audit;
+mod channels;
 mod chsql;
 mod classify;
 mod clickhouse;
