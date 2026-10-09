@@ -221,14 +221,10 @@ async fn handle(socket: TcpStream, state: Arc<State>) -> Result<(), String> {
 
     // 2. Log in to ClickHouse at a revision both sides can share.
     let our_revision = hello.revision.min(MAX_REVISION);
-    let upstream = TcpStream::connect(&config.clickhouse.native_addr)
+    let native_addr = config.clickhouse_native_addr()?;
+    let upstream = TcpStream::connect(&native_addr)
         .await
-        .map_err(|e| {
-            format!(
-                "cannot reach ClickHouse at {}: {e}",
-                config.clickhouse.native_addr
-            )
-        })?;
+        .map_err(|e| format!("cannot reach ClickHouse at {native_addr}: {e}"))?;
     let _ = upstream.set_nodelay(true);
     let (up_read, mut up_write) = upstream.into_split();
     let mut u = Rd {

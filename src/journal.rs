@@ -107,7 +107,7 @@ fn journal_url(config: &Config) -> String {
 
 async fn connect(config: &Config, url: &str) -> Result<Client, String> {
     let target = config.admin_target(url)?;
-    crate::upstream::admin_client(target.tls, url).await
+    crate::upstream::admin_client(&target, url).await
 }
 
 /// Prepare the database: full before-images on protected tables, a

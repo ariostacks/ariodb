@@ -62,6 +62,36 @@ ariodb audit                                   # check the audit log is intact
 ariodb classify "EXPLAIN ANALYZE DELETE FROM users"
 ```
 
+## Tunnels
+
+When the database is only reachable through a side process (cloud-sql-proxy,
+an IAP tunnel, an SSH port-forward), let ariodb run it:
+
+```toml
+[database]
+url = "postgres://ariodb_gw:...@10.20.0.5:5432/app"
+tunnel = "cloudsql"
+
+[[tunnels]]
+name = "cloudsql"
+command = ["cloud-sql-proxy", "--port", "5433", "my-project:europe-west2:app-db"]
+listen = "127.0.0.1:5433"     # where the process listens
+ready_timeout_seconds = 30    # how long to wait for that port to accept connections
+restart = true                # start it again, with backoff, if it exits
+```
+
+`ariodb serve` starts every tunnel before it accepts agents and refuses to
+start if one does not come up in time. A tunnel that exits is restarted after
+1 s, doubling to 30 s; its output appears in ariodb's log prefixed with
+`tunnel <name>:`. Stopping ariodb (Ctrl-C or SIGTERM) stops the tunnels.
+
+A connection that names a tunnel (`[database]`, any `[[credentials]]`, or
+`[clickhouse]`) dials the tunnel's `listen` address; the user, password,
+database and TLS settings still come from its URL, so TLS is checked against
+the real host name. `ariodb setup`, `undo` and `mcp` use a tunnel that
+`ariodb serve` is already running, or start their own for the duration.
+Tunnel changes need a restart.
+
 ## Database roles
 
 - **Gateway role** (`ARIODB_DATABASE_URL`): ordinary privileges on the tables
@@ -77,6 +107,8 @@ Make sure agents can reach the database only through ariodb.
 |---|---|
 | Insert, update, delete, including cascades and trigger effects | Undone |
 | `TRUNCATE`, `DROP`, schema changes | Refused for agents, so never need undoing |
+| Rows someone else changed after the session first did | Reported as conflicts; left alone with `--skip-conflicts`, otherwise nothing is undone |
+| Undo steps that would cascade (or trigger updates and deletes) into rows the session never touched | Refused; nothing is undone |
 | Rows in tables without a primary key | Reported as not undoable |
 | Sequence values | Not rewound; gaps in IDs are harmless |
 | Anything outside the database (emails, payments) | Out of scope |
@@ -91,9 +123,17 @@ roadmap in the design document.
 ## Testing
 
 ```bash
-cargo test            # unit tests
-./scripts/e2e.sh      # end-to-end against Postgres in Docker
+cargo test                      # unit and property tests (PROPTEST_CASES=100000 for a longer hunt)
+./scripts/e2e.sh                # end-to-end against Postgres in Docker
+./scripts/e2e-clickhouse.sh     # end-to-end against ClickHouse in Docker
+./scripts/sim-undo.sh           # seeded random agent and human writes, then undo, checked against a model
+SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh   # other seeds, longer runs
 ```
+
+The undo simulation brackets every write with a snapshot of the database,
+predicts each undo from those snapshots alone, and fails with the seed, the
+plan, what changed and the history of the rows involved when ariodb
+disagrees. The same seed always produces the same workload.
 
 ## Licence
 

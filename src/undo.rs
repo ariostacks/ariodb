@@ -76,6 +76,9 @@ pub struct Step {
     pub sql: String,
     /// Identifies the row, for conflict detection.
     key: (String, Vec<Option<String>>),
+    /// Rows the step updates or deletes itself: 1, or 0 for a re-insert.
+    /// Anything more was done by a cascade or trigger.
+    own_changes: i64,
 }
 
 pub struct Conflict {
@@ -96,7 +99,16 @@ pub struct Plan {
 pub async fn connect(config: &Config) -> Result<Client, String> {
     let url = std::env::var("ARIODB_ADMIN_URL").unwrap_or_else(|_| config.database_url());
     let target = config.admin_target(&url)?;
-    crate::upstream::admin_client(target.tls, &url).await
+    crate::upstream::admin_client(&target, &url).await
+}
+
+/// A row one session changed: its first and last change to it.
+struct Touch<'a> {
+    first: &'a Change,
+    last: &'a Change,
+    /// The position of the session's last change to the row, counting
+    /// all its changes in commit order.
+    last_seen: usize,
 }
 
 pub async fn plan(client: &Client, records: &[TxnRecord], session: &str) -> Result<Plan, String> {
@@ -113,10 +125,13 @@ pub async fn plan(client: &Client, records: &[TxnRecord], session: &str) -> Resu
         .any(|r| r.session.as_deref() == Some(undo_tag.as_str()));
 
     let mut infos: HashMap<String, TableInfo> = HashMap::new();
-    let mut steps = Vec::new();
     let mut blocked = Vec::new();
-    // Last position at which this session touched each row.
-    let mut last_touch: HashMap<(String, Vec<Option<String>>), u64> = HashMap::new();
+    // Each row this session changed, in the order it first changed them.
+    let mut touched: Vec<Touch> = Vec::new();
+    let mut by_key: HashMap<(String, Vec<Option<String>>), usize> = HashMap::new();
+    // Where this session first changed each row.
+    let mut first_touch: HashMap<(String, Vec<Option<String>>), u64> = HashMap::new();
+    let mut seen = 0;
 
     for txn in &mine {
         for change in &txn.changes {
@@ -135,18 +150,50 @@ pub async fn plan(client: &Client, records: &[TxnRecord], session: &str) -> Resu
                 ));
                 continue;
             }
-            match inverse(change, info) {
-                Ok(step) => {
-                    last_touch.insert(step.key.clone(), txn.lsn);
-                    steps.push(step);
+            let Some(values) = change.new.as_ref().or(change.old.as_ref()) else {
+                blocked.push(format!("{table}: a change without values"));
+                continue;
+            };
+            let key = (table, key_of(change, values, &info.primary_key));
+            first_touch.entry(key.clone()).or_insert(txn.lsn);
+            seen += 1;
+            match by_key.get(&key) {
+                Some(&i) => {
+                    touched[i].last = change;
+                    touched[i].last_seen = seen;
                 }
-                Err(reason) => blocked.push(format!("{table}: {reason}")),
+                None => {
+                    by_key.insert(key, touched.len());
+                    touched.push(Touch {
+                        first: change,
+                        last: change,
+                        last_seen: seen,
+                    });
+                }
             }
         }
     }
-    steps.reverse();
 
-    // Did anyone else touch these rows later? Includes earlier undo runs.
+    // One step per row, from what the session left back to what was there
+    // before it first changed the row. Replaying every change backwards
+    // would give a row several steps that must run in order, and the
+    // foreign-key retry in `apply` reorders steps. Latest rows first, as
+    // that is usually the order foreign keys need.
+    touched.sort_by_key(|t| std::cmp::Reverse(t.last_seen));
+    let mut steps = Vec::new();
+    for t in &touched {
+        let info = &infos[&t.first.qualified_table()];
+        match net_inverse(t.first, t.last, info) {
+            Ok(Some(step)) => steps.push(step),
+            Ok(None) => {} // inserted and deleted again: nothing to undo
+            Err(reason) => blocked.push(format!("{}: {reason}", t.first.qualified_table())),
+        }
+    }
+
+    // Did anyone else touch these rows after this session first did?
+    // Restoring the session's before-image would overwrite their change,
+    // even when the session changed the row again afterwards. Includes
+    // earlier undo runs.
     let mut conflicts = Vec::new();
     for txn in records
         .iter()
@@ -159,7 +206,7 @@ pub async fn plan(client: &Client, records: &[TxnRecord], session: &str) -> Resu
             };
             for values in [&change.old, &change.new].into_iter().flatten() {
                 let key = (table.clone(), key_of(change, values, &info.primary_key));
-                if let Some(&mine_at) = last_touch.get(&key)
+                if let Some(&mine_at) = first_touch.get(&key)
                     && txn.lsn > mine_at
                 {
                     let who = txn
@@ -228,8 +275,10 @@ pub async fn apply(
     .map_err(err)?;
 
     // Foreign keys can make the right order hard to know in advance (a child
-    // row needs its parent back first). Retry steps that fail on a foreign
-    // key until no more progress is made.
+    // row needs its parent back first, and a parent must not go before its
+    // children, or deleting it cascades). Retry steps that fail on a
+    // foreign key, or that would change rows the session never touched,
+    // until no more progress is made.
     let mut pending: Vec<&Step> = plan
         .steps
         .iter()
@@ -244,8 +293,24 @@ pub async fn apply(
             tx.batch_execute("SAVEPOINT ariodb_step")
                 .await
                 .map_err(err)?;
+            let changed_before = rows_changed(&tx).await.map_err(err)?;
             match tx.execute(step.sql.as_str(), &[]).await {
                 Ok(1) => {
+                    let extra =
+                        rows_changed(&tx).await.map_err(err)? - changed_before - step.own_changes;
+                    if extra > 0 {
+                        // An ON DELETE CASCADE or SET NULL, or a trigger,
+                        // reached rows that are not this session's to undo.
+                        tx.batch_execute("ROLLBACK TO SAVEPOINT ariodb_step")
+                            .await
+                            .map_err(err)?;
+                        last_error = format!(
+                            "{} would also change {extra} other rows (a foreign key cascade or a trigger), which undo leaves alone",
+                            step.description
+                        );
+                        retry.push(step);
+                        continue;
+                    }
                     tx.batch_execute("RELEASE SAVEPOINT ariodb_step")
                         .await
                         .map_err(err)?;
@@ -281,13 +346,24 @@ pub async fn apply(
         }
         if retry.len() == before {
             return Err(format!(
-                "could not order the undo around foreign keys: {last_error}; nothing was undone"
+                "could not undo without touching other rows: {last_error}; nothing was undone"
             ));
         }
         pending = retry;
     }
     tx.commit().await.map_err(err)?;
     Ok(done)
+}
+
+/// Rows updated or deleted so far in this transaction, in every table,
+/// including attempts rolled back to a savepoint (only differences are used).
+async fn rows_changed(tx: &tokio_postgres::Transaction<'_>) -> Result<i64, tokio_postgres::Error> {
+    tx.query_one(
+        "SELECT coalesce(sum(n_tup_upd + n_tup_del), 0)::bigint FROM pg_stat_xact_user_tables",
+        &[],
+    )
+    .await
+    .map(|r| r.get(0))
 }
 
 async fn table_info(client: &Client, table: &str) -> Result<TableInfo, String> {
@@ -374,8 +450,11 @@ fn literal(cell: &Option<Cell>, sql_type: &str) -> Result<String, String> {
     }
 }
 
-fn inverse(change: &Change, info: &TableInfo) -> Result<Step, String> {
-    let table = change.qualified_table();
+/// The single step that takes a row from the session's last change back to
+/// how it was before the session's first change. `None` when there is
+/// nothing to do: the session inserted the row and deleted it again.
+fn net_inverse(first: &Change, last: &Change, info: &TableInfo) -> Result<Option<Step>, String> {
+    let table = first.qualified_table();
     let qt = quote_table(&table);
     let type_of = |col: &str| {
         info.types
@@ -384,7 +463,7 @@ fn inverse(change: &Change, info: &TableInfo) -> Result<Step, String> {
             .unwrap_or_else(|| "text".into())
     };
 
-    let where_clause = |values: &[Option<Cell>]| -> Result<String, String> {
+    let where_clause = |change: &Change, values: &[Option<Cell>]| -> Result<String, String> {
         let mut parts = Vec::new();
         for col in &info.primary_key {
             let i = change
@@ -401,60 +480,71 @@ fn inverse(change: &Change, info: &TableInfo) -> Result<Step, String> {
         Ok(parts.join(" AND "))
     };
 
-    match change.op {
-        Op::Insert => {
-            let new = change.new.as_ref().ok_or("insert without values")?;
-            let key = key_of(change, new, &info.primary_key);
-            Ok(Step {
-                description: format!("delete inserted {table} row {}", show_key(&key)),
-                sql: format!("DELETE FROM {qt} WHERE {}", where_clause(new)?),
-                key: (table, key),
-            })
-        }
-        Op::Update => {
-            let old = change
+    // What was there before the session, and what it left.
+    let before = match first.op {
+        Op::Insert => None,
+        Op::Update => Some(
+            first
                 .old
                 .as_ref()
-                .ok_or("update without before-image; run `ariodb setup`")?;
-            let new = change.new.as_ref().ok_or("update without values")?;
-            let mut sets = Vec::new();
-            for (i, col) in change.columns.iter().enumerate() {
-                if info.generated.contains(col) {
-                    continue;
-                }
-                sets.push(format!(
-                    "{} = {}",
-                    quote_ident(col),
-                    literal(&old[i], &type_of(col))?
-                ));
+                .ok_or("update without before-image; run `ariodb setup`")?,
+        ),
+        Op::Delete => Some(
+            first
+                .old
+                .as_ref()
+                .ok_or("delete without before-image; run `ariodb setup`")?,
+        ),
+        Op::Truncate => return Err("TRUNCATE cannot be undone".to_string()),
+    };
+    let after = match last.op {
+        Op::Insert | Op::Update => Some(last.new.as_ref().ok_or("change without values")?),
+        Op::Delete => None,
+        Op::Truncate => return Err("TRUNCATE cannot be undone".to_string()),
+    };
+    // Generated columns cannot be written; Postgres recomputes them.
+    let writable = |old: &[Option<Cell>]| -> Result<Vec<(String, String)>, String> {
+        let mut out = Vec::new();
+        for (i, col) in first.columns.iter().enumerate() {
+            if !info.generated.contains(col) {
+                out.push((quote_ident(col), literal(&old[i], &type_of(col))?));
             }
-            let key = key_of(change, new, &info.primary_key);
-            Ok(Step {
+        }
+        Ok(out)
+    };
+
+    Ok(match (before, after) {
+        (None, None) => None,
+        (None, Some(new)) => {
+            let key = key_of(last, new, &info.primary_key);
+            Some(Step {
+                description: format!("delete inserted {table} row {}", show_key(&key)),
+                sql: format!("DELETE FROM {qt} WHERE {}", where_clause(last, new)?),
+                key: (table, key),
+                own_changes: 1,
+            })
+        }
+        (Some(old), Some(new)) => {
+            let sets: Vec<String> = writable(old)?
+                .into_iter()
+                .map(|(col, value)| format!("{col} = {value}"))
+                .collect();
+            let key = key_of(last, new, &info.primary_key);
+            Some(Step {
                 description: format!("restore {table} row {}", show_key(&key)),
                 sql: format!(
                     "UPDATE {qt} SET {} WHERE {}",
                     sets.join(", "),
-                    where_clause(new)?
+                    where_clause(last, new)?
                 ),
                 key: (table, key),
+                own_changes: 1,
             })
         }
-        Op::Delete => {
-            let old = change
-                .old
-                .as_ref()
-                .ok_or("delete without before-image; run `ariodb setup`")?;
-            let mut cols = Vec::new();
-            let mut vals = Vec::new();
-            for (i, col) in change.columns.iter().enumerate() {
-                if info.generated.contains(col) {
-                    continue;
-                }
-                cols.push(quote_ident(col));
-                vals.push(literal(&old[i], &type_of(col))?);
-            }
-            let key = key_of(change, old, &info.primary_key);
-            Ok(Step {
+        (Some(old), None) => {
+            let (cols, vals): (Vec<String>, Vec<String>) = writable(old)?.into_iter().unzip();
+            let key = key_of(first, old, &info.primary_key);
+            Some(Step {
                 description: format!("re-insert deleted {table} row {}", show_key(&key)),
                 sql: format!(
                     "INSERT INTO {qt} ({}) OVERRIDING SYSTEM VALUE VALUES ({})",
@@ -462,10 +552,10 @@ fn inverse(change: &Change, info: &TableInfo) -> Result<Step, String> {
                     vals.join(", ")
                 ),
                 key: (table, key),
+                own_changes: 0,
             })
         }
-        Op::Truncate => Err("TRUNCATE cannot be undone".to_string()),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -495,6 +585,11 @@ mod tests {
             old: old.map(cells),
             new: new.map(cells),
         }
+    }
+
+    /// One change undone on its own.
+    fn inverse(c: &Change, info: &TableInfo) -> Result<Step, String> {
+        net_inverse(c, c, info).map(|s| s.expect("a step"))
     }
 
     #[test]
@@ -541,5 +636,29 @@ mod tests {
         let mut c = change(Op::Delete, Some(("7", "paid")), None);
         c.old.as_mut().unwrap()[1] = Some(Cell::Unchanged { unchanged: true });
         assert!(inverse(&c, &info()).is_err());
+    }
+
+    #[test]
+    fn several_changes_to_one_row_become_one_step() {
+        let insert = change(Op::Insert, None, Some(("7", "new")));
+        let update = change(Op::Update, Some(("7", "new")), Some(("7", "newer")));
+        let delete = change(Op::Delete, Some(("7", "newer")), None);
+        let paid = change(Op::Update, Some(("7", "paid")), Some(("7", "void")));
+
+        // Inserted, then deleted: nothing to do, whatever happened between.
+        assert!(net_inverse(&insert, &delete, &info()).unwrap().is_none());
+        // Inserted, then changed: delete it.
+        let s = net_inverse(&insert, &update, &info()).unwrap().unwrap();
+        assert!(s.sql.starts_with("DELETE FROM"), "{}", s.sql);
+        // Changed, then deleted: put the original back.
+        let s = net_inverse(&paid, &delete, &info()).unwrap().unwrap();
+        assert!(
+            s.sql.contains("VALUES ('7'::integer, 'paid'::text)"),
+            "{}",
+            s.sql
+        );
+        // Changed twice: back to the first before-image.
+        let s = net_inverse(&paid, &update, &info()).unwrap().unwrap();
+        assert!(s.sql.contains(r#""status" = 'paid'::text"#), "{}", s.sql);
     }
 }

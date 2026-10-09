@@ -202,15 +202,9 @@ async fn query(
         };
 
     // Build the upstream request.
-    let mut url = match reqwest::Url::parse(&config.clickhouse.http_url) {
+    let (mut url, resolve) = match config.clickhouse_http_url() {
         Ok(u) => u,
-        Err(e) => {
-            return ch_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                1000,
-                &format!("bad clickhouse.http_url: {e}"),
-            );
-        }
+        Err(e) => return ch_error(StatusCode::INTERNAL_SERVER_ERROR, 1000, &e),
     };
     {
         let mut q = url.query_pairs_mut();
@@ -242,10 +236,12 @@ async fn query(
         Err(e) => return ch_error(StatusCode::INTERNAL_SERVER_ERROR, 1000, &e),
     };
     crate::tls::init();
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(config.clickhouse.accept_invalid_certificate)
-        .build()
-        .expect("HTTP client");
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(config.clickhouse.accept_invalid_certificate);
+    if let Some((domain, addr)) = &resolve {
+        builder = builder.resolve(domain, *addr);
+    }
+    let client = builder.build().expect("HTTP client");
     let mut req = client
         .post(url)
         .header("x-clickhouse-user", &config.clickhouse.user)
