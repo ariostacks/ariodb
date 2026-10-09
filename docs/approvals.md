@@ -2,9 +2,11 @@
 
 This page explains how ariodb holds a statement until someone, or something,
 agrees to it: what happens to the statement while it waits, how the
-`[approvals]` settings behave, and how to configure each kind of approver
-(the dashboard and the command line, Slack, signed webhooks, model
-approvers and plugins). It is for engineers who already have ariodb in
+`[approvals]` settings behave, how to configure each kind of approver
+(the dashboard and the command line, Slack, signed webhooks, Discord,
+Telegram, Microsoft Teams, Google Chat, Mattermost, PagerDuty, Opsgenie,
+email, model approvers and plugins), and who may decide a request. It is
+for engineers who already have ariodb in
 front of a database and want some statements to need a second opinion
 rather than a flat allow or deny.
 
@@ -37,7 +39,7 @@ sequenceDiagram
     participant D as Database
     A->>G: SELECT name, email FROM customers
     G->>G: built-in policy, then rules: verdict approve
-    G->>P: request (dashboard queue, Slack, webhook, model or plugin)
+    G->>P: request (dashboard queue, Slack, webhook, chat, paging or email channel, model or plugin)
     Note over G,D: nothing is sent to the database while it waits
     P-->>G: allow (every approver, in order)
     G->>D: run the statement
@@ -106,9 +108,15 @@ states:
 
 | Status | Meaning | `decided_by` |
 |---|---|---|
-| `allowed` | Approved | `dashboard:<user>`, `cli:<os user>`, `slack:<slack user>`, `webhook`, `model:<provider>/<model>` or `plugin:<name>` |
+| `allowed` | Approved | `dashboard:<user>`, `sso:<user>`, `cli:<os user>`, `slack:<slack user>`, `webhook`, `model:<provider>/<model>` or `plugin:<name>` |
 | `denied` | Denied, or the approver could not be reached | as above, or `ariodb` when notifying the approver failed |
 | `expired` | Nobody decided in time, or the agent withdrew | empty, or `ariodb` with the reason in the note |
+
+`dashboard:<user>` is a person signed in with a local password and
+`sso:<user>` one signed in with [single sign-on](dashboard.md#single-sign-on);
+either may have decided in the dashboard or through a signed link. `webhook`
+is a signed link followed without signing in, whichever approver sent it
+(see [who may decide](#who-may-decide)).
 
 The decision also appears in the [decisions log](dashboard.md#decisions)
 alongside the statement's outcome.
@@ -122,8 +130,8 @@ llm_fail_mode = "closed"      # closed (default) | open; only for model approver
 llm_cache_seconds = 300       # default 300; reuse a model's answer to the same question
 ```
 
-`timeout_seconds` bounds people (dashboard, Slack, webhook) and plugin
-approvers; an approver's own `timeout_seconds` overrides it. The two `llm_`
+`timeout_seconds` bounds people (the dashboard, Slack, webhooks and the
+chat, paging and email channels) and plugin approvers; an approver's own `timeout_seconds` overrides it. The two `llm_`
 settings apply only to model approvers and are explained under
 [model approvers](#failures-retries-and-the-fail-mode). Every key, with its
 type and default, is in [configuration](configuration.md#approvals).
@@ -149,10 +157,24 @@ store (`*_secret`, set with `ariodb secret set <name>`).
 | `dashboard` | A person, in the dashboard or with `ariodb approve` / `ariodb deny` | nothing else |
 | `slack` | A person, in a Slack channel (optionally with buttons) | `channel`, a bot token; a signing secret for buttons |
 | `webhook` | Whatever receives a signed POST and follows a signed link | `url`, an HMAC secret |
+| `discord` | A person, from a Discord channel's link buttons | the channel webhook's URL |
+| `telegram` | A person, from a Telegram chat's link buttons | a bot token, `chat_id` |
+| `teams` | A person, from a Microsoft Teams card | a Workflows webhook's URL |
+| `google_chat` | A person, from a Google Chat card | the space's webhook URL |
+| `mattermost` | A person, from links in a Mattermost post | the incoming webhook's URL |
+| `pagerduty` | The person on call, from a PagerDuty incident's links | an Events API v2 routing key |
+| `opsgenie` | The person on call, from an Opsgenie alert's links | an API integration key |
+| `email` | A person, from links in an email | `smtp_host`, `from`, `to` |
 | `llm` | A model, judging against a written policy | `policy`; provider settings |
 | `plugin` | A program you supply | `plugin` |
 
-<!-- TODO: approver channels beyond dashboard, Slack, webhook, model and plugin will be documented here once they are merged. -->
+The eight channel types from `discord` to `email` post the request with
+signed Approve and Deny links, and are described together under
+[chat, paging and email channels](#chat-paging-and-email-channels).
+
+Every approver except `slack`, `llm` and `plugin` may also set `groups`,
+the single sign-on groups whose members may decide its requests; see
+[who may decide](#who-may-decide).
 
 ariodb checks every approver when the config loads, and refuses a config
 where a rule names an approver that does not exist, or where an approver is
@@ -172,9 +194,10 @@ type = "dashboard"
 ```
 
 The request appears in the dashboard's Approvals queue, with the agent, the
-rule, the statement and a countdown. Anyone signed in to the dashboard can
-approve or deny it, with an optional note for the agent. See
-[dashboard.md](dashboard.md#approvals).
+rule, the statement and a countdown. Anyone signed in to the dashboard with
+the approver or admin role (and, if the approver sets `groups`, in one of
+those groups) can approve or deny it, with an optional note for the agent.
+See [dashboard.md](dashboard.md#approvals).
 
 The same queue is available from a shell on the ariodb host, which is
 handy over SSH or in scripts:
@@ -201,10 +224,13 @@ the ariodb host with the same `--config` (or at least the same
 `[journal] dir`) as `ariodb serve`. It records the decision as
 `cli:$USER`.
 
-**Any dashboard user, and anyone who can run `ariodb approve` against the
-state directory, can decide any pending request**, including requests that
-were also sent to Slack or a webhook. The approver type controls where a
-request is announced; it does not restrict who may answer it.
+**Any dashboard user with the approver role, and anyone who can run
+`ariodb approve` against the state directory, can decide any pending
+request**, including requests that were also sent to Slack, a webhook or a
+channel. The approver type controls where a request is announced; it does
+not restrict who may answer it. An approver's `groups` narrow who may decide
+in the dashboard and through links, but not on the command line; see
+[who may decide](#who-may-decide).
 
 ### Slack
 
@@ -441,11 +467,244 @@ cannot be turned into a deny link or the other way round.
   expiry the page says "This request was already decided or has expired."
 - Decisions through links are recorded as decided by `webhook`. The links
   carry no identity, so anyone holding a link can use it: send them only to
-  places where the people who see them are allowed to decide.
+  places where the people who see them are allowed to decide. With single
+  sign-on, or `[dashboard] approval_links = "sign_in"`, a link also needs a
+  signed-in approver, who is recorded instead; see
+  [who may decide](#who-may-decide).
 
 `public_url` must be reachable by whoever opens the links. The webhook
 `url` itself is not checked: use `https` so the statement is not sent in
 clear text.
+
+To make every link already sent stop working, change the webhook's HMAC
+secret (or rename the approver): links are checked against the secret and
+the approver the request names at the moment they are opened.
+
+### Chat, paging and email channels
+
+Eight more approver types put a request in front of people where they
+already are: `discord`, `telegram`, `teams`, `google_chat`, `mattermost`,
+`pagerduty`, `opsgenie` and `email`. Each posts the agent, the rule's
+reason, the statement and the rule's name, with **Approve** and **Deny**
+links and a link to the request in the dashboard.
+
+The Approve and Deny links are the same kind of signed link the webhook
+approver sends (see [the decision links](#the-decision-links)), so no
+channel needs a callback endpoint of its own that the internet can reach.
+Opening a link shows a confirmation page with the request and a button; only
+that button decides. Every message says so ("Each link opens a page that
+asks you to confirm."), so nobody expects a click in the chat to decide on
+its own.
+
+```mermaid
+sequenceDiagram
+    participant G as ariodb
+    participant C as Channel (Discord, Teams, email, ...)
+    participant P as Person
+    participant D as Dashboard listener
+    G->>C: message with Approve, Deny and dashboard links
+    P->>D: opens the Approve link (GET)
+    D-->>P: confirmation page: agent, statement, rule, status, a button
+    P->>D: presses the button (POST)
+    D->>G: request allowed
+```
+
+#### Configuring each channel
+
+```toml
+[[approvers]]
+name = "ops-discord"
+type = "discord"
+url_env = "ARIODB_DISCORD_WEBHOOK_URL"        # or url_secret
+
+[[approvers]]
+name = "ops-telegram"
+type = "telegram"
+bot_token_env = "ARIODB_TELEGRAM_BOT_TOKEN"   # or bot_token_secret
+chat_id = -1001234567890                      # a number, or "@channelusername"
+
+[[approvers]]
+name = "ops-teams"
+type = "teams"
+url_secret = "teams-webhook-url"              # or url_env
+
+[[approvers]]
+name = "ops-chat"
+type = "google_chat"
+url_secret = "google-chat-webhook-url"        # or url_env
+
+[[approvers]]
+name = "ops-mattermost"
+type = "mattermost"
+url_env = "ARIODB_MATTERMOST_WEBHOOK_URL"     # or url_secret
+channel = "agent-ops"                         # optional: post somewhere other than the webhook's channel
+
+[[approvers]]
+name = "on-call"
+type = "pagerduty"
+routing_key_env = "ARIODB_PAGERDUTY_ROUTING_KEY"   # or routing_key_secret
+region = "us"                                 # default; "eu" for an EU service region account
+
+[[approvers]]
+name = "on-call-opsgenie"
+type = "opsgenie"
+api_key_secret = "opsgenie-key"               # or api_key_env
+region = "us"                                 # default; "eu" for the EU instance
+
+[[approvers]]
+name = "ops-email"
+type = "email"
+smtp_host = "smtp.example.com"
+smtp_tls = "starttls"                         # default (port 587); "tls" for implicit TLS (port 465)
+# smtp_port = 587                             # default for the chosen smtp_tls
+smtp_user = "ariodb@example.com"
+smtp_password_env = "ARIODB_SMTP_PASSWORD"    # or smtp_password_secret
+from = "ariodb <ariodb@example.com>"
+to = ["dba-oncall@example.com", "Sam Lee <sam@example.com>"]
+```
+
+Every channel also takes `timeout_seconds` and `groups`, as other people
+approvers do. Every key, with its type and default, is in
+[configuration](configuration.md#chat-paging-and-email-approvers).
+
+| `type` | Set up on the service's side | What ariodb sends |
+|---|---|---|
+| `discord` | A channel webhook (channel settings, Integrations, Webhooks); copy its URL | Execute Webhook with `wait=true` and `with_components=true`: markdown content with the statement in a code block, and link buttons. Mentions are switched off (`allowed_mentions` is empty). |
+| `telegram` | A bot from BotFather, added to the group or channel; the chat's ID, or `@channelusername` for a public channel | Bot API `sendMessage` in HTML mode, link previews off, with an inline keyboard of URL buttons. |
+| `teams` | A Workflows flow that starts from "When a Teams webhook request is received" and posts the card it receives to a channel or chat; copy the flow's URL | A message with one Adaptive Card (version 1.4), whose buttons are `Action.OpenUrl`. |
+| `google_chat` | An incoming webhook on the space; its URL carries `key` and `token` | A `cardsV2` card whose buttons use `openLink`. |
+| `mattermost` | An incoming webhook. To use `channel`, the webhook must not be locked to its own channel | A post with markdown links after the statement's code block. (Mattermost's attachment buttons call back to a server, which ariodb does not need.) |
+| `pagerduty` | An Events API v2 integration on a service; copy its integration (routing) key | An Events API v2 `trigger`, severity `warning`, with the approval ID as `dedup_key`, the statement in `custom_details` (never in the summary) and the three links attached. |
+| `opsgenie` | An API integration; copy its key | An alert with the approval ID as its `alias`, priority `P3`, tags `ariodb` and `approval`, a plain-text description with the links first, and the links again in `details`. The key is sent as `Authorization: GenieKey <key>`. |
+| `email` | An SMTP account that may send as `from` | One message to every `to` address, with a plain-text part and an HTML part. |
+
+- **PagerDuty incidents and Opsgenie alerts are closed for you.** Once a
+  request is decided, expires or is withdrawn, ariodb sends a `resolve`
+  event for the PagerDuty incident, or closes the Opsgenie alert with a
+  note such as `ariodb: approved` or `ariodb: denied by webhook`, so nobody
+  is paged for a question that has been answered. This is best effort: a
+  failure is logged (`ariodb: could not close request <id> in approver
+  '<name>': ...`) and the decision stands.
+- **Opsgenie is being retired** by Atlassian: existing sites work until 5
+  April 2027, and its alerting moves to Jira Service Management.
+- **Point `[dashboard] public_url` at the address approvers' browsers
+  use.** Every link in the message is built from it. Some services
+  (Telegram among them) refuse buttons that point at `localhost`.
+
+#### Secrets
+
+Every credential is named by an environment variable (`*_env`) or a secret
+in the store (`*_secret`), never written in the file:
+
+| `type` | Credential |
+|---|---|
+| `discord`, `teams`, `google_chat`, `mattermost` | The incoming webhook's URL, in `url_env` or `url_secret`. The URL holds the webhook's token, so it is a credential: a plain `url` is refused when the config loads ("put the webhook URL in url_secret or url_env, not url: the URL itself is the credential"). |
+| `telegram` | The bot token, in `bot_token_env` or `bot_token_secret`. |
+| `pagerduty` | The routing key, in `routing_key_env` or `routing_key_secret`. |
+| `opsgenie` | The API key, in `api_key_env` or `api_key_secret`. |
+| `email` | The SMTP password, in `smtp_password_env` or `smtp_password_secret`, with `smtp_user`. Set both or neither; without them ariodb does not log in. |
+
+Errors never include a webhook URL or a token, so neither reaches the agent
+or the approval record.
+
+Connections are held to encryption:
+
+- Webhook URLs must be `https`. Plain `http` is allowed only for this
+  machine (`localhost`, a `.localhost` name, or a loopback address).
+- Email uses `smtp_tls = "starttls"` (port 587) or `"tls"` (implicit TLS,
+  port 465). `"none"` (port 25) is allowed only for a mail server on this
+  machine.
+- ariodb never follows a redirect from these services, so a message and its
+  credentials go only to the address you configured.
+
+#### What the message shows
+
+Agent SQL is escaped for each channel's format and kept apart from the
+links, so it cannot add links, mentions or formatting of its own:
+
+- **Discord and Mattermost**: the statement is in a code block it cannot
+  close (every backtick is followed by a zero-width space), and markdown in
+  the agent's name, rule and reason is escaped. `@` and `<` are broken up,
+  so `@here`, `@everyone`, `<@id>` and `<!channel>` mention nobody.
+- **Telegram, Google Chat and email**: escaped as HTML.
+- **Teams**: placed in Adaptive Card text runs, which Teams never reads as
+  markdown.
+- **PagerDuty**: kept in the event's details, out of the summary.
+- **Opsgenie and the email's plain-text part**: ariodb's own lines and
+  links come first, and every line of the statement after them is marked
+  with `| `, so a line in the SQL such as `Approve: https://...` cannot pass
+  for one of ariodb's.
+
+Characters that reorder or hide text (bidirectional overrides such as
+U+202E, and zero-width characters) are written out as `<U+202E>` and the
+like, so the approver reads the statement that would run.
+
+A statement too long for the channel is shortened, and the message says so
+before the statement ("shortened here (the confirmation page shows all of
+it)"), not only with an ellipsis at the end. The confirmation page always
+shows the whole statement:
+
+| `type` | Statement shown, at most |
+|---|---|
+| `discord` | 1,200 characters, less if the escaped message would pass Discord's 2,000 |
+| `telegram` | 3,000 characters |
+| `teams`, `google_chat`, `mattermost` | 2,500 characters |
+| `pagerduty` | 4,000 characters |
+| `opsgenie` | 10,000 characters |
+| `email` | 20,000 characters |
+
+#### When a channel cannot be reached
+
+If posting fails, the request is denied at once rather than left waiting
+for a message nobody will see. It is recorded as denied by `ariodb` with
+the error in the note, and the agent gets, for example:
+
+```text
+ERROR:  ariodb: writes need a person to agree: could not reach approver 'ops-telegram': answered 400 Bad Request: Bad Request: chat not found
+```
+
+ariodb expects a 2xx answer within 30 seconds (the mail server has 30
+seconds too). The error quotes the service's own message where its answer
+has one.
+
+#### The link key
+
+The channels' links are signed with HMAC-SHA256 under a key ariodb makes
+the first time a channel sends a request, and keeps in the secret store as
+`ariodb.approval-link-key`. (Webhook approvers sign their links with their
+own HMAC secret instead.) Each link is signed for one request and one
+verdict, so it cannot decide another request, and an approve link cannot
+be turned into a deny link.
+
+The dashboard can only store secrets whose names are letters, digits, `-`
+and `_`, so nobody can choose the link key from the dashboard and sign
+links of their own; it is listed there, by name only, like any other
+secret.
+
+**To revoke every channel link already sent**, delete the key on the
+ariodb host:
+
+```console
+$ ariodb secret delete ariodb.approval-link-key
+deleted secret 'ariodb.approval-link-key'
+```
+
+Links signed with it then show "This approval link is not valid.", and the
+next channel request makes a new key. Requests that are still pending can
+be decided in the dashboard or with `ariodb approve`. A link also stops
+working when its approver is renamed or removed from the config.
+
+#### Trying channels without the real services
+
+The end-to-end tests point the channels at local stand-ins. Webhook URLs
+and the SMTP host are in the config, and these environment variables
+replace the other services' addresses (as `ARIODB_SLACK_API` does for
+Slack): `ARIODB_TELEGRAM_API` (instead of `https://api.telegram.org`),
+`ARIODB_PAGERDUTY_API` (instead of `https://events.pagerduty.com`, or
+`https://events.eu.pagerduty.com` with `region = "eu"`) and
+`ARIODB_OPSGENIE_API` (instead of `https://api.opsgenie.com`, or
+`https://api.eu.opsgenie.com`). They are meant for tests; leave them unset
+in production.
 
 ### Model approvers
 
@@ -738,14 +997,108 @@ security notes are in [plugins.md](plugins.md).
 
 ## Making links and callbacks reachable
 
-Slack messages and webhook payloads link to `[dashboard] public_url`. The
-dashboard, `/slack/actions` and `/hooks/approvals/...` are served by the
-same listener (`[dashboard] listen`), so that address has to be reachable
-by Slack, by your webhook receiver's users, and by your people. See
+Slack messages, webhook payloads and channel messages link to
+`[dashboard] public_url`. The dashboard, `/slack/actions` and
+`/hooks/approvals/...` are served by the same listener
+(`[dashboard] listen`), so that address has to be reachable by Slack, by
+the people who open the links, and by your webhook receiver if it decides
+by POSTing to them. See
 [dashboard.md](dashboard.md#running-behind-a-reverse-proxy) for running it
 behind a reverse proxy, and for exposing only the callback paths.
 
-<!-- TODO: once single sign-on is merged, describe how approval links and the dashboard queue are gated by SSO and dashboard roles. -->
+## Who may decide
+
+Who may decide a request depends on where they decide it:
+
+| Where | Who may decide |
+|---|---|
+| The dashboard's Approvals page | A signed-in user with the approver or admin [role](dashboard.md#roles), and in one of the approver's `groups` if it sets any |
+| A signed link (webhook and channel approvers), `approval_links = "signed"` | Anyone holding the link |
+| A signed link, `approval_links = "sign_in"` | As for the dashboard: a signed-in approver, in the approver's `groups` if any |
+| A Slack button | Anyone in the Slack channel; the request must be waiting on the Slack approver whose signing secret signed the press |
+| `ariodb approve` and `ariodb deny` | Anyone who can run ariodb on the host against its state directory; roles and groups do not apply |
+| A model or plugin approver | That approver alone |
+
+### Links that need sign-in
+
+`[dashboard] approval_links` says what a signed link needs before it
+decides:
+
+```toml
+[dashboard]
+approval_links = "sign_in"    # signed | sign_in; default sign_in with [dashboard.oidc], signed without
+```
+
+- **`signed`** (the default without single sign-on): the signed link alone
+  decides, and the decision is recorded as `webhook`.
+- **`sign_in`** (the default with [single
+  sign-on](dashboard.md#single-sign-on)): the confirmation page also needs
+  a signed-in dashboard user who may decide the request. The page says
+  "Signed in as pat@example.com; you will be recorded as the decider.", and
+  the decision is recorded as `sso:pat@example.com` (or `dashboard:<user>`
+  for a local password), not as `webhook`.
+
+With `sign_in`, opening a link without a dashboard session shows "Sign in
+to decide this request." and a **Sign in with <provider>** link that
+returns to the same confirmation page afterwards. Where local passwords are
+allowed, the page also offers to sign in to the dashboard with a password,
+then open the link again. A signed-in viewer, or someone outside the
+approver's groups, gets "You may not decide this request: ..." with the
+reason.
+
+The dashboard's session cookie is `SameSite=Strict`, so a browser leaves it
+out when a link is opened from a chat app or an email. The confirmation
+page then reloads itself once, as a same-site visit that carries the
+cookie, before it asks anyone to sign in; people already signed in to the
+dashboard in that browser go straight to the button. The button's form
+carries the session's CSRF token and must come from the dashboard's own
+origin, so another site cannot press it on someone's behalf ("This form is
+out of date. Open the link again.").
+
+`sign_in` works without single sign-on too: people then sign in to the
+dashboard with their local passwords.
+
+### Approver groups
+
+With single sign-on, an approver can name the groups whose members may
+decide its requests:
+
+```toml
+[[approvers]]
+name = "dba-ops"
+type = "dashboard"
+groups = ["dba"]
+
+[[rules]]
+name = "schema-owners-decide"
+condition = "'billing.invoices' in sql.tables && sql.kind == 'write'"
+verdict = "approve"
+approve = ["dba-ops"]
+```
+
+- `groups` are names from the identity provider's groups claim, the same
+  names `[dashboard.oidc]` maps to roles. A person must also have the
+  approver or admin role: groups narrow who may decide, they never grant a
+  role. Being an admin is not enough on its own: an admin outside the
+  groups cannot decide.
+- An empty or missing `groups` means anyone with the approver role.
+- `groups` needs `[dashboard.oidc]`; local password users have no groups,
+  so they cannot decide a grouped approver's requests.
+- `groups` works on `dashboard`, `webhook` and the channel types. On a
+  webhook or channel approver it needs `approval_links = "sign_in"` (the
+  default with single sign-on), because a link followed without signing in
+  has nobody whose groups could be checked. ariodb refuses a config that
+  combines them with `approval_links = "signed"`.
+- `slack`, `llm` and `plugin` approvers cannot set `groups`: Slack buttons,
+  models and plugins decide without a dashboard user.
+
+The dashboard's Approvals page shows everyone the pending requests, and
+says on each one who may decide it ("Only members of dba may decide this
+request.") when the person looking may not.
+
+`ariodb approve` and `ariodb deny` do not check roles or groups: whoever
+can run them on the ariodb host can already read and change its state
+directory.
 
 ## Troubleshooting approvals
 
@@ -757,6 +1110,12 @@ behind a reverse proxy, and for exposing only the callback paths.
 | Slack buttons fail, and ariodb answers `/slack/actions` with 401 "bad signature" | Wrong signing secret, or the ariodb host's clock is more than five minutes out. |
 | ariodb answers `/slack/actions` with 403 "this request is not waiting on a Slack approver" | The request belongs to another approver; decide it there or in the dashboard. |
 | A webhook link says "This approval link is not valid." | The link was altered, the approver's secret changed, or the approver was renamed or removed. |
+| A channel link says "This approval link is not valid." | The link was altered, `ariodb.approval-link-key` was deleted, or the approver was renamed or removed. |
+| "could not reach approver 'ops-discord': answered 404 Not Found: Unknown Webhook" | The webhook was deleted or its URL is wrong; each channel quotes its service's own error. |
+| "could not reach approver 'ops-teams': the teams webhook URL must use https (plain http is allowed only for this machine)" | Use the `https://` URL the service gave you. |
+| "could not reach approver 'ops-email': the mail server said: ..." | The SMTP host, port, `smtp_tls` or login is wrong, or the server refused the sender or a recipient. |
+| A link opens "Sign in to decide this request." | `approval_links = "sign_in"` (the default with single sign-on); sign in and the page comes back. |
+| "You may not decide this request: only members of dba may decide requests for approver 'dba-ops'" | The approver sets `groups` and you are in none of them; or, with "deciding needs the approver role", your role is viewer. |
 | A model approver always refuses with "is misconfigured" | A wrong key, model, deployment or `base_url`; the note in `ariodb approvals --all` has the provider's error. |
 
 More in [troubleshooting.md](troubleshooting.md).

@@ -85,8 +85,9 @@ License.
   combine.
 - [Testing policies](testing-policies.md): `ariodb explain`,
   `ariodb test` and fixtures in CI.
-- [Approvals](approvals.md): dashboard, CLI, Slack, webhook, model and
-  plugin approvers.
+- [Approvals](approvals.md): dashboard, CLI, Slack, webhook, Discord,
+  Telegram, Teams, Google Chat, Mattermost, PagerDuty, Opsgenie, email,
+  model and plugin approvers, and who may decide.
 - [Plugins](plugins.md): approvers, rule facts, notifiers and audit sinks
   as external programs.
 
@@ -95,7 +96,8 @@ License.
 - [Undo](undo.md): sessions, undo plans, conflicts, and what cannot be
   reversed.
 - [Dashboard](dashboard.md): approvals, decisions, sessions, rules, config
-  and settings in the browser.
+  and settings in the browser; roles, and single sign-on with OpenID
+  Connect.
 
 **Agents as tools**
 

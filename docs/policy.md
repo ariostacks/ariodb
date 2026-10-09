@@ -322,7 +322,7 @@ apply. See [ClickHouse](clickhouse.md) for how statements are run.
 | Kind | ClickHouse statements |
 |---|---|
 | `read` | `SELECT`, `WITH ... SELECT`, `SHOW`, `DESCRIBE`/`DESC`, `EXISTS`, `EXPLAIN` |
-| `write` | `INSERT` (HTTP only; the native protocol refuses it) |
+| `write` | `INSERT`. Over the native protocol, only `INSERT ... VALUES` and `INSERT ... FORMAT` with the rows sent as data, which ariodb counts against the row limit (see [ClickHouse](clickhouse.md#inserts)) |
 | `destructive` | `DELETE`, `ALTER ... DELETE`, `ALTER ... UPDATE`, `DROP`, `TRUNCATE`, `DETACH`, `RENAME`, `EXCHANGE`, and any statement using a table function that leaves the server |
 | `schema_change` | `CREATE`, `ALTER`, `ATTACH`, `OPTIMIZE`, `SYSTEM`, `GRANT`, `REVOKE`, `KILL`, `MOVE` |
 | `session` | `SET`, `USE`: always refused |

@@ -410,8 +410,9 @@ out everything that depends on running it:
 - **The database itself.** Grants, `READ ONLY` enforcement, statement
   timeouts, constraint errors, and whether a table exists.
 - **The transport.** The 1 MiB message limit, reserved statement names,
-  ClickHouse native-protocol `INSERT` (refused as unsupported, though
-  `explain` judges the SQL as an ordinary insert), and the MySQL
+  the ClickHouse native listener's insert checks (the row limit, the
+  column types it can read, and the refusal of `INSERT ... SELECT`, all
+  of which `explain` does not apply), and the MySQL
   listener's own checks (one statement per query, reserved tables,
   cursors, `KILL`).
 

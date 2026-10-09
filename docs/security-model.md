@@ -29,8 +29,9 @@ flowchart LR
         CH[(ClickHouse)]
     end
     subgraph Approvers
-        H[People: dashboard, CLI, Slack, webhook links]
+        H[People: dashboard, CLI, Slack, webhook and channel links]
         LLM[Model provider]
+        IDP[Identity provider]
     end
     A -->|SQL, protocol messages, agent token| P & C & M
     P & C & M --> G
@@ -39,6 +40,7 @@ flowchart LR
     G -->|request| H & LLM
     N -->|HTTP| D
     H -->|decision| D
+    D <-->|single sign-on| IDP
     G --- S
 ```
 
@@ -53,11 +55,14 @@ database's own permissions sit behind ariodb as the last line.
    sends to the Postgres proxy, the ClickHouse HTTP and native proxies, and
    the MCP server. It holds a valid agent token.
 2. **Someone on the network who can reach the dashboard** and its callback
-   endpoints (`/hooks/approvals/...`, `/slack/actions`), with no account,
-   or with a stolen or phished link.
+   endpoints (`/hooks/approvals/...`, `/slack/actions`, the single sign-on
+   callback), with no account, with a stolen or phished link, or with an
+   account whose role is lower than what they try.
 3. **Content that reaches a person or a model approver.** Agent SQL is
-   shown in Slack, in webhook payloads, on the dashboard and to model
-   approvers, and must not be able to change what they see or decide.
+   shown in Slack, in webhook payloads, in Discord, Telegram, Teams, Google
+   Chat, Mattermost, PagerDuty, Opsgenie and email messages, on the
+   dashboard and to model approvers, and must not be able to change what
+   they see or decide.
 
 ## What ariodb guarantees
 
@@ -82,9 +87,12 @@ database's own permissions sit behind ariodb as the last line.
 - **Nothing held for approval runs early.** A statement held for approval
   does not reach the database until every approver has allowed it; a deny,
   a timeout or a failure refuses it.
-- **Dashboard changes need a person.** Every change needs a logged-in
-  user, a CSRF token and a same-origin request, and passwords cannot be
-  guessed at speed.
+- **Dashboard changes need a person with the right role.** Every change
+  needs a signed-in user whose role allows it (checked by the server on
+  every request), a CSRF token and a same-origin request, and passwords
+  cannot be guessed at speed. Single sign-on accepts only ID tokens with a
+  good public-key signature, the right issuer, audience and nonce, and an
+  expiry in the future, from a browser that started the sign-in.
 - **Agents never hold database credentials.** Agents authenticate to
   ariodb with their own tokens; database passwords stay with ariodb (but
   see [the MCP caveat](#what-ariodb-does-not-protect-against)).
@@ -176,15 +184,24 @@ database's own permissions sit behind ariodb as the last line.
   approvers to save people time, not as the only check on high-risk rules,
   and keep `llm_fail_mode = "closed"`. See
   [approvals.md](approvals.md#limits-of-model-approvers).
-- **Who may decide an approval.** Any signed-in dashboard user, anyone who
-  can run `ariodb approve` against the state directory, and anyone holding
-  a webhook decision link can decide a pending request. The approver type
-  says where a request is announced, not who may answer it. Slack buttons
-  are the exception: a Slack signature only decides requests waiting on
-  that Slack approver.
-- **All dashboard users are equal.** Every signed-in user can decide
-  approvals, undo sessions, add users, store secrets and, with
-  `config_writes = true`, change the policy.
+- **Who may decide an approval.** Any dashboard user with the approver or
+  admin role, anyone who can run `ariodb approve` against the state
+  directory, and, with `approval_links = "signed"` (the default without
+  single sign-on), anyone holding a webhook or channel decision link can
+  decide a pending request. The approver type says where a request is
+  announced, not who may answer it. An approver's `groups` narrow who may
+  decide in the dashboard and through links that need sign-in, but not on
+  the command line. Slack buttons are decided by whoever is in the Slack
+  channel, whatever their dashboard role; a Slack signature only decides
+  requests waiting on that Slack approver. See
+  [approvals.md](approvals.md#who-may-decide).
+- **Admins can do everything the dashboard offers.** An admin can undo
+  sessions, manage users and secrets and, with `config_writes = true`,
+  change the policy, including the role mapping. Roles stop viewers and
+  approvers from doing so, but a single sign-on admin is only as
+  trustworthy as the groups the identity provider puts in the token: anyone
+  who can change group membership at the provider can make themselves an
+  admin.
 
 ### Where agent data is stored and sent
 
@@ -199,6 +216,7 @@ audit-sink plugins, honour `[audit] redact_literals`:
 | Change journal (`<state dir>/journal.jsonl`) | Full before- and after-images of every changed row in protected tables, by anyone | No | Not pruned |
 | Slack messages | Held statements (up to 2,500 characters) | No | Slack's |
 | Webhook payloads | Held statements | No | The receiver's |
+| Discord, Telegram, Teams, Google Chat, Mattermost, PagerDuty, Opsgenie and email messages | Held statements (shortened to fit each channel) | No | The service's, and the mailboxes' |
 | Model providers | Held statements, agent, database, rule, policy | No | The provider's |
 | Plugin notifications (`approval_requested` and others) and audit sinks | Statements | Yes | The plugin's |
 | Plugin approvers and facts plugins | Statements, agent, database, rule | No | The plugin's |
@@ -320,8 +338,17 @@ Dashboard:
       webhook users need it, expose only `/slack/actions` and
       `/hooks/approvals/` (see
       [dashboard.md](dashboard.md#exposing-only-the-callbacks)).
-- [ ] Dashboard accounts only for people trusted with every action it
-      offers.
+- [ ] Each person given the lowest role that does the job: viewer to
+      look, approver to decide, admin only for those trusted with the
+      config, undo, users and secrets.
+- [ ] With single sign-on: an `https://` issuer, role groups that only
+      the right people can join at the provider, `allowed_email_domains`
+      where the provider sends `email_verified`, and
+      `password_login = "off"` once a break-glass procedure is agreed (or
+      `"break_glass"` with a strong `root` password kept offline).
+- [ ] `approval_links = "sign_in"` wherever links reach people who are not
+      all allowed to decide, and `groups` on approvers whose requests only
+      some approvers should decide.
 - [ ] `config_writes = false` unless people are meant to edit policy from
       the dashboard.
 
@@ -347,8 +374,12 @@ Agents and approvers:
 - [ ] Model approvers never the only check on high-risk rules;
       `llm_fail_mode = "closed"`; a local model if statements must not
       leave your network.
-- [ ] Webhook URLs use `https`; webhook links go only to people allowed to
-      decide.
+- [ ] Webhook URLs use `https`; with `approval_links = "signed"`, webhook
+      and channel links go only to people allowed to decide.
+- [ ] Channel credentials (webhook URLs, bot tokens, routing and API keys,
+      SMTP passwords) in the secret store or the environment;
+      `ariodb.approval-link-key` deleted to revoke links if a channel's
+      messages leak.
 - [ ] Plugins only from sources you trust, owned by ariodb's user and not
       writable by others; their credentials through `pass_env` or
       `secret_env`, not `env` in the config file.

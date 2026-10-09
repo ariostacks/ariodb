@@ -134,8 +134,9 @@ Step by step, for an agent connected to the Postgres proxy:
 
 The ClickHouse proxies, the MySQL proxy and the MCP server go through the
 same policy, rules, approvals and decisions log. ClickHouse has no
-transactions, so its writes cannot be measured, rolled back or undone; see
-[ClickHouse](clickhouse.md) and [MCP](mcp.md). MySQL writes are counted
+transactions, so its writes cannot be rolled back or undone; inserts over
+its native protocol are counted against the row limit before any row
+reaches ClickHouse. See [ClickHouse](clickhouse.md) and [MCP](mcp.md). MySQL writes are counted
 before commit and journalled from the binlog; see
 [MySQL and MariaDB](mysql.md).
 
@@ -179,9 +180,18 @@ actually did (`effects.rows`, `effects.tables`).
 
 **Approval.** A statement held by a rule until every listed approver
 allows it: a person in the dashboard or the CLI, Slack, a webhook, a model
-judging against a written policy, or a [plugin](plugins.md).
+judging against a written policy, or a [plugin](plugins.md). People can
+also be asked in Discord, Telegram, Microsoft Teams, Google Chat,
+Mattermost, PagerDuty, Opsgenie or by email: the message carries signed
+Approve and Deny links to a confirmation page in the dashboard. See
+[approvals](approvals.md).
 
-<!-- TODO: approver channels beyond dashboard, Slack, webhook, model and plugin, once merged. -->
+**Roles.** Dashboard users are viewers, approvers or admins. Viewers read
+approvals, decisions, sessions and rules; approvers also decide approvals; admins
+also change the config, undo sessions and manage users and secrets. People
+can sign in with a local password or through an OpenID Connect provider
+(Okta, Microsoft Entra ID, Google, Auth0, Keycloak and others), whose
+groups decide their role. See [dashboard](dashboard.md#roles).
 
 **Session.** One agent connection to the Postgres proxy (or one run of the
 MCP server), with an id such as `s-3f9c2a71d0`. Every write in it is tagged

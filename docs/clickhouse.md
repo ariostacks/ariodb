@@ -4,8 +4,9 @@ ariodb can sit in front of ClickHouse as well as Postgres. This page
 covers the two listeners (ClickHouse's HTTP interface and its native
 protocol), TLS on them, how agents log in, the `[agents.clickhouse]`
 block, how reads are kept read-only, which settings and table functions
-are refused, how table names are scoped to a database, inserts, the rules
-that apply, and the limits you should know before giving an agent access.
+are refused, how table names are scoped to a database, inserts over both
+protocols and how their rows are counted, the rules that apply, and the
+limits you should know before giving an agent access.
 It is for engineers putting ariodb between agents and a ClickHouse server.
 The same [policy](policy.md), [rules](rules.md) and
 [approvals](approvals.md) apply as for Postgres, with the differences set
@@ -26,12 +27,15 @@ flowchart LR
     G -- "refused" --> X[ClickHouse-style error]
     G -- "read: readonly = 2,<br/>max_execution_time" --> C[(ClickHouse)]
     G -- "HTTP INSERT" --> C
+    G -- "native INSERT: rows counted,<br/>sent once within the limit" --> C
 ```
 
 Because ClickHouse has no transactions, the Postgres approach of running a
 write and measuring it before commit is not available. Reads are protected
 by ClickHouse's own read-only mode; writes are controlled by the policy,
 rules and approvals before they run, and cannot be rolled back or undone.
+Over the native protocol, ariodb also counts an insert's rows before any
+reach ClickHouse, and refuses an insert over the row limit.
 
 ## Configuration
 
@@ -190,7 +194,8 @@ ClickHouse with its own login at a protocol revision both sides
 understand (capped at 54470), and relays the server's replies. Very old
 clients that cannot send settings as strings are refused. Each query is
 judged on its own, so `--multiquery` works: a refused statement returns an
-error and the connection carries on.
+error and the connection carries on. Inserts work too, with their rows
+counted first; see [over the native protocol](#over-the-native-protocol).
 
 ## TLS
 
@@ -242,8 +247,9 @@ Agents cannot pass settings that would loosen these.
   request headers, only `Content-Type`, `Content-Encoding` and
   `Accept-Encoding` are passed on, and ariodb names the database itself.
 - **Native**: the client's settings are passed on except `readonly`,
-  `max_execution_time` and anything starting `allow_`, which ariodb
-  replaces or removes.
+  `max_execution_time`, anything starting `allow_`, and anything starting
+  `input_format_native_` (which would change how an insert's data blocks
+  are read), which ariodb replaces or removes.
 - **In the SQL**: a `SETTINGS` clause that mentions `readonly` or
   `allow_ddl` is refused ("queries may not change readonly or allow_ddl").
   `SET` and `USE` statements are refused.
@@ -316,9 +322,11 @@ sensitive; avoid tables whose names differ only by case.
 
 ## Inserts
 
-Inserts work over **HTTP only**, for agents whose `[agents.clickhouse]`
-access is `read_write`. `INSERT` is the only write ClickHouse agents can
-run.
+`INSERT` is the only write ClickHouse agents can run, and only agents whose
+`[agents.clickhouse]` access is `read_write`, into tables on that block's
+list. It works over both listeners.
+
+### Over HTTP
 
 ```bash
 curl -s -u coding-agent:agent-token-local-test-only \
@@ -327,23 +335,97 @@ curl -s -u coding-agent:agent-token-local-test-only \
 ```
 
 Put the `INSERT ... FORMAT` statement in the `query` parameter and the rows
-in the body: ariodb judges the statement and passes the body through.
-Writes are sent without `readonly`, with `max_execution_time` set.
+in the body: ariodb judges the statement and passes the body through,
+without reading it. Writes are sent without `readonly`, with
+`max_execution_time` set. HTTP inserts are **not** counted against
+`max_rows_per_write`; the decisions log records the `written_rows`
+ClickHouse reports afterwards.
 
-<!-- TODO: document ClickHouse native-protocol INSERT once it is merged. -->
-On the native protocol, `INSERT` is refused ("native-protocol INSERTs are
-not supported; use ariodb's ClickHouse HTTP interface"), as are external
-tables and data packets outside a query: relaying them safely would mean
-decoding ClickHouse's data blocks.
+### Over the native protocol
+
+```bash
+clickhouse-client --host 127.0.0.1 --port 9001 \
+  --user coding-agent --password agent-token-local-test-only \
+  --query "INSERT INTO events VALUES (1001, 'user1001', 'view')"
+
+clickhouse-client --host 127.0.0.1 --port 9001 \
+  --user coding-agent --password agent-token-local-test-only \
+  --query 'INSERT INTO events FORMAT CSV' < events.csv
+```
+
+`clickhouse-client` keeps the rows out of the statement it sends: it sends
+`INSERT INTO events VALUES` or `INSERT INTO events FORMAT CSV`, then the
+rows as data blocks, whether you wrote them inline or piped them in. ariodb
+judges the statement like any other, then reads every data block, column
+by column, and counts its rows:
+
+- **Rows are counted against `max_rows_per_write`**: the agent's own, or
+  `[limits] max_rows_per_write` (500 by default).
+- **Nothing reaches ClickHouse until the last block has arrived.**
+  ClickHouse writes each block as it receives it and cannot take one back,
+  so ariodb holds the blocks and sends them only once the total is known to
+  be within the limit.
+- **An insert over the limit inserts nothing.** ariodb stops reading at the
+  block that passes the limit, tells the client "nothing was inserted: the
+  insert sends at least 75 rows; the limit is 50", and closes the
+  connection. The decisions log records it as `rolled_back`, with the rows
+  counted so far.
+- **A successful insert is recorded as `allowed`** with its row count, and
+  the connection carries on, so `--multiquery` can mix inserts and reads.
+- **An insert the client cancels, or abandons by disconnecting, inserts
+  nothing** and is recorded as `failed`.
+
+ariodb holds at most 64 MiB of an insert's data (256 MiB once
+decompressed); larger inserts are refused with nothing inserted. Send them
+in parts. LZ4 and ZSTD compression (`clickhouse-client`'s
+`--network_compression_method`) and uncompressed connections all work.
+
+To count rows exactly, ariodb has to agree with ClickHouse about where each
+block and each column ends, so it reads only columns of types it knows:
+integers, floats, `Bool`, `Decimal`, `String`, `FixedString`, `Date`,
+`Date32`, `DateTime`, `DateTime64`, `UUID`, `IPv4`, `IPv6`, `Enum8` and
+`Enum16`, and `Nullable`, `Array`, `Map`, `Tuple`, `LowCardinality` and
+`SimpleAggregateFunction` built from them. An insert into a column of any
+other type (`JSON`, `Variant`, `Dynamic`, `AggregateFunction`, and
+others), or one that uses a sparse serialisation, is refused with nothing
+inserted; use the HTTP listener for those tables.
+
+Some inserts would run before ariodb could count their rows, so the native
+listener refuses them:
+
+- `INSERT ... SELECT`, which ClickHouse runs as soon as the query arrives;
+- a `SETTINGS` clause in an `INSERT`, which could change how the blocks are
+  read;
+- rows written into the statement itself, after `VALUES` or after the
+  format name, as some drivers send them (ClickHouse would read them as
+  data before any block arrived);
+- `INSERT INTO FUNCTION`.
+
+These answer "over the native protocol ariodb checks only INSERT ... VALUES
+and INSERT ... FORMAT with the rows sent as data, which it counts before
+they are inserted; other inserts would run before their rows could be
+counted", and are recorded as `unsupported`. Run `INSERT ... SELECT`
+through the HTTP listener, where it is judged but not counted. External
+tables (`clickhouse-client --external`), and data packets outside a query,
+are refused on the native listener too.
+
+ariodb asks ClickHouse to describe the columns with type names as text
+(`input_format_native_decode_types_in_binary_format = 0`) and drops any
+client setting starting `input_format_native_`, so the blocks ClickHouse
+reads are the ones ariodb counted.
+
+### What applies to inserts
 
 **ClickHouse writes cannot be rolled back or undone.** There is no
 transaction to measure before commit and no journal. What does apply:
 
 - the policy (the agent's access and tables, refused functions);
 - before-stage [rules](rules.md) and any [approval](approvals.md) they ask
-  for, which happens before the insert is sent.
+  for, which happens before the insert is sent;
+- over the native protocol, the row limit, checked before anything is
+  inserted.
 
-What does **not** apply: `max_rows_per_write`, the effect check, and
+What does **not** apply: the row limit over HTTP, the effect check, and
 after-stage rules, which need a measured effect. Use a before-stage rule
 with an approval for inserts that matter.
 
@@ -387,9 +469,12 @@ so agents' client timeouts must be longer than the
 Every ClickHouse request is recorded in the decisions log with
 `engine = clickhouse`, under the session `ch-<agent name>`. Over HTTP, the
 row count comes from ClickHouse's `X-ClickHouse-Summary` header
-(`read_rows` for reads, `written_rows` for inserts); native-protocol
-entries have no row count. A native `INSERT` is recorded as
-`unsupported`, not `refused`, so that [exported
+(`read_rows` for reads, `written_rows` for inserts). Over the native
+protocol, an insert's entry has the rows ariodb counted (for one over the
+limit, `rolled_back` with the rows counted before it stopped); reads have
+no row count. A native insert the listener cannot carry (an
+`INSERT ... SELECT`, a column type it cannot read, data too large to hold)
+is recorded as `unsupported`, not `refused`, so that [exported
 fixtures](testing-policies.md#recording-fixtures-from-real-decisions) do
 not turn a transport limit into a policy expectation.
 
@@ -414,8 +499,13 @@ ClickHouse 24.10 (`clickhouse/clickhouse-server:24.10-alpine`); set
 
 ## Known limits
 
-- Writes are `INSERT` over HTTP only, and cannot be rolled back, undone,
-  measured or limited by row count.
+- Writes are `INSERT` only, and cannot be rolled back or undone. Over the
+  native protocol the row limit applies before anything is inserted; over
+  HTTP it does not.
+- Native inserts must send their rows as data blocks (`INSERT ... VALUES`
+  or `FORMAT`, as `clickhouse-client` does), into columns of the types
+  ariodb can read, and at most 64 MiB at a time. `INSERT ... SELECT` and
+  inserts with a `SETTINGS` clause work over HTTP only.
 - All agents share ariodb's one ClickHouse login; there are no per-agent
   ClickHouse credentials.
 - The connection from ariodb to ClickHouse's native port is unencrypted.

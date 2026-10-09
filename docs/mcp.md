@@ -188,7 +188,8 @@ the Postgres proxy:
   simply takes longer; the MCP client must not time it out before the
   approval timeout. Approvers see the session and agent as usual, and a
   person decides in the dashboard of `ariodb serve`, with `ariodb approve`,
-  in Slack or through a webhook:
+  in Slack, or through the links a webhook or a chat, paging or email
+  approver sends:
 
   ```json
   {"content":[{"type":"text","text":"Refused by ariodb: reading customer emails needs a person to agree: denied by cli:alice (use the reporting replica)"}],"isError":true}

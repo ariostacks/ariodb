@@ -254,7 +254,7 @@ decision from 'ops' within 90 seconds`.
 
 | Message | Cause | Fix |
 |---|---|---|
-| `no decision from 'ops' within 90 seconds` | Nobody decided in time. | Make sure people are told (a Slack or webhook approver, or a plugin notifier), or raise `timeout_seconds` on the approver or under `[approvals]`. |
+| `no decision from 'ops' within 90 seconds` | Nobody decided in time. | Make sure people are told (a Slack, webhook, chat, paging or email approver, or a plugin notifier), or raise `timeout_seconds` on the approver or under `[approvals]`. |
 | `the agent disconnected, so the request was withdrawn` / `the agent cancelled the statement, so the request was withdrawn` | The agent gave up first, usually because its own client timeout is shorter than the approval timeout. | Raise the agent's statement or tool-call timeout above the approval timeout. |
 | `the agent disconnected while the statement waited` | The approval arrived just as the agent left; the statement did not run. | As above. |
 | `denied by dashboard:root (not during the freeze)` | A person denied it; the note follows. | |
@@ -262,6 +262,9 @@ decision from 'ops' within 90 seconds`.
 | `could not reach approver 'ops-slack': Slack said: not_in_channel` | The Slack bot is not in the channel (`channel_not_found`, `invalid_auth` and the like are Slack's own codes). | Invite the bot, or fix the channel ID or token. |
 | `could not reach approver 'pager': webhook answered 500 Internal Server Error` | The webhook receiver failed. | Fix the receiver; the request is refused at once rather than waiting. |
 | `could not reach approver 'pager': environment variable ARIODB_WEBHOOK_SECRET is not set` | A `*_env` key names a variable missing from `serve`'s environment. | Set it and restart, or use the `*_secret` form. |
+| `could not reach approver 'ops-telegram': answered 400 Bad Request: Bad Request: chat not found` | A chat, paging or email channel turned the message away; the text after `answered` is the service's own error. Common ones: the bot is not in the chat, a deleted webhook (`Unknown Webhook`), a wrong routing or API key. | Fix the channel's set-up (see [approvals](approvals.md#chat-paging-and-email-channels)). Errors never include the webhook URL or token. |
+| `could not reach approver 'ops-email': the mail server said: ...` | The SMTP host, port, `smtp_tls` or login is wrong, or the server refused the sender or a recipient. | Check the mail server's answer in the message. |
+| `ariodb: could not close request a-3f9c0e1b2a4d in approver 'on-call': ...` in the log | Resolving the PagerDuty incident or closing the Opsgenie alert failed after the decision. | The decision stands; close the incident or alert by hand, and check the key. |
 
 **Slack buttons do nothing**, or Slack shows an error after a click: set
 the Slack app's interactivity request URL to `<public_url>/slack/actions`,
@@ -271,10 +274,17 @@ make sure Slack can reach that address over HTTPS, and check
 different Slack approver answers `this request is not waiting on a Slack
 approver`.
 
-**Webhook links open a page instead of deciding.** That is deliberate: a
-`GET` on an approve or deny link only shows the request and a button, so
-link previews cannot decide. Receivers that decide programmatically must
-`POST` to the link.
+**Webhook and channel links open a page instead of deciding.** That is
+deliberate: a `GET` on an approve or deny link only shows the request and a
+button, so link previews cannot decide. Receivers that decide
+programmatically must `POST` to the link. With single sign-on, or
+`approval_links = "sign_in"`, the page also asks the person to sign in; see
+[single sign-on and roles](#single-sign-on-and-roles).
+
+**A link says "This approval link is not valid."** The link was altered;
+or, for a webhook, its HMAC secret changed; or, for a channel,
+`ariodb.approval-link-key` was deleted; or the approver was renamed or
+removed. Decide in the dashboard instead.
 
 **After-stage approvals and locks.** While an after-stage approval waits,
 the write's transaction stays open and holds its row locks. Other sessions
@@ -341,8 +351,41 @@ Plugin changes in the config take effect only after `serve` restarts.
 | `cross-site request refused` | The browser's `Origin` does not match the `Host` header ariodb sees, usually because a reverse proxy rewrites `Host`. | Pass the original host through (`proxy_set_header Host $host;` in nginx). |
 | `missing or wrong CSRF token` | The page is older than the session (for example after a restart or a new login elsewhere). | Reload the page. |
 | `the dashboard may not change the config (dashboard.config_writes = false); copy the text into your config repository instead` | Saving the config from the dashboard is off. | Copy the edit into your config repository, or set `config_writes = true`. |
+| `this needs the admin role; sam has the approver role` | The person's [role](dashboard.md#roles) is too low for that page or action. | Give a local user another role on the Settings page (or `ariodb dashboard-password --user sam --role admin`); for single sign-on, add the person to a group in `admin_groups`. |
+| `sam has the viewer role; deciding needs the approver role` | Viewers can see approvals but not decide them. | As above, with the approver role. |
+| `only members of dba may decide requests for approver 'dba-ops'` | The approver sets `groups`, and this person is in none of them. Admins are not exempt; local users have no groups. | Add the person to the group at the provider (they must sign in again), or decide with `ariodb approve` on the host. |
 
-<!-- TODO: document OIDC single sign-on and dashboard role troubleshooting once merged. -->
+## Single sign-on and roles
+
+The sign-in error page shows the message; ariodb's log has a line for each
+refusal (`ariodb: single sign-on refused <name>: ...` or
+`ariodb: single sign-on refused: ...`). `ariodb: <name> signed in to the
+dashboard with <provider> as <role>` marks a sign-in that worked.
+
+| Message | Cause | Fix |
+|---|---|---|
+| `ariodb cannot reach <provider> at the moment.` (with `ariodb: single sign-on: ...` in the log) | ariodb could not read `<issuer>/.well-known/openid-configuration` or the signing keys: a wrong `issuer`, no route to the provider, a redirect (ariodb follows none), or a document that fails its checks. | Check `issuer` against the provider's discovery document, and the log line's detail. |
+| `ariodb: single sign-on: the provider calls itself https://example.okta.com/oauth2/default, not https://example.okta.com` in the log | The discovery document names another issuer. | Set `issuer` to exactly what the document says. |
+| `ariodb: single sign-on: the provider's token_endpoint http://... is not https (http only for localhost)` in the log | The provider advertises plain-http endpoints. | Serve the provider over HTTPS, or give it its public `https` name. |
+| An error from the provider before it returns, such as "Invalid parameter: redirect_uri" | The redirect URI is not registered. | Register `<public_url><redirect_path>` exactly, scheme and port included. |
+| `<provider> refused the sign-in: ...` | The provider sent an error back, for example `invalid_scope` from a provider with no `groups` scope, or `access_denied` when the person is not assigned to the application. | For `invalid_scope`, set `scopes = ["openid", "profile", "email"]`. Otherwise follow the provider's message. |
+| `This sign-in has expired or was already used. Start again.` | More than ten minutes passed at the provider, the back button replayed an old callback, or ariodb restarted during the sign-in. | Sign in again. |
+| `This sign-in was started in another browser. Start again here.` | The callback arrived without the `ariodb_sso` cookie: another browser or profile, or a proxy that drops cookies. With `public_url` on `https://`, the cookie is `Secure` and is not kept on plain `http://`. | Sign in again from the dashboard's `public_url`. |
+| `Sign-in with <provider> failed: the token endpoint answered 401 Unauthorized invalid_client` | Wrong client ID or secret, or the provider expects another way of sending the secret. | Check `client_id` and the secret ariodb reads (`client_secret_env` or `client_secret_secret`). |
+| `Sign-in with <provider> failed: the ID token is for another client` / `... was issued to another client` | `client_id` does not match the token's audience or `azp`. | Use the client ID of the application the redirect URI belongs to. |
+| `Sign-in with <provider> failed: the ID token has expired` / `... is not valid yet` / `... was issued in the future` | The ariodb host's clock is more than a minute out. | Fix the clock (NTP). |
+| `Sign-in with <provider> failed: ID token algorithm 'HS256' is not allowed` | The provider signs ID tokens with a shared secret. ariodb accepts only public-key signatures. | Switch the application to RS256 (or another RSA, ECDSA or EdDSA algorithm). |
+| `<name> is not in any group that may use this dashboard (the ID token has no 'groups' claim: the provider must put groups in it)` | The provider puts no groups in the ID token, or under another name. | Add a groups claim (see [registering ariodb](dashboard.md#registering-ariodb-with-a-provider)), or set `groups_claim` to the claim it uses. |
+| `<name> is not in any group that may use this dashboard` | The token has groups, but none in `admin_groups`, `approver_groups` or `viewer_groups`. | Compare the groups the provider sends with the lists. Some send IDs (Microsoft Entra ID sends object IDs) or full paths (Keycloak's `/ariodb-admins`). |
+| `this dashboard needs a verified email address, and the provider sent none` | `allowed_email_domains` is set, and the token has no email or no `email_verified` true. Microsoft Entra ID never sends `email_verified`. | Ask for the `email` scope, or limit sign-in by groups and remove `allowed_email_domains`. |
+| `pat@elsewhere.example is not in a domain allowed to use this dashboard` | The verified email is outside `allowed_email_domains`. | Add the domain, or keep the person out. |
+| `local passwords are switched off; sign in with <provider>` | `password_login = "off"`. | Sign in with the provider; to recover from a provider outage, set `password_login = "break_glass"` in the config on the host. |
+| `single sign-on is configured; set a break-glass password with ariodb dashboard-password` | The first-run password page is off under single sign-on. | Run `ariodb dashboard-password` on the host. |
+| Signed out at once after a config change | The role is worked out on every request: a group removed from the lists, a new `allowed_email_domains`, or `password_login = "off"` refuses the sessions it no longer admits. | Expected. |
+| A person's new group does not take effect | Groups are read from the ID token at sign-in. | Sign out and in again. |
+| Signing out does not sign out of the provider | `logout_at_provider` is off, or the provider's discovery document has no `end_session_endpoint`. | Set `logout_at_provider = true`, and register `<public_url>/` as a post-logout redirect URI. |
+| A link page says `Sign in to decide this request.` | `approval_links = "sign_in"` (the default with single sign-on) and this browser has no dashboard session. | Sign in from the page; it returns to the link. |
+| A link page says `This form is out of date. Open the link again.` | The button's form came from an older session, or from another origin. | Open the link again. |
 
 ## ClickHouse errors
 
@@ -361,20 +404,22 @@ passed through from ClickHouse.
 | `Code: 210. DB::Exception: ariodb: cannot reach ClickHouse: ... (ARIODB)` | ariodb cannot reach `http_url`. | Check the address, TLS (`accept_invalid_certificate` for a private CA), and any tunnel. |
 | `Code: 1000. DB::Exception: ariodb: ARIODB_CLICKHOUSE_PASSWORD is not set. (ARIODB)` | The password variable is missing where `serve` runs. Also `secret '...' is not set`. | Set it, or use `password_secret`. |
 | `Code: 1000. ... bad clickhouse.http_url: ...` | The URL does not parse. | Fix `http_url`. |
-| `native-protocol INSERTs are not supported; use ariodb's ClickHouse HTTP interface` | Inserts through `clickhouse-client` on the native port are refused. | Insert through the HTTP listener. |
+| `over the native protocol ariodb checks only INSERT ... VALUES and INSERT ... FORMAT with the rows sent as data, which it counts before they are inserted; other inserts would run before their rows could be counted` | A native `INSERT ... SELECT`, an `INSERT` with a `SETTINGS` clause, or a driver that writes the rows into the query text, which ClickHouse would insert before ariodb could count them. | Send the rows as data, as `clickhouse-client` does for `VALUES` and `FORMAT`; run `INSERT ... SELECT` through the HTTP listener. |
+| `nothing was inserted: the insert sends at least 75 rows; the limit is 50` | A native insert has more rows than the agent's `max_rows_per_write` (or `[limits]`). None of it reached ClickHouse, and the connection closes. The decisions log records it as `rolled_back`. | Insert in smaller batches, or raise the agent's limit. |
+| `nothing was inserted: ariodb cannot check inserts into columns of type JSON` | ariodb counts rows by reading every column, and cannot read this type (also `Variant`, `Dynamic`, `AggregateFunction`, or a column with a sparse serialisation). | Insert into that table through the HTTP listener. |
+| `nothing was inserted: the insert is larger than ariodb can hold to check (64 MiB); send it in smaller parts` | ariodb holds a native insert's data until the last block; it holds at most 64 MiB (256 MiB decompressed). | Split the insert. |
+| `nothing was inserted: compression method 0x... is not supported through ariodb; use LZ4 or ZSTD` | The client compresses with a method ariodb cannot read. | Use `--network_compression_method lz4` (the default) or `zstd`, or `--compression 0`. |
 | `external tables are not supported through ariodb` | `clickhouse-client --external` and similar. | Not supported. |
 | `client protocol too old: settings must be sent as strings` / `ariodb speaks the not-chunked protocol only` | An old or unusual native client. | Use a current `clickhouse-client`, or the HTTP interface. |
 | `cannot reach ClickHouse at 127.0.0.1:9000: Connection refused (os error 111)` in the log | `native_addr` is wrong or ClickHouse is down. | Check `native_addr`; ariodb connects to it without TLS. |
 | Clients hang or fail with TLS errors after setting `tls_cert` | Both listeners now accept TLS only. | Use `https://` and `clickhouse-client --secure`. |
-
-<!-- TODO: remove the native INSERT refusal above once ClickHouse native INSERT is merged. -->
 
 ## Config changes that do not take effect
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `ariodb: kept the previous config: <error>` | The edited file does not load; the old config is still in force. | Fix the error (`ariodb check`). |
-| A key seems to be ignored | Unknown keys are ignored silently, so a typo leaves the default in place. | Compare with [configuration](configuration.md); `ariodb check` prints what it read. |
+| A key seems to be ignored | Unknown keys are ignored silently (except in `[dashboard.oidc]`, which refuses them), so a typo leaves the default in place. | Compare with [configuration](configuration.md); `ariodb check` prints what it read. |
 | A new listen address, certificate, tunnel or plugin is not used | These need a restart. | Restart `serve`. See [what reloads](configuration.md#what-reloads-while-ariodb-runs). |
 | A changed environment variable is not used | ariodb reads its environment at start. | Restart, or use the secret store, which is read at each use. |
 
