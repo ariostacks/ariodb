@@ -133,7 +133,7 @@ enum Command {
         /// The agent name from the config file
         #[arg(long)]
         agent: String,
-        /// postgres or clickhouse
+        /// postgres, clickhouse or mysql (MySQL and MariaDB)
         #[arg(long, default_value = "postgres")]
         engine: String,
         /// The SQL to judge

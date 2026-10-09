@@ -34,7 +34,7 @@ pub struct Fixture {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Action {
     pub agent: String,
-    /// `postgres` (the default) or `clickhouse`.
+    /// `postgres` (the default), `clickhouse` or `mysql`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
     pub sql: SqlAction,
@@ -79,8 +79,23 @@ pub fn preview(
     let Some(agent) = config.agent(agent_name) else {
         return deny(format!("unknown agent '{agent_name}'"));
     };
-    // ClickHouse statements are judged against the agent's ClickHouse access.
-    let (agent, statements) = if engine == "clickhouse" {
+    // ClickHouse and MySQL statements are judged against the agent's access
+    // to that engine.
+    let (agent, statements) = if engine == "mysql" {
+        let Some(my) = &agent.mysql else {
+            return deny("this agent has no MySQL access".into());
+        };
+        let mut view = agent.clone();
+        view.access = my.access;
+        view.tables = my.tables.clone();
+        match crate::mysql_sql::classify(sql) {
+            Ok(mut s) => {
+                crate::mysql_sql::scope_to_database(&mut s, database);
+                (view, s)
+            }
+            Err(e) => return deny(e.to_string()),
+        }
+    } else if engine == "clickhouse" {
         let Some(ch) = &agent.clickhouse else {
             return deny("this agent has no ClickHouse access".into());
         };
@@ -150,8 +165,10 @@ pub fn preview(
 
 /// The database name statements run in when none is given.
 pub fn default_database(config: &Config, engine: &str) -> String {
-    if engine == "clickhouse" {
-        return "default".to_string();
+    match engine {
+        "clickhouse" => return "default".to_string(),
+        "mysql" => return config.mysql.database.clone(),
+        _ => {}
     }
     crate::upstream::Target::from_url(&config.database_url(), config.database.tls, None)
         .map(|t| t.database)
@@ -243,10 +260,10 @@ pub fn run(config: &Config, fixtures: &[(String, Fixture)]) -> Result<(usize, us
     let (mut passed, mut drifted) = (0, 0);
     for (label, f) in fixtures {
         let engine = f.action.engine.as_deref().unwrap_or("postgres");
-        let fallback = if engine == "clickhouse" {
-            "default".to_string()
-        } else {
-            default_db.clone()
+        let fallback = match engine {
+            "clickhouse" => "default".to_string(),
+            "mysql" => config.mysql.database.clone(),
+            _ => default_db.clone(),
         };
         let database = f.action.sql.database.clone().unwrap_or(fallback);
         let got = preview(
@@ -400,5 +417,68 @@ mod tests {
         assert_eq!(fixtures[0].1.expect.verdict, "approve");
         assert_eq!(fixtures[1].1.expect.verdict, "approve");
         assert_eq!(run(&config, &fixtures).unwrap(), (4, 0));
+    }
+
+    #[test]
+    fn mysql_decisions_round_trip_as_fixtures() {
+        let text = CONFIG.replace(
+            "[limits]",
+            "[mysql]\nlisten = \"127.0.0.1:0\"\ndatabase = \"app\"\n\n[limits]",
+        ) + "\n[agents.mysql]\naccess = \"read_only\"\ntables = [\"orders\", \"users\"]\n";
+        let config = Config::from_toml(&text).unwrap();
+        let rules = RuleSet::compile(&config.rules).unwrap();
+        assert_eq!(default_database(&config, "mysql"), "app");
+        let explain = |sql: &str| preview(&config, &rules, "bot", sql, "app", "mysql");
+        assert_eq!(explain("SELECT * FROM app.orders").verdict, "allow");
+        // The rules see the same tables as on Postgres.
+        assert_eq!(explain("SELECT * FROM users").rule, "pii");
+        // The agent's MySQL access, not its Postgres access, decides.
+        let p = explain("UPDATE orders SET a = 1 WHERE id = 1");
+        assert_eq!((p.verdict, p.rule.as_str()), ("deny", "policy"));
+        assert!(p.reason.contains("read only"), "{}", p.reason);
+        assert_eq!(explain("SELECT * FROM other.orders").verdict, "deny");
+        assert_eq!(explain("SHOW PROCESSLIST").verdict, "deny");
+        assert_eq!(explain("SELECT * FROM `unterminated").verdict, "deny");
+        let no_access = preview(&config, &rules, "nobody", "SELECT 1", "app", "mysql");
+        assert_eq!(no_access.verdict, "deny");
+
+        let decision = |sql: &str, outcome: &str, rule: Option<&str>| crate::audit::Decision {
+            id: 1,
+            at_ms: 0,
+            session: "s-0123456789".into(),
+            agent: "bot".into(),
+            sql: sql.into(),
+            kind: "read".into(),
+            tables: vec![],
+            outcome: outcome.into(),
+            rows: None,
+            reason: None,
+            rule: rule.map(str::to_string),
+            latency_ms: None,
+            engine: "mysql".into(),
+            database: "app".into(),
+        };
+        let cases = [
+            decision("SELECT * FROM orders", "allowed", None),
+            decision("SELECT * FROM users", "refused", Some("pii")),
+            decision("DELETE FROM orders", "refused", None),
+            decision("SET NAMES utf8mb4", "allowed", None),
+        ];
+        let fixtures: Vec<(String, Fixture)> = cases
+            .iter()
+            .map(|d| {
+                let value = fixture_for(d, &config).unwrap();
+                assert_eq!(value["action"]["engine"], "mysql");
+                ("x".to_string(), serde_json::from_value(value).unwrap())
+            })
+            .collect();
+        assert_eq!(run(&config, &fixtures).unwrap(), (4, 0));
+
+        // A hand-written fixture without a database runs in [mysql] database.
+        let written: Fixture = serde_json::from_str(
+            r#"{"action":{"agent":"bot","engine":"mysql","sql":{"statement":"SELECT * FROM app.orders"}},"match":{"verdict":"allow"}}"#,
+        )
+        .unwrap();
+        assert_eq!(run(&config, &[("w".to_string(), written)]).unwrap(), (1, 0));
     }
 }
