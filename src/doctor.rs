@@ -1040,3 +1040,47 @@ async fn check_mysql_gateway(
     let _ = conn.disconnect().await;
     (reads, writes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_yes() -> Guarantees {
+        Guarantees {
+            reads: Ok(()),
+            writes: Ok(()),
+            undo: Ok(()),
+        }
+    }
+
+    #[test]
+    fn the_summary_names_mysql_and_keeps_postgres_wording() {
+        let postgres_only = Report {
+            sections: vec![],
+            postgres: Some(all_yes()),
+            mysql: None,
+        };
+        assert_eq!(
+            postgres_only.summary(),
+            "reads yes; checked writes yes; undo yes"
+        );
+        let mut mysql = all_yes();
+        mysql.undo = Err("not set up".into());
+        let both = Report {
+            sections: vec![],
+            postgres: Some(all_yes()),
+            mysql: Some(mysql.clone()),
+        };
+        assert_eq!(
+            both.summary(),
+            "reads yes; checked writes yes; undo yes; MySQL: reads yes; checked writes yes; undo no (not set up)"
+        );
+        let mysql_only = Report {
+            sections: vec![],
+            postgres: None,
+            mysql: Some(mysql),
+        };
+        assert!(mysql_only.summary().starts_with("MySQL: "));
+        assert!(!mysql_only.failed());
+    }
+}
