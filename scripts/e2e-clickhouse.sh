@@ -20,6 +20,7 @@ trap 'kill $SERVE_PID 2>/dev/null || true; docker rm -f $CH >/dev/null 2>&1 || t
 pass() { printf '  \033[32mpass\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 expect() { if grep -qF -- "$2" <<<"$3"; then pass "$1"; else echo "$3"; fail "$1"; fi; }
+quiet() { if [ -z "$2" ]; then pass "$1"; else echo "$2"; fail "$1"; fi; } # quiet <description> <output>
 
 echo "starting ClickHouse"
 docker rm -f $CH >/dev/null 2>&1 || true
@@ -41,6 +42,8 @@ done
 admin() { curl -s -u ariodb:ch-local-test-only "http://127.0.0.1:$CH_HTTP/" --data-binary "$1"; }
 admin "CREATE TABLE events (id UInt32, user String, kind String) ENGINE = MergeTree ORDER BY id"
 admin "CREATE TABLE secrets (note String) ENGINE = MergeTree ORDER BY note"
+admin "CREATE TABLE loads (id UInt32, user String, kind String) ENGINE = MergeTree ORDER BY id"
+admin "CREATE TABLE typed (id UInt32, n Nullable(Int64), tags Array(String), m Map(String, UInt16), t Tuple(a UInt8, b String), lc LowCardinality(String), lcn LowCardinality(Nullable(String)), d Decimal(18, 4), ts DateTime64(3, 'UTC'), u UUID, fs FixedString(3), e Enum8('a' = 1, 'b' = 2), ip IPv6, ok Bool, nested Array(Array(Nullable(String)))) ENGINE = MergeTree ORDER BY id"
 admin "INSERT INTO events SELECT number, concat('user', toString(number % 10)), 'view' FROM numbers(1000)"
 admin "INSERT INTO secrets VALUES ('not-a-real-secret')"
 admin "CREATE DATABASE hidden"
@@ -85,9 +88,11 @@ access = "read_only"
 tables = ["unused"]
 token_env = "E2E_LOADER_TOKEN"
 
+max_rows_per_write = 50
+
 [agents.clickhouse]
 access = "read_write"
-tables = ["events"]
+tables = ["events", "loads", "typed"]
 
 [[agents]]
 name = "pg-only"
@@ -158,10 +163,58 @@ expect "comma joins are checked over native" "may not use table 'secrets'" "$(cl
 expect "the login database scopes table names" "may not use table 'hidden.events'" "$(cli analyst $A "SELECT * FROM events" --database hidden)"
 expect "url() refused over native too" "reaches outside the server" "$(cli analyst $A "SELECT * FROM url('http://169.254.169.254/x', CSV, 'a String')")"
 expect "rules apply over native" "data hold" "$(cli analyst $A "SELECT count() FROM events WHERE user = 'user7'")"
-expect "native inserts refused with a pointer to HTTP" "use ariodb's ClickHouse HTTP interface" "$(cli loader $L "INSERT INTO events VALUES (6000, 'x', 'y')")"
 expect "client settings cannot lift read-only mode" "1001" "$(cli analyst $A "SELECT count() FROM events" --readonly 0)"
 expect "the connection keeps working after a refusal" "1001" "$(docker run --rm "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE --user analyst --password $A --multiquery --query "SELECT * FROM secrets; SELECT count() FROM events" 2>&1 || true; docker run --rm "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE --user analyst --password $A --query "SELECT count() FROM events" 2>&1)"
 expect "uncompressed clients work too" "1001" "$(cli analyst $A "SELECT count() FROM events" --compression 0)"
+
+echo "native inserts (clickhouse-client)"
+cli_in() { # cli_in <agent> <token> <sql> <stdin> [extra args]
+  local agent=$1 token=$2 sql=$3 input=$4; shift 4
+  printf '%s' "$input" | docker run --rm -i "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE \
+    --user "$agent" --password "$token" "$@" --query "$sql" 2>&1 || true
+}
+csv() { python3 -c 'import sys; n, kind = int(sys.argv[1]), sys.argv[2]; print("\n".join(f"{i},user{i % 10},{kind}" for i in range(n)))' "$@"; }
+landed() { admin "SELECT count() FROM loads WHERE kind = '$1'"; }
+# The newest decision for statements containing the text: outcome and rows.
+decided() {
+  python3 - "$WORK/state/ariodb.db" "$1" <<'PY2'
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+row = db.execute("SELECT outcome, rows FROM decisions WHERE sql LIKE ? ORDER BY id DESC LIMIT 1", (f"%{sys.argv[2]}%",)).fetchone()
+print(row)
+PY2
+}
+TYPED_ROW="(1, NULL, ['a', 'b c'], {'k': 7, 'l': 8}, (3, 'x'), 'low', NULL, 12.5, '2026-10-09 12:00:00.123', '00000000-0000-0000-0000-00000000000a', 'abc', 'b', '::1', true, [['p', NULL], []]), (2, -5, [], {}, (4, ''), 'low', 'card', -1.25, '2026-10-09 12:00:01', '00000000-0000-0000-0000-00000000000b', 'xyz', 'a', '2001:db8::1', false, [[], [NULL]])"
+for mode in lz4 none zstd; do
+  case $mode in
+    lz4) ARGS=() ;;
+    none) ARGS=(--compression 0) ;;
+    zstd) ARGS=(--network_compression_method zstd) ;;
+  esac
+  quiet "INSERT ... VALUES lands ($mode)" "$(cli loader $L "INSERT INTO loads VALUES (1, 'user1', 'values-$mode')" ${ARGS[@]+"${ARGS[@]}"})"
+  expect "  one row landed" "1" "$(landed values-$mode)"
+  quiet "INSERT ... FORMAT CSV from stdin lands ($mode)" "$(cli_in loader $L "INSERT INTO loads FORMAT CSV" "$(csv 40 csv-$mode)" ${ARGS[@]+"${ARGS[@]}"})"
+  expect "  all 40 rows landed" "40" "$(landed csv-$mode)"
+  expect "  the decision records 40 rows" "('allowed', 40)" "$(decided "FORMAT CSV")"
+  expect "an insert over the limit is refused ($mode)" "the limit is 50" "$(cli_in loader $L "INSERT INTO loads FORMAT CSV" "$(csv 75 big-$mode)" ${ARGS[@]+"${ARGS[@]}"})"
+  expect "  and no rows landed" "0" "$(landed big-$mode)"
+  expect "  the decision records the rows it was sent" "('rolled_back', 75)" "$(decided "FORMAT CSV")"
+  expect "an insert over the limit in small blocks is refused ($mode)" "the limit is 50" \
+    "$(cli_in loader $L "INSERT INTO loads FORMAT CSV" "$(csv 75 blocks-$mode)" --max_insert_block_size 20 ${ARGS[@]+"${ARGS[@]}"})"
+  expect "  and none of its blocks landed" "0" "$(landed blocks-$mode)"
+  expect "  the decision records the block it stopped at" "('rolled_back', 60)" "$(decided "FORMAT CSV")"
+  quiet "every column type in a test table is read exactly ($mode)" "$(cli loader $L "INSERT INTO typed VALUES $TYPED_ROW" ${ARGS[@]+"${ARGS[@]}"})"
+  expect "  and both rows landed intact" "2	[['p',NULL],[]]	2001:db8::1	card" \
+    "$(admin "SELECT count(), anyIf(nested, id = 1), toString(anyIf(ip, id = 2)), anyIf(lcn, id = 2) FROM typed FORMAT TSV")"
+  admin "TRUNCATE TABLE typed"
+done
+expect "the session carries on after a native insert" "42" "$(docker run --rm "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE --user loader --password $L --multiquery --query "INSERT INTO loads VALUES (2, 'user2', 'values-lz4'); SELECT count() FROM loads WHERE kind LIKE '%-lz4'" 2>&1 || true)"
+expect "a read-only agent cannot insert over native" "is read only" "$(cli analyst $A "INSERT INTO events VALUES (6000, 'x', 'y')")"
+expect "an insert into another table is refused over native" "may not use table 'secrets'" "$(cli loader $L "INSERT INTO secrets VALUES ('planted')")"
+expect "INSERT ... SELECT is refused over native" "only INSERT ... VALUES and INSERT ... FORMAT" "$(cli loader $L "INSERT INTO loads SELECT number, 'x', 'select' FROM numbers(1000)")"
+expect "  and nothing landed" "0" "$(landed select)"
+expect "external tables are still refused" "external tables are not supported" "$(cli_in analyst $A "SELECT count() FROM events WHERE id IN ext" "1" --external --file=- --name=ext --structure='id UInt32')"
+expect "native insert decisions are logged" "decisions log intact" "$($BIN "${CFG[@]}" audit)"
 
 echo "recorded decisions as tests"
 $BIN "${CFG[@]}" export-fixtures --out "$WORK/recorded" >/dev/null

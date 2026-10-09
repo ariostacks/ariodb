@@ -432,6 +432,138 @@ pub fn classify(sql: &str) -> Result<Statement, String> {
     })
 }
 
+/// Over the native protocol, an INSERT whose rows ariodb can count before
+/// ClickHouse sees them: `INSERT INTO [TABLE] t [(columns)] VALUES` or
+/// `... FORMAT name`, with nothing after, so the rows follow as data blocks.
+/// ClickHouse runs any other form as soon as it arrives: INSERT ... SELECT,
+/// rows written into the query text (even inside what looks like a comment,
+/// which a format such as CSV reads as data), or a SETTINGS clause that
+/// could change how the blocks are read.
+pub fn insert_from_client(sql: &str) -> Result<(), String> {
+    let refuse = || {
+        Err("over the native protocol ariodb checks only INSERT ... VALUES and INSERT ... FORMAT with the rows sent as data, which it counts before they are inserted; other inserts would run before their rows could be counted".to_string())
+    };
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let space = |mut i: usize| -> Option<usize> {
+        loop {
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if b[i..].starts_with(b"--") || b[i..].starts_with(b"# ") {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if b[i..].starts_with(b"/*") {
+                let mut depth = 0;
+                loop {
+                    if i + 1 >= b.len() {
+                        return None;
+                    }
+                    if b[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else {
+                return Some(i);
+            }
+        }
+    };
+    // A name: a bare word (returned lower case) or a quoted identifier
+    // (returned with its quote, so it never matches a keyword).
+    let word = |i: usize| -> Option<(String, usize)> {
+        let i = space(i)?;
+        match b.get(i)? {
+            q @ (b'`' | b'"') => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != *q {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                (j < b.len()).then(|| (sql[i..=j].to_string(), j + 1))
+            }
+            c if c.is_ascii_alphabetic() || *c == b'_' => {
+                let mut j = i;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$')
+                {
+                    j += 1;
+                }
+                Some((sql[i..j].to_ascii_lowercase(), j))
+            }
+            _ => None,
+        }
+    };
+    let expect = |i: usize, kw: &str| word(i).filter(|(w, _)| w == kw).map(|(_, j)| j);
+    let Some(j) = expect(i, "insert").and_then(|j| expect(j, "into")) else {
+        return refuse();
+    };
+    i = j;
+    if let Some(j) = expect(i, "table") {
+        i = j;
+    }
+    // The table, perhaps with its database.
+    let Some((name, j)) = word(i) else {
+        return refuse();
+    };
+    if name == "function" {
+        return refuse();
+    }
+    i = j;
+    if space(i).and_then(|k| b.get(k)) == Some(&b'.') {
+        let Some((_, j)) = word(space(i).unwrap_or(i) + 1) else {
+            return refuse();
+        };
+        i = j;
+    }
+    // A column list.
+    if let Some(k) = space(i).filter(|k| b.get(*k) == Some(&b'(')) {
+        let mut depth = 0;
+        let mut j = k;
+        loop {
+            match b.get(j) {
+                None => return refuse(),
+                Some(b'(') => depth += 1,
+                Some(b')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Some(q @ (b'\'' | b'`' | b'"')) => {
+                    j += 1;
+                    while j < b.len() && b[j] != *q {
+                        j += if b[j] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        i = j + 1;
+    }
+    let end = match word(i) {
+        Some((w, j)) if w == "values" => j,
+        Some((w, j)) if w == "format" => match word(j) {
+            Some((_, k)) => k,
+            None => return refuse(),
+        },
+        _ => return refuse(),
+    };
+    // Nothing may follow, not even a comment: ClickHouse would read it as rows.
+    if !sql[end.min(sql.len())..].trim().is_empty() {
+        return refuse();
+    }
+    Ok(())
+}
+
 /// Unqualified table names mean tables in the session's database, which the
 /// agent chooses (the `database` parameter, or the native login).
 /// Allow-lists name tables in `default` without a prefix, so in any other
@@ -580,6 +712,35 @@ mod tests {
         assert_eq!(s.tables, vec!["events", "other.t"]);
         scope_to_database(&mut s, "Hidden");
         assert_eq!(s.tables, vec!["hidden.events", "other.t"]);
+    }
+
+    #[test]
+    fn native_inserts_must_send_their_rows_as_data() {
+        for ok in [
+            "INSERT INTO events VALUES",
+            "insert into TABLE db.`my events` (id, `user`) values  ",
+            "/* load */ INSERT INTO events (a, b) FORMAT CSV",
+            "INSERT INTO events FORMAT JSONEachRow\n",
+        ] {
+            assert_eq!(insert_from_client(ok), Ok(()), "{ok}");
+        }
+        for bad in [
+            "INSERT INTO events SELECT * FROM numbers(10000)",
+            "INSERT INTO events (id) SELECT number FROM numbers(10)",
+            "INSERT INTO events VALUES (1, 'a', 'b')",
+            "INSERT INTO events FORMAT CSV 1,a,b",
+            "INSERT INTO events FORMAT CSV\n/*\n1,a,b\n2,c,d\n*/",
+            "INSERT INTO events FORMAT CSV -- 1,a,b",
+            "INSERT INTO events SETTINGS async_insert = 1 VALUES",
+            "INSERT INTO events FROM INFILE '/etc/passwd' FORMAT CSV",
+            "INSERT INTO FUNCTION numbers(1) VALUES",
+            "INSERT INTO events WITH 1 AS x SELECT x",
+            "INSERT INTO events (id VALUES",
+            "INSERT INTO events FORMAT",
+            "SELECT 1",
+        ] {
+            assert!(insert_from_client(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
