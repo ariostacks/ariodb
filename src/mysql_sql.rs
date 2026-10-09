@@ -327,6 +327,14 @@ fn statement(
     lexemes: Vec<Lexeme>,
 ) -> Result<Option<Statement>, ParseError> {
     let runs_comment = lexemes.iter().any(|l| l.tok == Tok::Comment(true));
+    // Optimizer hints are harmless, except SET_VAR, which sets session
+    // variables (some the policy refuses) for the statement.
+    let sets_variables = lexemes.iter().any(|l| {
+        let text = &sql[l.start..l.end];
+        l.tok == Tok::Comment(false)
+            && text.starts_with("/*+")
+            && text.to_lowercase().contains("set_var")
+    });
     let toks: Vec<Lexeme> = lexemes
         .into_iter()
         .filter(|l| !matches!(l.tok, Tok::Comment(_)))
@@ -343,6 +351,12 @@ fn statement(
         Judged::new(
             Kind::Unknown,
             "executable comments (/*! ... */) run SQL ariodb cannot see",
+            command_for(&word(&toks, 0)),
+        )
+    } else if sets_variables {
+        Judged::new(
+            Kind::Unknown,
+            "SET_VAR hints change settings ariodb does not check",
             command_for(&word(&toks, 0)),
         )
     } else {
@@ -511,27 +525,8 @@ fn judge(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseError
         ))
     };
     match verb.as_str() {
-        "select" | "with" | "values" | "insert" | "replace" | "update" | "delete" | "" => {
-            parsed(text, toks)
-        }
-        // TABLE t [ORDER BY c] [LIMIT n [OFFSET m]], which sqlparser reads
-        // only inside a query.
-        "table" => {
-            let Some((table, next)) = table_at(toks, 1)? else {
-                return Err(ParseError("TABLE needs a table".into()));
-            };
-            let plain = toks[next..]
-                .iter()
-                .all(|t| matches!(t.tok, Tok::Word(_) | Tok::Name(_) | Tok::Punct(',')));
-            if !plain {
-                return Err(ParseError(
-                    "ariodb cannot read the end of this TABLE".into(),
-                ));
-            }
-            let mut j = Judged::new(Kind::Read, "select", "SELECT");
-            j.tables.push(table);
-            Ok(j)
-        }
+        "select" | "with" | "table" | "values" | "insert" | "replace" | "update" | "delete"
+        | "" => parsed(text, toks),
         "explain" | "describe" | "desc" => explain(text, toks, depth),
         "analyze" => match word(toks, 1).as_str() {
             "table" | "tables" | "no_write_to_binlog" | "local" => {
@@ -750,6 +745,9 @@ fn dotted(parts: &[String]) -> Result<String, ParseError> {
 
 /// SELECT, INSERT, REPLACE, UPDATE and DELETE, read by sqlparser.
 fn parsed(text: &str, toks: &[Lexeme]) -> Result<Judged, ParseError> {
+    if toks.is_empty() {
+        return Err(ParseError("empty statement".into()));
+    }
     let words: Vec<String> = (0..toks.len()).map(|i| word(toks, i)).collect();
     if words
         .windows(2)
@@ -774,6 +772,11 @@ fn parsed(text: &str, toks: &[Lexeme]) -> Result<Judged, ParseError> {
             with.push_str(&" ".repeat(b - a - with.len()));
             sql.replace_range(a..b, &with);
         }
+    }
+    // MySQL's TABLE t is SELECT * FROM t, which sqlparser reads only inside
+    // a query.
+    if words[0] == "table" {
+        sql = format!("SELECT * FROM{}", &sql[toks[0].end - base..]);
     }
     let ast = parse_one(&sql)?;
     let (kind, reason, command) = judge_ast(&ast);
@@ -1676,6 +1679,12 @@ mod tests {
             kind_of("UPDATE /*+ NO_RANGE_OPTIMIZATION(orders) */ orders SET a = 1 WHERE id = 1"),
             Kind::Write
         );
+        assert_eq!(
+            kind_of(
+                "UPDATE /*+ SET_VAR(foreign_key_checks = OFF) */ orders SET a = 1 WHERE id = 1"
+            ),
+            Kind::Unknown
+        );
     }
 
     #[test]
@@ -1701,6 +1710,15 @@ mod tests {
             assert_eq!(kind_of(sql), Kind::Read, "{sql}");
         }
         assert_eq!(tables("TABLE app.orders"), vec!["app.orders"]);
+        assert_eq!(
+            tables("TABLE orders ORDER BY id LIMIT 2 OFFSET 1"),
+            vec!["orders"]
+        );
+        assert_eq!(
+            tables("TABLE orders UNION TABLE secrets"),
+            vec!["orders", "secrets"]
+        );
+        assert_eq!(kind_of("TABLE orders INTO OUTFILE '/tmp/x'"), Kind::Unknown);
         assert_eq!(tables("DESCRIBE app.orders"), vec!["app.orders"]);
         assert_eq!(tables("EXPLAIN DELETE FROM secrets"), vec!["secrets"]);
         assert_eq!(one("DESC orders").command, "DESCRIBE");
@@ -1740,6 +1758,14 @@ mod tests {
             Kind::Write
         );
         assert!(classify(&"EXPLAIN ".repeat(10)).is_err());
+        for sql in [
+            "EXPLAIN",
+            "ANALYZE",
+            "EXPLAIN ANALYZE",
+            "ANALYZE FORMAT=JSON",
+        ] {
+            assert!(classify(sql).is_err(), "{sql}");
+        }
     }
 
     #[test]
