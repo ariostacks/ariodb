@@ -64,9 +64,25 @@ impl Db {
                  user TEXT NOT NULL,
                  csrf TEXT NOT NULL,
                  expires_ms INTEGER NOT NULL
-             );",
+             );
+             CREATE INDEX IF NOT EXISTS approvals_session ON approvals(session, created_ms);",
         )
         .map_err(|e| e.to_string())?;
+        // Columns added after the first release. Users from before roles
+        // existed could do everything, so they stay admins.
+        for column in [
+            "ALTER TABLE dashboard_users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'",
+            "ALTER TABLE dashboard_sessions ADD COLUMN method TEXT NOT NULL DEFAULT 'password'",
+            "ALTER TABLE dashboard_sessions ADD COLUMN subject TEXT",
+            "ALTER TABLE dashboard_sessions ADD COLUMN email TEXT",
+            "ALTER TABLE dashboard_sessions ADD COLUMN groups TEXT NOT NULL DEFAULT '[]'",
+        ] {
+            if let Err(e) = conn.execute_batch(column)
+                && !e.to_string().contains("duplicate column")
+            {
+                return Err(e.to_string());
+            }
+        }
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -171,6 +187,172 @@ fn row_to_approval(r: &rusqlite::Row) -> rusqlite::Result<Approval> {
         note: r.get("note")?,
         decided_ms: r.get("decided_ms")?,
     })
+}
+
+/// What a dashboard user may do. Each role can do everything the one
+/// before it can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// Read every page.
+    Viewer,
+    /// Also decide approvals.
+    Approver,
+    /// Also edit the config, block requests, undo sessions, and manage
+    /// users and secrets.
+    Admin,
+}
+
+impl Role {
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "viewer" => Some(Role::Viewer),
+            "approver" => Some(Role::Approver),
+            "admin" => Some(Role::Admin),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Approver => "approver",
+            Role::Admin => "admin",
+        }
+    }
+}
+
+/// A dashboard session as read back: who, how they signed in, and (for
+/// single sign-on) what the identity provider said about them. The
+/// provider's subject is stored too, for whoever reads the table later.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub user: String,
+    pub csrf: String,
+    /// `password` or `sso`.
+    pub method: String,
+    pub email: Option<String>,
+    pub groups: Vec<String>,
+    /// For password sessions, the user's role now; None for single sign-on,
+    /// whose role follows from the groups and the current config.
+    pub local_role: Option<Role>,
+}
+
+/// What to record when a session starts.
+pub struct NewSession<'a> {
+    pub token_hash: &'a str,
+    pub user: &'a str,
+    pub csrf: &'a str,
+    pub expires_ms: i64,
+    pub method: &'a str,
+    pub subject: Option<&'a str>,
+    pub email: Option<&'a str>,
+    pub groups: &'a [String],
+}
+
+impl Db {
+    pub fn insert_session(&self, s: &NewSession) -> Result<(), String> {
+        let groups = serde_json::to_string(s.groups).map_err(|e| e.to_string())?;
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM dashboard_sessions WHERE expires_ms < ?1",
+                [now_ms()],
+            )?;
+            c.execute(
+                "INSERT INTO dashboard_sessions (token_hash, user, csrf, expires_ms, method, subject, email, groups)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![s.token_hash, s.user, s.csrf, s.expires_ms, s.method, s.subject, s.email, groups],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// The live session with this token hash. A password session whose
+    /// user has since been removed is no session.
+    pub fn session(&self, token_hash: &str) -> Result<Option<Session>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT s.user, s.csrf, s.method, s.email, s.groups, u.role
+                 FROM dashboard_sessions s
+                 LEFT JOIN dashboard_users u ON s.method = 'password' AND u.name = s.user
+                 WHERE s.token_hash = ?1 AND s.expires_ms > ?2",
+                params![token_hash, now_ms()],
+                |r| {
+                    let groups: String = r.get(4)?;
+                    let role: Option<String> = r.get(5)?;
+                    Ok(Session {
+                        user: r.get(0)?,
+                        csrf: r.get(1)?,
+                        method: r.get(2)?,
+                        email: r.get(3)?,
+                        groups: serde_json::from_str(&groups).unwrap_or_default(),
+                        local_role: role.as_deref().and_then(Role::parse),
+                    })
+                },
+            )
+            .optional()
+        })
+        .map(|s| s.filter(|s| s.method != "password" || s.local_role.is_some()))
+    }
+
+    pub fn end_session(&self, token_hash: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM dashboard_sessions WHERE token_hash = ?1",
+                [token_hash],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Local dashboard users and their roles, by name.
+    pub fn users(&self) -> Result<Vec<(String, Role)>, String> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT name, role FROM dashboard_users ORDER BY name")?;
+            let rows = stmt.query_map([], |r| {
+                let role: String = r.get(1)?;
+                Ok((r.get(0)?, Role::parse(&role).unwrap_or(Role::Viewer)))
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Change a local user's role. Returns false if there is no such user.
+    pub fn set_role(&self, user: &str, role: Role) -> Result<bool, String> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE dashboard_users SET role = ?2 WHERE name = ?1",
+                params![user, role.as_str()],
+            )
+            .map(|n| n == 1)
+        })
+    }
+
+    /// Remove a local user and end their sessions. Returns false if there
+    /// is no such user.
+    pub fn remove_user(&self, user: &str) -> Result<bool, String> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM dashboard_sessions WHERE user = ?1 AND method = 'password'",
+                [user],
+            )?;
+            c.execute("DELETE FROM dashboard_users WHERE name = ?1", [user])
+                .map(|n| n == 1)
+        })
+    }
+
+    /// Everyone and everything that has decided an approval, most frequent
+    /// first, for the decisions filter.
+    pub fn deciders(&self) -> Result<Vec<String>, String> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT decided_by FROM approvals WHERE decided_by IS NOT NULL AND decided_by != 'ariodb'
+                 GROUP BY decided_by ORDER BY count(*) DESC LIMIT 200",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect()
+        })
+    }
 }
 
 pub fn now_ms() -> i64 {

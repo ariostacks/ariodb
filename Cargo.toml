@@ -17,6 +17,7 @@ futures = "0.3.34"
 hex = "0.4.3"
 hmac = "0.13.0"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls", "aws-lc-rs", "webpki-roots"] }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
 libc = "0.2.190"
 lz4_flex = { version = "0.11.5", default-features = false, features = ["std", "safe-decode"] }
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls", "binlog"] }
@@ -43,6 +44,7 @@ webpki-roots = "1.0.9"
 zstd = { version = "0.13.3", default-features = false }
 
 [dev-dependencies]
+aws-lc-rs = "1.18.1"
 proptest = "1.11.0"
 
 # mysql_common reads some negative TIME values with arithmetic that

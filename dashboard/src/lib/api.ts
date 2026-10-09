@@ -22,7 +22,7 @@ export function whenSignedOut(handler: () => void) {
   onSignedOut = handler
 }
 
-type Options = { method?: "GET" | "POST" | "PUT"; body?: unknown }
+type Options = { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown }
 
 export async function api<T>(path: string, opts: Options = {}): Promise<T> {
   const method = opts.method ?? "GET"
@@ -54,11 +54,43 @@ export function errorText(e: unknown): string {
 // ---------------------------------------------------------------------------
 // Shapes of the JSON API (see src/dashboard.rs and src/dashboard_api.rs).
 
-export type Me =
-  | { user: string; csrf: string }
-  | { user: null; needs_setup: boolean }
+export type Role = "viewer" | "approver" | "admin"
 
-export type Session = { user: string; csrf: string }
+/** What each role may do; each role can do everything the one before it can. */
+export const ROLES: { role: Role; label: string; can: string }[] = [
+  { role: "viewer", label: "Viewer", can: "Reads every page" },
+  { role: "approver", label: "Approver", can: "Also decides approvals" },
+  { role: "admin", label: "Admin", can: "Also edits config, blocks requests, undoes sessions, manages users and secrets" },
+]
+
+export function atLeast(role: Role, needed: Role) {
+  const order: Role[] = ["viewer", "approver", "admin"]
+  return order.indexOf(role) >= order.indexOf(needed)
+}
+
+/** The signed-in user, as /api/me, /api/login and /api/setup describe them. */
+export type Session = {
+  user: string
+  csrf: string
+  role: Role
+  email: string | null
+  groups: string[]
+  /** How they signed in. */
+  method: "password" | "sso"
+  /** The single sign-on provider's name, when single sign-on is configured. */
+  provider: string | null
+  config_writes: boolean
+}
+
+export type SignedOut = {
+  user: null
+  needs_setup: boolean
+  sso: { provider: string; login_url: string } | null
+  /** primary without single sign-on; break_glass or off with it. */
+  password_login: "primary" | "break_glass" | "off"
+}
+
+export type Me = Session | SignedOut
 
 export type Overview = {
   pending_approvals: number
@@ -93,6 +125,9 @@ export type Approval = {
   decided_by: string | null
   note: string | null
   decided_ms: number | null
+  /** Single sign-on groups that may decide; empty means anyone with the approver role. */
+  decider_groups: string[]
+  you_may_decide: boolean
 }
 
 export type Decision = {
@@ -108,7 +143,11 @@ export type Decision = {
   reason: string | null
   rule: string | null
   latency_ms: number | null
+  /** Who decided the approvals behind this statement: people, models and plugins. */
+  decided_by: string[]
 }
+
+export type DashboardUser = { name: string; role: Role }
 
 export type BlockLike = { rule: string; snippet: string; applied: boolean }
 

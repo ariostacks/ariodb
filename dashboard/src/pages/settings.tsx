@@ -1,5 +1,13 @@
 import { useState, type FormEvent } from "react"
-import { CheckCircle2Icon, KeyRoundIcon, Loader2Icon, LogOutIcon, ShieldCheckIcon, UserPlusIcon } from "lucide-react"
+import {
+  CheckCircle2Icon,
+  KeyRoundIcon,
+  Loader2Icon,
+  LogOutIcon,
+  ShieldCheckIcon,
+  Trash2Icon,
+  UserPlusIcon,
+} from "lucide-react"
 import { toast } from "sonner"
 import { ErrorNote, Loading, PageBody } from "@/components/page"
 import { Alert, AlertDescription } from "@/components/ui/alert"
@@ -9,8 +17,39 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { StatusBadge } from "@/components/status-badge"
-import { api, errorText, type AuditCheck, type PluginStatus } from "@/lib/api"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { api, errorText, ROLES, type AuditCheck, type DashboardUser, type PluginStatus, type Role } from "@/lib/api"
 import { useApi } from "@/lib/hooks"
+import { useCan, useMe } from "@/lib/me"
+
+function RoleSelect({
+  value,
+  onChange,
+  disabled,
+  label,
+  id,
+}: {
+  value: Role
+  onChange: (r: Role) => void
+  disabled?: boolean
+  label: string
+  id?: string
+}) {
+  return (
+    <Select value={value} onValueChange={(v) => onChange(v as Role)} disabled={disabled}>
+      <SelectTrigger id={id} aria-label={label} className="w-36">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {ROLES.map((r) => (
+          <SelectItem key={r.role} value={r.role}>
+            {r.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
 
 const NAME_PATTERN = "[A-Za-z0-9_-]+"
 const USER_PATTERN = "[A-Za-z0-9_.@-]+"
@@ -102,20 +141,26 @@ function Secrets() {
 }
 
 function Users() {
-  const { data, error, loading, reload } = useApi<{ users: string[] }>("/api/users")
+  const me = useMe()
+  const { data, error, loading, reload } = useApi<{ users: DashboardUser[] }>("/api/users")
   const [name, setName] = useState("")
   const [password, setPassword] = useState("")
+  const [role, setRole] = useState<Role>("viewer")
   const [busy, setBusy] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
-  const exists = data?.users.includes(name) ?? false
+  const existing = data?.users.find((u) => u.name === name)
 
   async function submit(e: FormEvent) {
     e.preventDefault()
     setBusy(true)
     setFormError(null)
     try {
-      await api("/api/users", { method: "POST", body: { name, password } })
-      toast.success(exists ? `Password for ${name} reset.` : `User ${name} added.`)
+      // Resetting a password leaves the role alone; roles change in the list.
+      await api("/api/users", {
+        method: "POST",
+        body: existing ? { name, password } : { name, password, role },
+      })
+      toast.success(existing ? `Password for ${name} reset.` : `User ${name} added.`)
       setName("")
       setPassword("")
       await reload()
@@ -126,24 +171,65 @@ function Users() {
     }
   }
 
+  async function change(user: string, r: Role) {
+    try {
+      await api(`/api/users/${encodeURIComponent(user)}/role`, { method: "POST", body: { role: r } })
+      toast.success(`${user} is now ${ROLES.find((x) => x.role === r)?.label.toLowerCase() ?? r}.`)
+    } catch (err) {
+      toast.error(errorText(err))
+    }
+    await reload()
+  }
+
+  async function remove(user: string) {
+    try {
+      await api(`/api/users/${encodeURIComponent(user)}`, { method: "DELETE" })
+      toast.success(`${user} removed.`)
+    } catch (err) {
+      toast.error(errorText(err))
+    }
+    await reload()
+  }
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Dashboard users</CardTitle>
-        <CardDescription>A new password signs that user out everywhere.</CardDescription>
+        <CardTitle>Local users</CardTitle>
+        <CardDescription>
+          {me.provider
+            ? `People who sign in with ${me.provider} get their role from their groups. Local users are for break-glass use.`
+            : "A new password signs that user out everywhere."}
+        </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         {error && <ErrorNote message={error} />}
         {loading && !data ? (
           <Loading rows={1} />
         ) : (
-          <div className="flex flex-wrap gap-1.5">
+          <ul className="flex flex-col divide-y rounded-lg border">
             {data?.users.map((u) => (
-              <Badge key={u} variant="secondary">
-                {u}
-              </Badge>
+              <li key={u.name} className="flex items-center gap-2 px-3 py-2 text-sm">
+                <span className="min-w-0 flex-1 truncate font-medium">{u.name}</span>
+                <RoleSelect
+                  value={u.role}
+                  label={`Role for ${u.name}`}
+                  disabled={u.name === "root"}
+                  onChange={(r) => void change(u.name, r)}
+                />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="text-muted-foreground"
+                  disabled={u.name === "root"}
+                  title={u.name === "root" ? "root cannot be removed" : undefined}
+                  onClick={() => void remove(u.name)}
+                >
+                  <Trash2Icon />
+                  <span className="sr-only">Remove {u.name}</span>
+                </Button>
+              </li>
             ))}
-          </div>
+          </ul>
         )}
         <form onSubmit={submit}>
           <FieldGroup className="gap-3">
@@ -169,12 +255,19 @@ function Users() {
                 required
                 autoComplete="new-password"
               />
-              <FieldDescription>At least 12 characters.</FieldDescription>
+              <FieldDescription>At least 12 characters. A new password signs that user out everywhere.</FieldDescription>
             </Field>
+            {!existing && (
+              <Field>
+                <FieldLabel htmlFor="user-role">Role</FieldLabel>
+                <RoleSelect id="user-role" value={role} label="Role" onChange={setRole} />
+                <FieldDescription>{ROLES.find((r) => r.role === role)?.can}.</FieldDescription>
+              </Field>
+            )}
             {formError && <ErrorNote title="Not saved" message={formError} />}
             <Button type="submit" disabled={busy} className="self-start">
               {busy ? <Loader2Icon className="animate-spin" /> : <UserPlusIcon />}
-              {exists ? "Reset password" : "Add user"}
+              {existing ? "Reset password" : "Add user"}
             </Button>
           </FieldGroup>
         </form>
@@ -282,21 +375,42 @@ function AuditLog() {
   )
 }
 
-export function SettingsPage({ user, onSignOut }: { user: string; onSignOut: () => void }) {
+export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
+  const me = useMe()
+  const admin = useCan("admin")
+  const role = ROLES.find((r) => r.role === me.role)
   return (
     <PageBody>
       <div className="grid gap-4 @4xl/main:grid-cols-2">
-        <Secrets />
-        <Users />
+        {admin && <Secrets />}
+        {admin && <Users />}
         <AuditLog />
         <Plugins />
         <Card>
           <CardHeader>
             <CardTitle>This session</CardTitle>
             <CardDescription>
-              Signed in as <span className="font-medium text-foreground">{user}</span>. Sessions last 12 hours.
+              Signed in as <span className="font-medium text-foreground">{me.email ?? me.user}</span>
+              {me.method === "sso" ? ` with ${me.provider ?? "single sign-on"}` : " with a local password"}.
+              Sessions last 12 hours.
             </CardDescription>
           </CardHeader>
+          <CardContent className="flex flex-col gap-2 text-sm">
+            <div>
+              <Badge variant="secondary">{role?.label ?? me.role}</Badge>{" "}
+              <span className="text-muted-foreground">{role?.can}.</span>
+            </div>
+            {me.groups.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-muted-foreground">Groups</span>
+                {me.groups.map((g) => (
+                  <Badge key={g} variant="outline">
+                    {g}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </CardContent>
           <CardFooter className="mt-auto">
             <Button variant="outline" onClick={onSignOut}>
               <LogOutIcon />

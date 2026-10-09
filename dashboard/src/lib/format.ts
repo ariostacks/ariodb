@@ -32,3 +32,15 @@ export async function copyText(text: string): Promise<boolean> {
     return false
   }
 }
+
+/** How a decider recorded on an approval reads to people. */
+export function deciderLabel(by: string): string {
+  if (by.startsWith("sso:")) return by.slice(4)
+  if (by.startsWith("dashboard:")) return `${by.slice(10)} (local)`
+  if (by.startsWith("model:")) return `model ${by.slice(6)}`
+  if (by.startsWith("plugin:")) return `plugin ${by.slice(7)}`
+  if (by.startsWith("slack:")) return `${by.slice(6)} (Slack)`
+  if (by.startsWith("cli:")) return `${by.slice(4)} (command line)`
+  if (by === "webhook") return "approval link"
+  return by
+}

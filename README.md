@@ -50,7 +50,9 @@ it changed, and lets a person undo one agent session later.
   approve statements, supply facts for rules, receive notifications or
   receive the decisions log. Examples in Python and TypeScript.
 - **A dashboard.** Approvals queue, decisions, sessions and undo, rules,
-  config editor, secrets, users and plugins, built into the binary.
+  config editor, secrets, users and plugins, built into the binary. Single
+  sign-on with any OpenID Connect provider, with viewer, approver and admin
+  roles from the provider's groups.
 
 ## Quick start: the demo
 
@@ -315,6 +317,7 @@ follow.
 [[approvers]]
 name = "ops"
 type = "dashboard"            # decide in the dashboard or with `ariodb approve` / `deny`
+groups = ["dba"]              # optional, with single sign-on: only these groups decide its requests
 
 [[approvers]]
 name = "ops-slack"
@@ -349,7 +352,10 @@ effort = "low"                # default for anthropic
   `reason`, `expires_ms`, `approve_url`, `deny_url` and `dashboard_url`, and
   the `x-ariodb-signature` header is `sha256=<HMAC-SHA256 of the body>`. The
   approve and deny links are signed per request. Opening one shows the
-  request and a button; only a POST to the link decides.
+  request and a button; only a POST to the link decides. With single
+  sign-on (or `approval_links = "sign_in"`), the link also needs a
+  signed-in approver, who is recorded as the decider; `groups` works here
+  as for dashboard approvers, and needs `approval_links = "sign_in"`.
 - **Model**: the SQL is passed as JSON data with an instruction not to follow
   text inside it, and the answer is limited to allow or deny. A refusal, an
   empty or cut-short answer, or anything but that one JSON object is a deny.
@@ -601,7 +607,41 @@ row locks held) while it waits.
 listen = "127.0.0.1:8080"     # default; "" switches it off
 public_url = "https://ariodb.example.com"   # for links in Slack and webhooks; https turns on Secure cookies
 config_writes = false         # default false: the config page shows the edit to copy instead of saving it
+approval_links = "sign_in"    # signed | sign_in; default sign_in with single sign-on, signed without
+
+[dashboard.oidc]              # single sign-on with any OpenID Connect provider
+issuer = "https://login.example.com/realms/ops"   # https; http only for localhost
+provider_name = "Keycloak"    # the sign-in button says "Sign in with Keycloak"
+client_id = "ariodb"
+client_secret_env = "ARIODB_OIDC_CLIENT_SECRET"   # or client_secret_secret; neither for a public client
+redirect_path = "/auth/callback"   # default; register <public_url><redirect_path> with the provider
+# scopes = ["openid", "profile", "email"]   # default, plus "groups" when role groups are set
+groups_claim = "groups"       # default; a dotted name reaches inside objects, e.g. "realm_access.roles"
+admin_groups = ["ariodb-admins"]
+approver_groups = ["ariodb-approvers", "dba"]
+viewer_groups = ["engineering"]
+allowed_email_domains = ["example.com"]   # optional; needs email_verified = true in the ID token
+password_login = "break_glass"   # default: local passwords still work, offered below the button; "off"
+logout_at_provider = false    # true: signing out also ends the provider's session
 ```
+
+Each person gets the highest role any of their groups maps to; someone in
+none of the groups is refused. Roles are checked on every API request, and
+a signed-in person's role follows the current config, so removing a group
+from `admin_groups` takes effect at once.
+
+| Role | May |
+|---|---|
+| viewer | Read every page except config: approvals, decisions, sessions and undo plans, rules, plugins |
+| approver | Also decide approvals (within an approver's `groups`, if it sets them) |
+| admin | Also read and edit the config, block requests like a decision, undo sessions, manage local users and secrets |
+
+The provider must put the groups in the ID token under `groups_claim`
+(Keycloak: a group membership mapper; Okta: a groups claim; Microsoft
+Entra ID: `groups` in the token configuration). If it has no `groups`
+scope, set `scopes` without it. A provider that does not send
+`email_verified` (Microsoft Entra ID, for one) cannot be limited by
+`allowed_email_domains`; limit it by groups instead.
 
 ### `[audit]`
 
@@ -688,7 +728,7 @@ Every command takes `-c, --config <path>` (default `ariodb.toml`).
 | `audit` | Check the decisions log's hash chain |
 | `export-fixtures --out <dir> [--limit 500]` | Write recent decisions to `<dir>/recorded.json` as test fixtures |
 | `test <file or dir>` | Replay fixtures against the policy; exit 0 all match, 1 drift, 2 error |
-| `dashboard-password [--user root]` | Set a dashboard password, read from stdin |
+| `dashboard-password [--user root] [--role admin]` | Set a local dashboard password, read from stdin; new users are admins unless `--role viewer` or `approver` |
 | `plugin list` | Start each plugin and show the capabilities it declares |
 | `plugin test <name>` | Send a plugin a sample call for each capability; exit 1 on failure |
 | `secret set <name>` | Store a secret, read from stdin |
@@ -741,20 +781,36 @@ gateway role can use can reach tables the allow-list does not name. See
 ## Dashboard
 
 `ariodb serve` serves the dashboard on `[dashboard] listen`
-(127.0.0.1:8080 by default). Sign in as `root` with the password set by
-`ariodb dashboard-password`. On first run the password can also be set from
-the dashboard itself, but only from the same machine.
+(127.0.0.1:8080 by default). Without single sign-on, sign in as `root`
+with the password set by `ariodb dashboard-password`; on first run the
+password can also be set from the dashboard itself, but only from the
+same machine. With `[dashboard.oidc]`, people sign in with the provider
+and get a role from their groups (see [`[dashboard]`](#dashboard)); local
+passwords stay for break-glass use unless `password_login = "off"`, and
+the first-run page is switched off.
 
-Pages: overview; approvals (approve or deny with a note); decisions
-(filter by agent, outcome, rule, session or text; turn a decision into a
-test fixture; "block requests like this" builds a deny rule); sessions
-(see the undo plan, then undo); rules (list, and explain a statement for an
-agent); config (edit with a check before saving, database passwords
-masked; saving needs `config_writes = true`); settings (secrets, users, a
-decisions-log check, and each plugin's state).
+Pages: overview; approvals (approve or deny with a note, and who may
+decide each request); decisions (filter by agent, outcome, rule, session,
+text, or who decided its approval: a person, a model or a plugin; turn a
+decision into a test fixture; "block requests like this" builds a deny
+rule); sessions (see the undo plan, then undo); rules (list, and explain a
+statement for an agent); config (admins only: edit with a check before
+saving, database passwords masked; saving needs `config_writes = true`);
+settings (secrets and local users with their roles for admins, a
+decisions-log check, each plugin's state, and your own session). Pages
+and buttons a role may not use are hidden, and the server refuses them
+anyway.
 
-Changes need a logged-in session, a CSRF token and a same-origin request.
-Failed logins are limited per address and per user.
+Local users have roles too: root is always an admin, users from before
+roles existed are admins, and new users added from the dashboard are
+viewers unless given another role. Changes need a signed-in session, a
+CSRF token and a same-origin request. Failed password logins are limited
+per address and per user.
+
+Decisions are recorded by who made them: `dashboard:<user>` for local
+users, `sso:<email>` for single sign-on, `slack:<user>`, `cli:<user>`,
+`model:<provider>/<model>`, `plugin:<name>`, or `webhook` for a signed
+link followed without signing in.
 
 The front end is a React app (Vite, Tailwind CSS and shadcn/ui) in
 `dashboard/`. Its built files in `dashboard/dist` are committed and embedded
@@ -775,6 +831,7 @@ cargo test                      # unit and property tests (PROPTEST_CASES=100000
 cargo build && ./scripts/e2e.sh # end to end against Postgres in Docker
 ./scripts/e2e-clickhouse.sh     # end to end against ClickHouse in Docker (needs cargo build)
 ./scripts/e2e-plugins.sh        # plugins: the example and a broken one, against Postgres in Docker
+./scripts/e2e-sso.sh            # dashboard single sign-on against Keycloak in Docker
 PG_IMAGE=postgres:18 ./scripts/e2e.sh          # the full suite against another Postgres-compatible image
 ./scripts/e2e-compat.sh cockroach              # YugabyteDB (yugabyte) or CockroachDB (cockroach)
 ./scripts/sim-undo.sh           # seeded random agent and human writes, then undo, checked against a model
@@ -817,7 +874,9 @@ and `E2E_NAME` keep parallel runs of the scripts apart.
   dashboard password can be set from loopback; there are no connection
   limits or handshake timeouts; agent tokens are not rate limited; ClickHouse
   agents may send their token as a URL parameter; repeated wrong passwords
-  lock a dashboard user out for 15 minutes.
+  lock a dashboard user out for 15 minutes; with single sign-on, a group
+  removed at the provider still counts until that person's session ends;
+  without it, anyone holding an approval link can decide its request.
 
 ## Security
 

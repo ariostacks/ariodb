@@ -23,6 +23,7 @@ mod mysql_undo;
 mod mysql_wire;
 mod plugins;
 mod mcp;
+mod oidc;
 mod pgoutput;
 mod policy;
 #[cfg(test)]
@@ -127,6 +128,10 @@ enum Command {
     DashboardPassword {
         #[arg(long, default_value = "root")]
         user: String,
+        /// viewer, approver or admin. New users are admins unless this says
+        /// otherwise; existing users keep their role.
+        #[arg(long)]
+        role: Option<String>,
     },
     /// Manage encrypted secrets (database URLs, agent tokens)
     Secret {
@@ -284,16 +289,28 @@ async fn main() -> ExitCode {
         }
         Command::Approve { id, note } => decide_command(&config, &id, true, note),
         Command::Deny { id, note } => decide_command(&config, &id, false, note),
-        Command::DashboardPassword { user } => store::Db::open(Path::new(&config.journal.dir))
-            .and_then(|db| {
+        Command::DashboardPassword { user, role } => {
+            store::Db::open(Path::new(&config.journal.dir)).and_then(|db| {
+                let role = match role.as_deref() {
+                    None => None,
+                    Some(r) => Some(store::Role::parse(r).ok_or_else(|| {
+                        format!("--role must be viewer, approver or admin, not '{r}'")
+                    })?),
+                };
                 let mut password = String::new();
                 std::io::stdin()
                     .read_line(&mut password)
                     .map_err(|e| e.to_string())?;
-                dashboard::set_password(&db, &user, password.trim_end_matches(['\n', '\r']))?;
+                dashboard::set_password(
+                    &db,
+                    &user,
+                    password.trim_end_matches(['\n', '\r']),
+                    role,
+                )?;
                 println!("password set for '{user}'");
                 Ok(())
-            }),
+            })
+        }
         Command::Explain { agent, engine, sql } => {
             rules::RuleSet::compile(&config.rules).map(|rules| {
                 let database = testing::default_database(&config, &engine);

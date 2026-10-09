@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
-import { CheckIcon, ClockIcon, InfoIcon, Loader2Icon, XIcon } from "lucide-react"
+import { CheckIcon, ClockIcon, InfoIcon, Loader2Icon, UsersIcon, XIcon } from "lucide-react"
 import { toast } from "sonner"
 import { cn } from "cn"
 import { columnHelper, DataTable } from "@/components/data-table"
@@ -18,9 +18,16 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { api, errorText, type Approval } from "@/lib/api"
-import { ago, when } from "@/lib/format"
+import { ago, deciderLabel, when } from "@/lib/format"
 import { useApi, useNow } from "@/lib/hooks"
 import { usePending } from "@/lib/pending"
+
+/** Who may decide a request, in words. */
+function whoMayDecide(a: Approval) {
+  return a.decider_groups.length > 0
+    ? `members of ${a.decider_groups.join(", ")}`
+    : "approvers and admins"
+}
 
 function PendingCard({
   a,
@@ -68,6 +75,10 @@ function PendingCard({
         <CardDescription className="flex flex-wrap gap-x-3 gap-y-1">
           <span>rule {a.rule}</span>
           <span>approver {a.approver}</span>
+          <span className="inline-flex items-center gap-1">
+            <UsersIcon className="size-3.5" />
+            decided by {whoMayDecide(a)}
+          </span>
           <span className={cn("inline-flex items-center gap-1 tabular-nums", left <= 30 && "text-destructive")}>
             <ClockIcon className="size-3.5" />
             {left > 0 ? `${left}s left` : "expiring"}
@@ -78,31 +89,37 @@ function PendingCard({
         {a.reason && <p className="text-sm">{a.reason}</p>}
         <Sql className="max-h-64 overflow-auto">{a.sql}</Sql>
       </CardContent>
-      <CardFooter className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
-        <Input
-          placeholder="Note for the agent (optional)"
-          aria-label="Note for the agent"
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          className="sm:flex-1"
-          maxLength={500}
-        />
-        <div className="flex gap-2">
-          <Button className="flex-1 sm:flex-none" onClick={() => decide("allow")} disabled={busy !== null}>
-            {busy === "allow" ? <Loader2Icon className="animate-spin" /> : <CheckIcon />}
-            Approve
-          </Button>
-          <Button
-            className="flex-1 sm:flex-none"
-            variant="destructive"
-            onClick={() => decide("deny")}
-            disabled={busy !== null}
-          >
-            {busy === "deny" ? <Loader2Icon className="animate-spin" /> : <XIcon />}
-            Deny
-          </Button>
-        </div>
-      </CardFooter>
+      {!a.you_may_decide ? (
+        <CardFooter className="text-sm text-muted-foreground">
+          Only {whoMayDecide(a)} may decide this request.
+        </CardFooter>
+      ) : (
+        <CardFooter className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+          <Input
+            placeholder="Note for the agent (optional)"
+            aria-label="Note for the agent"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            className="sm:flex-1"
+            maxLength={500}
+          />
+          <div className="flex gap-2">
+            <Button className="flex-1 sm:flex-none" onClick={() => decide("allow")} disabled={busy !== null}>
+              {busy === "allow" ? <Loader2Icon className="animate-spin" /> : <CheckIcon />}
+              Approve
+            </Button>
+            <Button
+              className="flex-1 sm:flex-none"
+              variant="destructive"
+              onClick={() => decide("deny")}
+              disabled={busy !== null}
+            >
+              {busy === "deny" ? <Loader2Icon className="animate-spin" /> : <XIcon />}
+              Deny
+            </Button>
+          </div>
+        </CardFooter>
+      )}
     </Card>
   )
 }
@@ -130,7 +147,7 @@ const historyColumns = col.columns([
     enableSorting: false,
     cell: ({ row }) => (
       <div className="max-w-[28ch] whitespace-normal">
-        <div>{row.original.decided_by ?? "nobody (expired)"}</div>
+        <div>{row.original.decided_by ? deciderLabel(row.original.decided_by) : "nobody (expired)"}</div>
         {row.original.note && <div className="text-xs text-muted-foreground">{row.original.note}</div>}
       </div>
     ),
@@ -182,7 +199,7 @@ export function ApprovalsPage() {
           <InfoIcon />
           <AlertDescription>
             The request you followed a link to is no longer waiting: it was {linkedPast.status}
-            {linkedPast.decided_by ? ` by ${linkedPast.decided_by}` : ""}.
+            {linkedPast.decided_by ? ` by ${deciderLabel(linkedPast.decided_by)}` : ""}.
           </AlertDescription>
         </Alert>
       )}

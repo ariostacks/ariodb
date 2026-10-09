@@ -95,6 +95,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS decisions_at ON decisions(at_ms);
 CREATE INDEX IF NOT EXISTS decisions_agent ON decisions(agent, id);
+CREATE INDEX IF NOT EXISTS decisions_session ON decisions(session, id);
 CREATE TABLE IF NOT EXISTS plugin_cursors (
     plugin TEXT PRIMARY KEY,
     last_id INTEGER NOT NULL
@@ -361,11 +362,74 @@ pub struct Filter {
     /// Only entries older than this id (for paging).
     pub before: Option<i64>,
     pub limit: Option<i64>,
+    /// Only statements whose approval this one decided, as approvals
+    /// record it (`sso:pat@example.com`, `model:openai/...`, `plugin:x`).
+    pub decided_by: Option<String>,
+    /// Only statements an approval of this kind decided: `person`,
+    /// `model` or `plugin`.
+    pub decided_by_kind: Option<String>,
+}
+
+/// The approvals behind a decision (from `store.rs`'s table in the same
+/// database): same session, agent and rule, asked for after the session's
+/// previous statement was recorded, and decided before this one was. A
+/// session sends one statement at a time, so that window holds only this
+/// statement's approvals (to the millisecond: an approval asked for in the
+/// very millisecond the previous statement was recorded is not found).
+/// Refers to the decision as `d`, the approval as `a`.
+const APPROVAL_OF_D: &str = "a.session = d.session AND a.agent = d.agent \
+    AND a.rule = d.rule AND a.decided_by IS NOT NULL \
+    AND a.created_ms <= d.at_ms AND a.decided_ms <= d.at_ms \
+    AND a.created_ms > coalesce((SELECT max(p.at_ms) FROM decisions p WHERE p.session = d.session AND p.id < d.id), 0)";
+
+/// The SQL condition on `a.decided_by` for a kind of decider.
+fn decider_kind_condition(kind: &str) -> Result<&'static str, String> {
+    Ok(match kind {
+        "model" => "a.decided_by LIKE 'model:%'",
+        "plugin" => "a.decided_by LIKE 'plugin:%'",
+        "person" => {
+            "a.decided_by NOT LIKE 'model:%' AND a.decided_by NOT LIKE 'plugin:%' AND a.decided_by != 'ariodb'"
+        }
+        _ => return Err(format!("decided_by_kind must be person, model or plugin, not '{kind}'")),
+    })
+}
+
+/// Who decided the approvals behind each of these decisions, by decision id.
+pub fn deciders(
+    dir: &Path,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Vec<String>>, String> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let conn = open_conn(dir)?;
+    let list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT d.id, a.decided_by FROM decisions d JOIN approvals a ON {APPROVAL_OF_D} \
+         WHERE d.id IN ({list}) ORDER BY d.id, a.decided_ms"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (id, by) = row.map_err(|e| e.to_string())?;
+        let list: &mut Vec<String> = out.entry(id).or_default();
+        if !list.contains(&by) {
+            list.push(by);
+        }
+    }
+    Ok(out)
 }
 
 pub fn query(dir: &Path, f: &Filter) -> Result<Vec<Decision>, String> {
     let conn = open_conn(dir)?;
-    let mut sql = "SELECT * FROM decisions WHERE 1 = 1".to_string();
+    let mut sql = "SELECT d.* FROM decisions d WHERE 1 = 1".to_string();
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     // Each condition is a template where `?` becomes the next parameter.
     let mut conditions: Vec<(&str, Box<dyn rusqlite::ToSql>)> = Vec::new();
@@ -386,6 +450,19 @@ pub fn query(dir: &Path, f: &Filter) -> Result<Vec<Decision>, String> {
     }
     if let Some(v) = f.before {
         conditions.push(("id < ?", Box::new(v)));
+    }
+    let by_condition = f
+        .decided_by
+        .as_ref()
+        .map(|_| format!("EXISTS (SELECT 1 FROM approvals a WHERE {APPROVAL_OF_D} AND a.decided_by = ?)"));
+    if let (Some(c), Some(v)) = (&by_condition, &f.decided_by) {
+        conditions.push((c.as_str(), Box::new(v.clone())));
+    }
+    if let Some(kind) = &f.decided_by_kind {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM approvals a WHERE {APPROVAL_OF_D} AND {})",
+            decider_kind_condition(kind)?
+        ));
     }
     for (template, value) in conditions {
         args.push(value);
@@ -584,6 +661,94 @@ mod tests {
         assert_eq!(rest[0].decision.sql, "SELECT 3");
         // The byte budget stops a batch early, but never empties it.
         assert_eq!(cursor.after(0, 100, 1).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decisions_know_who_decided_their_approvals() {
+        let dir = std::env::temp_dir().join(format!("ariodb-audit-d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = AuditLog::open(&dir, &Settings::default()).unwrap();
+        let db = crate::store::Db::open(&dir).unwrap();
+        let approval = |id: &str, session: &str, rule: &str, by: &str| {
+            let now = crate::store::now_ms();
+            db.insert_approval(&crate::store::Approval {
+                id: id.into(),
+                created_ms: now,
+                expires_ms: now + 1000,
+                agent: "bot".into(),
+                session: session.into(),
+                sql: "SELECT 1".into(),
+                rule: rule.into(),
+                approver: "ops".into(),
+                reason: String::new(),
+                status: "allowed".into(),
+                decided_by: Some(by.into()),
+                note: None,
+                decided_ms: Some(now),
+            })
+            .unwrap();
+        };
+        let decide = |session: &str, rule: Option<&str>| {
+            let mut e = entry("SELECT 1", &[]);
+            e.session = session;
+            e.rule = rule;
+            log.record(&e);
+        };
+        // Two statements in one session, each approved by someone else, and
+        // one in another session decided by a model.
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(3));
+        approval("a-1", "s1", "ask", "sso:pat@example.test");
+        decide("s1", Some("ask"));
+        tick();
+        approval("a-2", "s1", "ask", "dashboard:root");
+        decide("s1", Some("ask"));
+        approval("a-3", "s2", "ask", "model:openai/gpt-test");
+        decide("s2", Some("ask"));
+        tick();
+        decide("s2", None);
+        let all = query(&dir, &Filter::default()).unwrap();
+        let ids: Vec<i64> = all.iter().map(|d| d.id).collect();
+        let by = deciders(&dir, &ids).unwrap();
+        let of = |n: usize| by.get(&all[n].id).cloned().unwrap_or_default();
+        // Newest first: s2 unruled, s2 model, s1 root, s1 pat.
+        assert!(of(0).is_empty());
+        assert_eq!(of(1), vec!["model:openai/gpt-test"]);
+        assert_eq!(of(2), vec!["dashboard:root"]);
+        assert_eq!(of(3), vec!["sso:pat@example.test"]);
+        let filtered = |f: Filter| query(&dir, &f).unwrap().len();
+        assert_eq!(
+            filtered(Filter {
+                decided_by: Some("sso:pat@example.test".into()),
+                ..Default::default()
+            }),
+            1
+        );
+        assert_eq!(
+            filtered(Filter {
+                decided_by_kind: Some("person".into()),
+                ..Default::default()
+            }),
+            2
+        );
+        assert_eq!(
+            filtered(Filter {
+                decided_by_kind: Some("model".into()),
+                agent: Some("bot".into()),
+                ..Default::default()
+            }),
+            1
+        );
+        assert!(
+            query(
+                &dir,
+                &Filter {
+                    decided_by_kind: Some("robot".into()),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

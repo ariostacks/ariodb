@@ -184,6 +184,30 @@ pub struct Dashboard {
     /// Let the dashboard save edits to the config file. Leave off when the
     /// config is managed in Git; the dashboard then shows the edit to copy.
     pub config_writes: bool,
+    /// Single sign-on with an OpenID Connect provider (see oidc.rs).
+    pub oidc: Option<crate::oidc::OidcConfig>,
+    /// What an approval link (webhook and similar) needs before it decides:
+    /// `signed` (the signed link alone) or `sign_in` (also a signed-in
+    /// approver, who is recorded as the decider). Default: `sign_in` when
+    /// single sign-on is configured, otherwise `signed`.
+    pub approval_links: Option<ApprovalLinks>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalLinks {
+    Signed,
+    SignIn,
+}
+
+impl Dashboard {
+    /// Whether opening an approval link needs a signed-in approver.
+    pub fn links_need_sign_in(&self) -> bool {
+        match self.approval_links {
+            Some(links) => links == ApprovalLinks::SignIn,
+            None => self.oidc.is_some(),
+        }
+    }
 }
 
 impl Default for Dashboard {
@@ -192,6 +216,8 @@ impl Default for Dashboard {
             listen: "127.0.0.1:8080".to_string(),
             public_url: "http://127.0.0.1:8080".to_string(),
             config_writes: false,
+            oidc: None,
+            approval_links: None,
         }
     }
 }
@@ -453,6 +479,7 @@ impl Config {
         }
         crate::approvals::validate(&self.approvers, &self.rules).map_err(ConfigError::Problem)?;
         crate::plugins::validate(self).map_err(ConfigError::Problem)?;
+        crate::oidc::validate(self).map_err(ConfigError::Problem)?;
         let mut names = std::collections::HashSet::new();
         for agent in &self.agents {
             if !names.insert(agent.name.as_str()) {
