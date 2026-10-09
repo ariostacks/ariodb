@@ -600,7 +600,7 @@ for it indefinitely.
 - [Configuration](configuration.md): every option in `ariodb.toml`.
 - [Rules](rules.md) and [testing policies](testing-policies.md): write
   rules and check them in CI.
-- [Approvals](approvals.md): Slack, webhooks, models and plugins as
-  approvers.
+- [Approvals](approvals.md): Slack, webhooks, chat, paging and email
+  channels, models and plugins as approvers.
 - [Undo](undo.md): what undo can and cannot reverse.
 - [Dashboard](dashboard.md): the pages and what they do.

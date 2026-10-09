@@ -115,10 +115,11 @@ really changed and which tables, including through triggers and cascades
 overrides a `deny`. Its only use is to make an exception to an `approve`
 rule (see the [cookbook](#make-an-exception-to-an-approval-rule)).
 
-<!-- TODO: list the further approver channels here once they are merged. -->
 Approvers are named in `[[approvers]]`: a person in the dashboard or with
-`ariodb approve`, Slack, a webhook, a model judging against a written
-policy, or a plugin. See [approvals](approvals.md).
+`ariodb approve`, Slack, a webhook, a person reached in Discord, Telegram,
+Microsoft Teams, Google Chat, Mattermost, PagerDuty, Opsgenie or by email,
+a model judging against a written policy, or a plugin. See
+[approvals](approvals.md).
 
 ## How rules combine
 
@@ -206,8 +207,28 @@ with tables, grants and column privileges.
 |---|---|---|
 | `agent.name` | string | The agent's name from `[[agents]]`. |
 | `agent.access` | string | `read_only` or `read_write`. For a ClickHouse statement, the agent's `[agents.clickhouse]` access; for a MySQL statement, its `[agents.mysql]` access. |
+| `agent.credential` | string | The [`[[credentials]]`](configuration.md#credentials) login the agent's Postgres queries run as (its `credential` setting), or `""` for an agent that runs as `[database]`. |
 
-<!-- TODO: document agent.credential once that fact is merged. -->
+`agent.credential` lets one rule cover every agent that shares a login,
+rather than listing them by name:
+
+```toml
+[[rules]]
+name = "reporting-login-reads-only"
+condition = "agent.credential == 'reporting' && sql.kind == 'write'"
+verdict = "deny"
+reason = "agents on the reporting login only read"
+
+[[rules]]
+name = "gateway-login-writes-need-a-human"
+condition = "agent.credential == '' && sql.kind == 'write'"
+verdict = "approve"
+approve = ["ops"]
+```
+
+It names the agent's Postgres login even for a ClickHouse or MySQL
+statement, which runs as `[clickhouse] user` or `[mysql] user` instead, so
+combine it with `sql.engine == 'postgres'` when that matters.
 
 ### Effects (`effects`)
 

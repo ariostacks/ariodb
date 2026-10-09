@@ -19,7 +19,8 @@ path given with `-c` / `--config` (see [the CLI reference](cli.md)).
 - **Unknown keys are ignored, not rejected.** A misspelt key such as
   `lisen = "0.0.0.0:6543"` under `[proxy]` loads without complaint and
   leaves the default in place. Run `ariodb check` after every edit and read
-  what it prints back.
+  what it prints back. The exception is
+  [`[dashboard.oidc]`](#dashboardoidc), which refuses unknown keys.
 - **Top-level keys come first.** `on_failure` is the only top-level key; in
   TOML it must appear before the first `[section]` header, or it belongs to
   that section instead.
@@ -188,7 +189,7 @@ ca_file = "/etc/ariodb/db-ca.pem"
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `max_rows_per_write` | integer | `500` | A write that changes more rows than this, counted across every table it touched (including through triggers and cascades), is rolled back. Must be at least 1. Agents can override it. |
+| `max_rows_per_write` | integer | `500` | A write that changes more rows than this, counted across every table it touched (including through triggers and cascades), is rolled back. A ClickHouse insert over the native protocol that sends more rows inserts nothing. Must be at least 1. Agents can override it. |
 | `statement_timeout_ms` | integer | `5000` | Set as `SET LOCAL statement_timeout` at the start of every transaction ariodb runs for an agent. On ClickHouse it becomes `max_execution_time`, rounded up to whole seconds (at least 1). On Postgres, `0` means no timeout. |
 | `max_connections` | integer | `256` | The most connections each listener holds at once, logged in or not: the Postgres and MySQL listeners, the ClickHouse HTTP and native listeners, and the dashboard each have their own count. Must be at least 1. |
 | `max_connections_per_agent` | integer | `32` | The most connections one agent holds at once on each listener, counted once it has logged in. Over HTTP (ClickHouse), it counts the agent's requests in flight. Must be at least 1. |
@@ -321,7 +322,11 @@ token_env = "ARIODB_TOKEN_SUPPORT_BOT"
 credential = "reporting"
 ```
 
-<!-- TODO: document the agent.credential rule fact once merged. -->
+Rules can test which login an agent uses with `agent.credential`: the
+`credential` name, or `""` for an agent that runs as `[database]`. For
+example, a rule with `condition = "agent.credential == 'reporting' &&
+sql.kind == 'write'"` refuses writes from every agent on the reporting
+login, whatever their access level. See [rules](rules.md#agent-agent).
 
 ### `[agents.clickhouse]`
 
@@ -448,10 +453,9 @@ how to set up Slack and webhooks, is in [approvals](approvals.md).
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `name` | string | required | Unique; rules list it in `approve`. |
-| `type` | string | required | `dashboard`, `slack`, `webhook`, `llm` or `plugin`. |
-| `timeout_seconds` | integer | `[approvals] timeout_seconds` | How long to wait for this approver. Applies to `dashboard`, `slack`, `webhook` and `plugin`. A model approver (`llm`) is not bounded by it; see [model approvers](#llm-a-model). |
-
-<!-- TODO: document further approver channels once merged. -->
+| `type` | string | required | `dashboard`, `slack`, `webhook`, `discord`, `telegram`, `teams`, `google_chat`, `mattermost`, `pagerduty`, `opsgenie`, `email`, `llm` or `plugin`. |
+| `timeout_seconds` | integer | `[approvals] timeout_seconds` | How long to wait for this approver. Applies to every type except `llm`: a model approver is not bounded by it; see [model approvers](#llm-a-model). |
+| `groups` | list of strings | `[]` | With [single sign-on](#dashboardoidc), the groups whose members may decide this approver's requests in the dashboard and through its links; empty means anyone with the approver role. Not allowed on `slack`, `llm` and `plugin`. On `webhook` and the channel types it needs `[dashboard] approval_links = "sign_in"`. See [approvals](approvals.md#approver-groups). |
 
 ### `dashboard`
 
@@ -498,6 +502,59 @@ type = "webhook"
 url = "https://hooks.internal.example/ariodb"
 hmac_secret_secret = "webhook-hmac"
 ```
+
+### Chat, paging and email approvers
+
+`discord`, `telegram`, `teams`, `google_chat`, `mattermost`, `pagerduty`,
+`opsgenie` and `email` post the request with signed Approve and Deny links
+to the dashboard's confirmation page. How each one posts, what it shows and
+how its links are signed and revoked is in
+[approvals](approvals.md#chat-paging-and-email-channels).
+
+| Key | Types | Type | Default | What it does |
+|---|---|---|---|---|
+| `url_env` / `url_secret` | `discord`, `teams`, `google_chat`, `mattermost` | string | one required | The incoming webhook's URL. It holds the webhook's token, so `url` is refused for these types. Must be `https`, except for this machine. |
+| `channel` | `mattermost` | string | the webhook's own | Post to this channel instead. |
+| `bot_token_env` / `bot_token_secret` | `telegram` | string | one required | The bot's token, from BotFather. |
+| `chat_id` | `telegram` | integer or string | required | The chat to post to: a number such as `-1001234567890`, or `"@channelusername"` for a public channel. |
+| `routing_key_env` / `routing_key_secret` | `pagerduty` | string | one required | An Events API v2 integration (routing) key. |
+| `api_key_env` / `api_key_secret` | `opsgenie` | string | one required | An API integration key. |
+| `region` | `pagerduty`, `opsgenie` | string | `"us"` | `us` or `eu`, for accounts in the EU service region. |
+| `smtp_host` | `email` | string | required | The mail server. |
+| `smtp_tls` | `email` | string | `"starttls"` | `starttls`, `tls` (implicit TLS) or `none`. `none` is allowed only when `smtp_host` is this machine (`localhost`, a `.localhost` name or a loopback address). |
+| `smtp_port` | `email` | integer | `587`, `465` or `25` | Defaults to 587 for `starttls`, 465 for `tls` and 25 for `none`. |
+| `smtp_user` | `email` | string | none | The SMTP login. Set it together with a password, or neither. |
+| `smtp_password_env` / `smtp_password_secret` | `email` | string | none | The SMTP password. |
+| `from` | `email` | string | required | The sender, such as `"ariodb <ariodb@example.com>"`. |
+| `to` | `email` | list of strings | required | At least one recipient; each gets the same message. |
+
+```toml
+[[approvers]]
+name = "ops-teams"
+type = "teams"
+url_secret = "teams-webhook-url"
+
+[[approvers]]
+name = "on-call"
+type = "pagerduty"
+routing_key_secret = "pagerduty-routing-key"
+region = "eu"
+timeout_seconds = 600
+
+[[approvers]]
+name = "ops-email"
+type = "email"
+smtp_host = "smtp.example.com"
+smtp_user = "ariodb@example.com"
+smtp_password_secret = "smtp-password"
+from = "ariodb <ariodb@example.com>"
+to = ["dba-oncall@example.com"]
+```
+
+The links are signed with a key ariodb keeps in the secret store as
+`ariodb.approval-link-key`, made on first use. Deleting it
+(`ariodb secret delete ariodb.approval-link-key`) invalidates every link
+already sent.
 
 ### `llm` (a model)
 
@@ -581,17 +638,74 @@ See [the dashboard](dashboard.md).
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `listen` | string | `"127.0.0.1:8080"` | Where the dashboard listens. `""` switches it off, along with the Slack and webhook callbacks. It speaks plain HTTP; put TLS in front of it with a reverse proxy. |
-| `public_url` | string | `"http://127.0.0.1:8080"` | The address people, Slack and webhook receivers use to reach the dashboard. Used for links in Slack messages and webhook payloads. When it starts with `https://`, session cookies are marked `Secure`. |
+| `public_url` | string | `"http://127.0.0.1:8080"` | The address people, Slack and webhook receivers use to reach the dashboard. Used for links in Slack messages, webhook payloads and channel messages, and for the single sign-on redirect address. When it starts with `https://`, session cookies are marked `Secure`. |
 | `config_writes` | boolean | `false` | Let the dashboard save edits to the config file. Leave it off when the config is managed in Git; the config page then shows the edit to copy. When on, ariodb needs write access to the config file's directory (it writes `<file>.tmp` and keeps `<file>.bak`). |
+| `approval_links` | string | `"sign_in"` with `[dashboard.oidc]`, otherwise `"signed"` | What a signed approval link (webhook and channel approvers) needs before it decides: `signed`, the link alone, recorded as `webhook`; or `sign_in`, also a signed-in dashboard user who may decide the request, recorded by name. See [approvals](approvals.md#links-that-need-sign-in). |
 
 ```toml
 [dashboard]
 listen = "127.0.0.1:8080"
 public_url = "https://ariodb.internal.example"
 config_writes = false
+approval_links = "sign_in"
 ```
 
-<!-- TODO: document OIDC single sign-on and dashboard roles once merged. -->
+### `[dashboard.oidc]`
+
+Single sign-on with any OpenID Connect provider. People sign in with the
+provider and get a [role](dashboard.md#roles) from their groups. Provider
+set-up, with worked examples for Okta, Microsoft Entra ID, Google
+Workspace, Auth0 and Keycloak, is in
+[the dashboard](dashboard.md#single-sign-on).
+
+Unlike the rest of the file, **unknown keys in `[dashboard.oidc]` are
+refused**, so a misspelt `password_login` cannot leave passwords on
+unnoticed.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `issuer` | string | required | The provider's issuer URL. ariodb reads `<issuer>/.well-known/openid-configuration`, and the document's `issuer` must match it (a trailing `/` aside). Must be `https://`; `http://` only for `localhost`, a `127.` address or `[::1]`. |
+| `provider_name` | string | `"single sign-on"` | Shown on the button: "Sign in with <provider_name>". |
+| `client_id` | string | required | The client (application) ID registered with the provider. |
+| `client_secret_env` / `client_secret_secret` | string | none | The client secret, for a confidential client. Set at most one. Leave both out for a public client, which relies on PKCE alone. |
+| `redirect_path` | string | `"/auth/callback"` | Where the provider sends people back, under `public_url`. Register `<public_url><redirect_path>` with the provider. It must be a path of its own: not `/`, nothing under `/api/`, `/hooks/`, `/slack/` or `/assets/`, not `/auth/login` or one of the dashboard's pages, and no `?` or `#`. |
+| `scopes` | list of strings | `["openid", "profile", "email"]`, plus `"groups"` when any role groups are set | The scopes asked for. Must include `openid`. Set it without `groups` for a provider that has no `groups` scope. |
+| `groups_claim` | string | `"groups"` | The ID token claim that lists a person's groups: a list of strings, or one string. A dotted name reaches into objects, such as `realm_access.roles`, so the claim's own name cannot contain a dot. |
+| `admin_groups` | list of strings | `[]` | Groups whose members are admins. |
+| `approver_groups` | list of strings | `[]` | Groups whose members are approvers. |
+| `viewer_groups` | list of strings | `[]` | Groups whose members are viewers. At least one of the three lists must name a group. |
+| `allowed_email_domains` | list of strings | `[]` (any) | Only people whose **verified** email (`email_verified` true in the ID token) is in one of these domains, compared without regard to case. A provider that does not send `email_verified` cannot be limited this way. |
+| `password_login` | string | `"break_glass"` | Local passwords: `break_glass` keeps them working, offered below the sign-in button; `off` refuses them and ends existing password sessions. |
+| `logout_at_provider` | boolean | `false` | Signing out also sends the browser to the provider's `end_session_endpoint`, with `post_logout_redirect_uri` set to `<public_url>/`. |
+
+```toml
+[dashboard]
+listen = "127.0.0.1:8080"
+public_url = "https://ariodb.example.com"
+
+[dashboard.oidc]
+issuer = "https://login.example.com/realms/ops"
+provider_name = "Keycloak"
+client_id = "ariodb"
+client_secret_secret = "oidc-client-secret"
+admin_groups = ["ariodb-admins"]
+approver_groups = ["ariodb-approvers", "dba"]
+viewer_groups = ["engineering"]
+allowed_email_domains = ["example.com"]
+```
+
+Each person gets the highest role any of their groups maps to; someone in
+none of them is refused. The role is worked out again on every request from
+the groups the provider sent at sign-in and the config in force, so a
+change to the group lists, `allowed_email_domains` or `password_login`
+applies to people already signed in. A change to someone's groups at the
+provider applies when they next sign in.
+
+With single sign-on configured, the dashboard's first-run password page is
+switched off; set a break-glass password with `ariodb dashboard-password`.
+A `public_url` that is not `https://` (or this machine) loads with a
+warning, because session cookies would then be sent without `Secure`.
+
 
 ## `[audit]`
 
@@ -618,7 +732,7 @@ ariodb in front of ClickHouse's HTTP interface and its native protocol. See
 |---|---|---|---|
 | `http_listen` | string | `""` (off) | Where agents send ClickHouse HTTP requests. |
 | `http_url` | string | `"http://127.0.0.1:8123"` | The real ClickHouse HTTP interface. `https://` is supported. |
-| `native_listen` | string | `""` (off) | Where agents connect with the native protocol (`clickhouse-client`). Reads only. |
+| `native_listen` | string | `""` (off) | Where agents connect with the native protocol (`clickhouse-client`). Reads, and inserts whose rows ariodb counts before they reach ClickHouse. |
 | `native_addr` | string | `"127.0.0.1:9000"` | The real native port, as `host:port`. ariodb connects to it without TLS. |
 | `user` | string | `"default"` | The ClickHouse login ariodb uses for every agent. Agents never see it. |
 | `password_env` / `password_secret` | string | none (empty password) | Its password. If both are set, the secret wins. |
@@ -638,7 +752,14 @@ tls_cert = "/etc/ariodb/ch.crt"
 tls_key = "/etc/ariodb/ch.key"
 ```
 
-<!-- TODO: ClickHouse native INSERT is refused today; document it once merged. -->
+Inserts need `access = "read_write"` in `[agents.clickhouse]` and the
+table on its list. Over the native protocol, ariodb counts an insert's rows
+against the agent's `max_rows_per_write` (or `[limits]
+max_rows_per_write`) and holds them back until the last one has arrived, so
+an insert over the limit inserts nothing. It holds at most 64 MiB of an
+insert's data (256 MiB once decompressed); send larger loads in parts.
+HTTP inserts are not counted. See
+[ClickHouse inserts](clickhouse.md#inserts).
 
 ## `[mysql]`
 
@@ -779,6 +900,7 @@ env = { ARIODB_EXAMPLE_CUTOFF_HOUR = "18" }
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AZURE_OPENAI_API_KEY` | model approvers | The provider's key when an approver names neither `api_key_env` nor `api_key_secret`. |
 | `ARIODB_ANTHROPIC_API`, `ARIODB_OPENAI_API`, `ARIODB_GEMINI_API` | model approvers | Replace the provider's public API address when the approver sets no `base_url`. Meant for tests; prefer `base_url`. |
 | `ARIODB_SLACK_API` | Slack approvers | Replace `https://slack.com/api`. Meant for tests. |
+| `ARIODB_TELEGRAM_API`, `ARIODB_PAGERDUTY_API`, `ARIODB_OPSGENIE_API` | Telegram, PagerDuty and Opsgenie approvers | Replace `https://api.telegram.org`, the PagerDuty Events API and the Opsgenie API (for either region). Meant for tests. |
 | `USER` | `approve`, `deny`, `undo --apply` | Recorded as the decider, `cli:<user>`. |
 | `PATH`, `HOME` | plugins | Passed to every plugin. |
 | Any name in a `*_env` key | as configured | Agent tokens, credential URLs, approver secrets, ClickHouse and MySQL passwords, plugin `pass_env`. |
@@ -804,8 +926,15 @@ live in environment variables or the config file.
 - **Keys that take a secret name:** `[database] secret`, `[[credentials]]
   secret`, `[[agents]] token_secret`, `[clickhouse] password_secret`,
   `[mysql] password_secret` and `journal_password_secret`,
-  `bot_token_secret`, `signing_secret_secret`, `hmac_secret_secret` and
-  `api_key_secret` on approvers, and the values of a plugin's `secret_env`.
+  `[dashboard.oidc] client_secret_secret`, `bot_token_secret`,
+  `signing_secret_secret`, `hmac_secret_secret`, `url_secret`,
+  `routing_key_secret`, `smtp_password_secret` and `api_key_secret` on
+  approvers, and the values of a plugin's `secret_env`.
+- **ariodb's own entry:** `ariodb.approval-link-key`, the key that signs
+  the chat, paging and email approvers' links, made on first use. The
+  dashboard cannot set it (its secret names are letters, digits, `-` and
+  `_`); delete it with `ariodb secret delete` to invalidate every link
+  already sent. See [approvals](approvals.md#the-link-key).
 - **When values are read:** at the moment they are used (each new agent
   connection, each ClickHouse request, each approval), so `ariodb secret
   set` takes effect for the next use without a restart. Plugins read
@@ -852,7 +981,7 @@ flowchart LR
 | `[[credentials]]` and `[database]` URL, secret and TLS (new connections) | `[[tunnels]]` (any change) |
 | `[database] write_check` (new agent connections) | `[[plugins]]` (any change) |
 | `[proxy] require_tls` (new connections; the certificate must already be loaded) | `[journal]` (any key, including `dir`) |
-| `[dashboard] public_url`, `config_writes` | `[audit] redact_literals` for the decisions log |
+| `[dashboard] public_url`, `config_writes`, `approval_links`, and `[dashboard.oidc]` (next request; groups, domains and `password_login` apply to people already signed in) | `[audit] redact_literals` for the decisions log |
 | `[audit] retention_days` (next hourly prune) | Environment variables, including `*_env` tokens |
 | `[clickhouse] http_url`, `native_addr`, `user`, password, `accept_invalid_certificate` (next request) | `[mysql] listen`, `tls_cert`, `tls_key`, `journal`, `server_id`, `tag_table`, and the journal login |
 | `[mysql] addr`, `database`, `user`, password, `tls`, `ca_file`, `require_tls` (new agent connections) | |
@@ -922,6 +1051,31 @@ text follows `ariodb: kept the previous config:`.
 | `approver 'az' (azure_openai) needs model (the deployment name)` | Name the deployment; `openai_compatible` likewise `needs model`. |
 | `approver 'm': api_version only applies to azure_openai` | Remove it. Also: `api_version must be "v1" or "preview" (Azure's v1 API)`. |
 | `approver 'm': effort 'huge' is not one of low, medium, high, xhigh, max for anthropic` | Use a value the provider accepts. |
+| `approver 'd' (discord) needs url_secret or url_env (the incoming webhook's URL)` | Likewise for `teams`, `google_chat` and `mattermost`. |
+| `approver 'd' (discord): put the webhook URL in url_secret or url_env, not url: the URL itself is the credential` | Move the URL to the secret store or an environment variable. |
+| `approver 't' (telegram) needs bot_token_secret or bot_token_env` | Also: `needs chat_id`. |
+| `approver 'p' (pagerduty) needs routing_key_secret or routing_key_env (an Events API v2 integration key)` | Add the routing key. |
+| `approver 'o' (opsgenie) needs api_key_secret or api_key_env` | Add the API key. |
+| `approver 'p': region must be "us" or "eu"` | For `pagerduty` and `opsgenie`. |
+| `approver 'e' (email) needs smtp_host` | Also: `needs from`, `needs at least one address in to`, `needs both smtp_user and smtp_password_secret or smtp_password_env, or neither`. |
+| `approver 'e': 'ops at example' is not an email address: ...` | Write `from` and every `to` as `name@example.com` or `Name <name@example.com>`. |
+| `approver 'e': smtp_tls = "none" is only allowed for a mail server on this machine; use "starttls" or "tls"` | Also: `smtp_tls must be "starttls", "tls" or "none", not "..."`. |
+| `approver 's' (Slack) cannot set groups: only dashboard and webhook approvers are decided by signed-in people` | Remove `groups` from a `slack`, `llm` or `plugin` approver. |
+| `approver 'ops' sets groups, which need [dashboard.oidc]` | Configure single sign-on, or remove `groups`. |
+| `approver 'pager' sets groups, which its approval links can only check with [dashboard] approval_links = "sign_in"` | Use `sign_in` (the default with single sign-on), or remove `groups`. |
+
+### `[dashboard.oidc]`
+
+| Message | Fix |
+|---|---|
+| ``config is not valid TOML: ... unknown field `pasword_login` ...`` | A misspelt key: unknown keys are refused in this section. |
+| `dashboard.oidc.issuer must be an https:// URL (http:// only for localhost)` | Use the provider's `https://` issuer. |
+| `dashboard.oidc.client_id is empty` | Set the client ID. |
+| `dashboard.oidc: set client_secret_env or client_secret_secret, not both` | Keep one. |
+| `dashboard.oidc.redirect_path '/approvals' must be a path of its own, such as /auth/callback` | Pick a path that is not a dashboard page or under `/api/`, `/hooks/`, `/slack/` or `/assets/`. |
+| `dashboard.oidc maps no groups to a role, so nobody could sign in: set admin_groups, approver_groups or viewer_groups` | Map at least one group. |
+| `dashboard.oidc.groups_claim is empty` | Leave it out for the default, `groups`. |
+| `dashboard.oidc.scopes must include openid` | Add `openid`. |
 
 One warning does not stop the load: `ariodb: warning: approver 'y': effort
 is ignored, because openai_compatible servers have no standard reasoning

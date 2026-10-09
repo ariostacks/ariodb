@@ -79,13 +79,16 @@ Each file in [`src/`](../src) and its job.
 | [`classify.rs`](../src/classify.rs) | Postgres SQL through Postgres's own parser (`pg_query`): kind, tables, functions, and the statement's text, looking inside `EXPLAIN ANALYZE`, `PREPARE`, `DECLARE`, `COPY (...)` and `WITH`. When in doubt, `Unknown`. |
 | [`chsql.rs`](../src/chsql.rs) | ClickHouse SQL through a careful tokeniser: verb, tables, functions; refuses table functions that reach outside the server and more than one statement. |
 | [`policy.rs`](../src/policy.rs) | The built-in, default-deny policy: access level, statement kinds, blocked functions, `COPY FROM STDIN`, the table list, catalogue reads. |
-| [`rules.rs`](../src/rules.rs) | CEL rules: compiling, choosing the rules for an agent and stage, building the variables (`sql.*`, `agent.*`, `effects.*`, `plugin.*`) and combining matches. |
+| [`rules.rs`](../src/rules.rs) | CEL rules: compiling, choosing the rules for an agent and stage, building the variables (`sql.*`; `agent.name`, `agent.access` and `agent.credential`; `effects.*`; `plugin.*`) and combining matches. |
 | [`gate.rs`](../src/gate.rs) | The decision layer every front door calls: `check` before a statement runs, `judge_write` after a write runs and before it commits. Also owns `State` and config hot reload. |
-| [`approvals.rs`](../src/approvals.rs) | Holding a statement until its approvers agree: dashboard and CLI, Slack, webhooks, models and plugins. |
+| [`approvals.rs`](../src/approvals.rs) | Holding a statement until its approvers agree: dashboard and CLI, Slack, webhooks, the chat, paging and email channels, models and plugins. Signs and checks decision links, and keeps the channels' link key. |
+| [`channels.rs`](../src/channels.rs) | The Discord, Telegram, Teams, Google Chat, Mattermost, PagerDuty, Opsgenie and email approvers: each channel's message, escaped for its format, sending it (no redirects, errors without URLs), closing PagerDuty incidents and Opsgenie alerts once decided, and their config checks. |
 | [`llm.rs`](../src/llm.rs) | Model approvers: one interface over the Anthropic, OpenAI, Gemini, Azure OpenAI and OpenAI-compatible APIs. |
 | [`plugins.rs`](../src/plugins.rs) | Starting, supervising and talking to plugins over JSON-RPC on stdin and stdout. |
 
-<!-- TODO: the agent.credential rule fact, once merged. -->
+`agent.credential` is the agent's `credential` setting (or `""`), so a
+rule can single out every agent that shares a database login without
+naming them.
 
 **Postgres front door**
 
@@ -104,7 +107,8 @@ Each file in [`src/`](../src) and its job.
 | File | Job |
 |---|---|
 | [`clickhouse.rs`](../src/clickhouse.rs) | The HTTP interface: authenticate the agent, classify and judge the statement, forward it with ariodb's own login and forced settings, stream the answer back. |
-| [`clickhouse_native.rs`](../src/clickhouse_native.rs) | The native TCP protocol, for reads: terminate the handshake on both sides, judge each Query packet, relay replies byte for byte. |
+| [`clickhouse_native.rs`](../src/clickhouse_native.rs) | The native TCP protocol: terminate the handshake on both sides, judge each Query packet, hold an insert's data blocks back until they are counted, relay replies byte for byte. |
+| [`clickhouse_blocks.rs`](../src/clickhouse_blocks.rs) | Reading the data blocks a native client sends: LZ4 and ZSTD frames, block headers, and every column by its type, to count rows and find exactly where each block ends. Refuses what it cannot walk. |
 
 **Recording and undoing**
 
@@ -114,13 +118,14 @@ Each file in [`src/`](../src) and its job.
 | [`pgoutput.rs`](../src/pgoutput.rs) | Decoding Postgres's `pgoutput` logical replication messages (protocol version 1, with logical messages). |
 | [`undo.rs`](../src/undo.rs) | `ariodb sessions` and `ariodb undo`: summarise sessions, plan the inverse of one session's changes, detect conflicts, and apply in one transaction. |
 | [`audit.rs`](../src/audit.rs) | The decisions log: the hash chain, retention, redaction, queries for the dashboard, `ariodb audit`, fixture export and the cursor audit-sink plugins read from. |
-| [`store.rs`](../src/store.rs) | ariodb's SQLite database, `ariodb.db`: approvals, dashboard users and sessions (the decisions log lives in the same file). |
+| [`store.rs`](../src/store.rs) | ariodb's SQLite database, `ariodb.db`: approvals, dashboard users with their roles, and sessions (the decisions log lives in the same file). |
 
 **Dashboard**
 
 | File | Job |
 |---|---|
-| [`dashboard.rs`](../src/dashboard.rs) | The axum server: login, sessions, CSRF and origin checks, approvals, signed webhook links and Slack callbacks. |
+| [`dashboard.rs`](../src/dashboard.rs) | The axum server: login, sessions, roles, CSRF and origin checks, approvals and who may decide them, signed approval links and Slack callbacks. |
+| [`oidc.rs`](../src/oidc.rs) | Single sign-on with OpenID Connect: `[dashboard.oidc]` and its checks, discovery and signing keys (cached), the authorisation code flow with PKCE, ID token validation, and mapping groups to roles. |
 | [`dashboard_api.rs`](../src/dashboard_api.rs) | The rest of the JSON API: overview, decisions, fixtures, sessions and undo, rules and explain, config editing, block-like-this, secrets, users, decisions-log check, plugins. |
 | [`dashboard_files.rs`](../src/dashboard_files.rs) | Serves the React app from `dashboard/dist`, embedded in the binary with `rust-embed`. |
 
@@ -295,6 +300,7 @@ are started for approvers and facts; the audit sink is left to
 ClickHouse has no transactions, so ariodb cannot measure or roll back a
 ClickHouse write. Both paths judge each statement before it runs and rely
 on ClickHouse's own `readonly = 2` setting to stop hidden writes in reads.
+The native path also counts an insert's rows before ClickHouse sees any.
 
 **HTTP** ([`clickhouse.rs`](../src/clickhouse.rs)), on
 `[clickhouse] http_listen`:
@@ -313,15 +319,42 @@ on ClickHouse's own `readonly = 2` setting to stop hidden writes in reads.
    cannot be rolled back or undone.
 
 **Native protocol** ([`clickhouse_native.rs`](../src/clickhouse_native.rs)),
-on `[clickhouse] native_listen`, for reads: ariodb terminates the handshake
-on both sides (agent name and token in; ariodb's own login out), holds both
-to a protocol revision it fully understands, then parses each Query packet,
-judges it, and rebuilds it with `readonly = 2` and a time limit. After
-that, server replies are relayed byte for byte. Native `INSERT` and
-external tables are refused, because their data blocks would have to be
-decoded to be relayed safely.
+on `[clickhouse] native_listen`: ariodb terminates the handshake on both
+sides (agent name and token in; ariodb's own login out), holds both to a
+protocol revision it fully understands, then parses each Query packet and
+the empty data packet that follows it (anything else there is an external
+table, and refused), judges the statement, and rebuilds the packet with
+`max_execution_time` and, for reads, `readonly = 2`. Server replies are
+relayed byte for byte throughout.
 
-<!-- TODO: ClickHouse native INSERT, once merged (today it is refused). -->
+An `INSERT` takes more:
+
+1. [`chsql::insert_from_client`](../src/chsql.rs) accepts only
+   `INSERT INTO t [(columns)] VALUES` or `... FORMAT <name>` with nothing
+   after, so the rows must follow as data blocks. ClickHouse would run any
+   other form (`INSERT ... SELECT`, rows in the query text, a `SETTINGS`
+   clause) as soon as it arrived. Then the gate judges it as usual.
+2. The rebuilt Query asks ClickHouse for type names as text
+   (`input_format_native_decode_types_in_binary_format = 0`) and drops the
+   client's `input_format_native_*` settings, so ClickHouse reads the
+   blocks the way ariodb does.
+3. `relay_insert` reads each Data packet with
+   [`clickhouse_blocks::read_data`](../src/clickhouse_blocks.rs), which
+   decompresses LZ4 or ZSTD frames, reads the block header and walks every
+   column by its type to find exactly where the block ends, and counts its
+   rows. With compression on, a block must end where its frame ends, so
+   ariodb and ClickHouse cannot disagree about block boundaries. Unknown
+   types, custom serialisations and unknown compression methods are
+   refused rather than guessed at.
+4. The raw bytes are held, up to 64 MiB (256 MiB decompressed), until the
+   empty block that ends the insert. Within `max_rows_per_write`, they are
+   sent to ClickHouse in one go and the decision logged with the row
+   count. Past it, nothing is sent, the client gets an exception, the
+   upstream connection is dropped (abandoning the insert at ClickHouse) and
+   the connection closes; the decision is `rolled_back`.
+
+A cancel or a disconnect during an insert sends nothing and is logged as
+`failed`.
 
 See [ClickHouse](clickhouse.md) for configuration.
 
@@ -397,20 +430,45 @@ Listen addresses, tunnels and plugins are read only at startup.
 [`approvals::require`](../src/approvals.rs) asks each approver a rule
 names, in order, and all must allow:
 
-- **People** (`dashboard`, `slack`, `webhook`) share one mechanism: an
-  approval row in `ariodb.db` with status `pending`. Slack gets a message
-  (with buttons if interactive) and webhooks a signed POST. The waiting
-  task polls the row every 300 ms until it is `allowed`, `denied` or
-  expired, or until the agent goes away, in which case the request is
+- **People** (`dashboard`, `slack`, `webhook` and the channels) share one
+  mechanism: an approval row in `ariodb.db` with status `pending`. Slack
+  gets a message (with buttons if interactive), webhooks a signed POST,
+  and the channels a message from [`channels.rs`](../src/channels.rs). The
+  waiting task polls the row every 300 ms until it is `allowed`, `denied`
+  or expired, or until the agent goes away, in which case the request is
   withdrawn. Because the row is in SQLite, a decision made in the
-  dashboard, with `ariodb approve`, through a signed webhook link or a Slack
-  button reaches a statement waiting in any ariodb process.
+  dashboard, with `ariodb approve`, through a signed link or a Slack
+  button reaches a statement waiting in any ariodb process. If the
+  message cannot be sent, the row is denied by `ariodb` at once.
 - **Models** (`llm`) go through [`llm.rs`](../src/llm.rs), with a cache of
   answers keyed on approver, model, policy, agent, database, rule and SQL,
   and `llm_fail_mode` deciding what happens when the provider is down.
 - **Plugins** go through [`plugins::ask`](../src/plugins.rs).
 
-<!-- TODO: further approver channels, once merged. -->
+**Decision links.** Webhook and channel approvers send
+`<public_url>/hooks/approvals/<id>?verdict=allow|deny&token=<HMAC>`, where
+the token is HMAC-SHA256 of `<id>:<verdict>`. Webhooks sign with their own
+`hmac_secret`; the channels with `ariodb.approval-link-key`, which
+`approvals::link_key` creates in the secret store on first use (under a
+lock, so concurrent requests share one key). `approvals::verify_link`
+looks up the approval row, finds the approver it names in the current
+config (only one that sends links), picks that approver's key, and
+compares in constant time; it never creates the key, so a missing key
+means no link is valid. The dashboard serves the GET (a confirmation page)
+and the POST (the decision); with `approval_links = "sign_in"` both also
+need a session whose user may decide, and the POST needs the session's
+CSRF token in its form.
+
+**Channels** ([`channels.rs`](../src/channels.rs)) build each message with
+a pure function per channel, so the tests check exactly what Discord,
+Telegram, Teams, Google Chat, Mattermost, PagerDuty, Opsgenie and email
+would be sent: the SQL escaped for that format, shortened with a note
+before it, and characters that reorder or hide text written out. HTTP
+posts have a 30-second limit, follow no redirects and leave the URL out of
+errors (several channels carry their credential in it); email goes
+through `lettre` over STARTTLS, implicit TLS or, on this machine only,
+plain SMTP. For PagerDuty and Opsgenie, once the wait ends a background
+task resolves the incident or closes the alert, keyed on the approval ID.
 
 Notifier plugins hear `approval_requested` and `approval_decided` events
 for every approval. See [approvals](approvals.md).
@@ -517,8 +575,8 @@ five-second busy timeout, so several processes can share it. Its tables:
 | Table | Holds | Written by |
 |---|---|---|
 | `approvals` | Every approval request and its outcome | `approvals.rs`, the dashboard, `ariodb approve` and `deny` |
-| `dashboard_users` | User names and Argon2 password hashes | `ariodb dashboard-password`, the dashboard |
-| `dashboard_sessions` | SHA-256 hashes of session tokens, with CSRF tokens and expiry | The dashboard |
+| `dashboard_users` | Local user names, Argon2 password hashes and roles | `ariodb dashboard-password`, the dashboard |
+| `dashboard_sessions` | SHA-256 hashes of session tokens, with CSRF tokens, expiry, and how the person signed in (`password` or `sso`); for single sign-on, the provider's subject, the verified email and the groups | The dashboard |
 | `decisions` | The decisions log (see above) | `audit.rs` |
 | `plugin_cursors` | How far each audit-sink plugin has read | `plugins.rs` |
 
@@ -534,16 +592,32 @@ The back end is axum, in the same process as the proxy:
   `HttpOnly`, `SameSite=Strict` cookie (stored only as hashes), a CSRF token
   required in `x-ariodb-csrf` on every change, an `Origin` check, and login
   rate limits per address and per user. It also serves the approval
-  endpoints, the signed webhook links (`/hooks/approvals/{id}`: GET shows
+  endpoints, the signed approval links (`/hooks/approvals/{id}`: GET shows
   the request, only POST decides) and Slack's interactivity callback
   (`/slack/actions`).
+- Every request works out who is signed in and their role afresh
+  (`dashboard::session`): a local user's role from `dashboard_users`
+  (`root` is always an admin), a single sign-on user's from the groups
+  stored with the session and the `[dashboard.oidc]` in force, after the
+  email domain check. Handlers call `require_role` for reads and
+  `require_change` (role, CSRF token, same origin) for changes; viewer,
+  approver and admin are ordered, so each role passes every check the one
+  below it does. `may_decide` adds the approver's `groups` for deciding.
+- [`oidc.rs`](../src/oidc.rs) handles single sign-on. `/auth/login`
+  stores a pending sign-in (state, nonce, PKCE verifier, where to return)
+  in memory for ten minutes, bound to the browser by a hashed `ariodb_sso`
+  cookie, and redirects to the provider. The callback, at the configured
+  `redirect_path` (matched in the router's fallback), takes the pending
+  sign-in out (so it works once), checks the cookie, trades the code at the
+  token endpoint, and validates the ID token against the provider's keys.
+  The discovery document and key set are cached for an hour; an unknown
+  key ID refetches the keys, at most every ten seconds. The HTTP client
+  follows no redirects.
 - [`dashboard_api.rs`](../src/dashboard_api.rs) serves the rest of
   `/api/*`.
 - [`dashboard_files.rs`](../src/dashboard_files.rs) serves the front end
   from files embedded at build time, falling back to `index.html` for any
   other path so the app's router can take over.
-
-<!-- TODO: OIDC single sign-on and dashboard roles, once merged. -->
 
 The front end is a React app in [`dashboard/`](../dashboard) (Vite,
 TypeScript, Tailwind CSS and shadcn/ui), with one file per page in
@@ -626,6 +700,7 @@ MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql.sh           # the same against Mar
 ./scripts/e2e-mysql-journal.sh         # MySQL setup, doctor, the binlog journal and undo
 MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql-journal.sh
 ./scripts/e2e-plugins.sh               # the example plugin, and a broken one
+./scripts/e2e-sso.sh                   # single sign-on against Keycloak, roles, approver groups, links that need sign-in
 ./scripts/sim-undo.sh                  # seeded random agent and human writes, then undo
 SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh
 ```
@@ -642,8 +717,8 @@ Helpers used by the scripts:
   with parameters, `mysql_native_password` logins, `COM_RESET_CONNECTION`,
   and a query cancelled with `KILL QUERY` from a second connection.
 - [`scripts/mock_services.py`](../scripts/mock_services.py): local stand-ins
-  for Slack, a webhook receiver and the model providers' APIs, which check
-  what ariodb sends.
+  for Slack, a webhook receiver, the chat and paging services, an SMTP
+  server and the model providers' APIs, which check what ariodb sends.
 - [`scripts/conn_limits.py`](../scripts/conn_limits.py): connection limits
   from the client side: a client that never finishes its startup, an agent
   over its own limit, a burst over a full listener, for Postgres, MySQL and

@@ -133,7 +133,9 @@ Each hop is configured separately.
 | ariodb to Postgres | `[database] tls = "verify"` (default for non-local hosts) | Checked against public CA roots plus `ca_file`. See the `ca_file` limitation below. |
 | ariodb to ClickHouse HTTP | `http_url = "https://..."` | For a private CA, `accept_invalid_certificate = true` (no CA-file option). |
 | ariodb to ClickHouse native | Not supported directly | ariodb connects to `native_addr` in plain TCP. Keep that hop on a private network, or carry it through a tunnel (an SSH forward, for example). |
-| ariodb to Slack, webhooks, model providers | `https://` URLs | Model approvers refuse plain `http` except to this machine. |
+| ariodb to Slack, webhooks, chat and paging services, model providers | `https://` URLs | Model approvers and the Discord, Teams, Google Chat and Mattermost webhooks refuse plain `http` except to this machine. |
+| ariodb to a mail server (email approvers) | `smtp_tls = "starttls"` (default) or `"tls"` | `"none"` is refused except for a mail server on this machine. |
+| ariodb to an OpenID Connect provider | An `https://` issuer | Refused otherwise, except on this machine; the discovery document's endpoints are held to the same rule. |
 
 Postgres agent connection with certificate checks:
 
@@ -383,8 +385,9 @@ reconnects.
 
 ### Other secrets
 
-The ClickHouse password, Slack and webhook secrets and model API keys are
-read when used, so `ariodb secret set` takes effect at once. Plugins read
+The ClickHouse password, approver credentials (Slack, webhook and channel
+secrets and webhook URLs), the single sign-on client secret and model API
+keys are read when used, so `ariodb secret set` takes effect at once. Plugins read
 `secret_env` when they start; restart `serve` to give them new values.
 
 There is no command to re-encrypt the store under a new master key, and no

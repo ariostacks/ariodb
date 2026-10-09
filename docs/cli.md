@@ -512,18 +512,28 @@ model](security-model.md).
 
 ## Dashboard and secrets
 
-### `ariodb dashboard-password [--user <USER>]`
+### `ariodb dashboard-password [--user <USER>] [--role <ROLE>]`
 
 Set a dashboard password, read from stdin (at least 12 characters). The
 default user is `root`; any other name creates or updates that user.
 Setting a password ends that user's existing sessions.
 
+`--role` is `viewer`, `approver` or `admin` (see
+[roles](dashboard.md#roles)). A new user is an admin unless `--role` says
+otherwise; an existing user keeps their role unless `--role` is given.
+`root` is always an admin. With single sign-on configured, this is how to
+set a break-glass password.
+
 ```bash
 printf '%s\n' 'not-a-real-password-123' | ariodb dashboard-password
 # password set for 'root'
+printf '%s\n' 'not-a-real-password-456' | ariodb dashboard-password --user sam --role approver
+# password set for 'sam'
 ```
 
-Too short: `error: use a password of at least 12 characters`.
+Too short: `error: use a password of at least 12 characters`. A bad role:
+`error: --role must be viewer, approver or admin, not 'owner'`. Making
+`root` anything else: `error: root is always an admin`.
 
 ### `ariodb secret set <NAME>`, `secret list`, `secret delete <NAME>`
 
@@ -542,6 +552,11 @@ error: no secret named 'old-token'
 ```
 
 An empty stdin exits 1 with `error: no value on stdin`.
+
+`ariodb.approval-link-key` is ariodb's own entry, which signs the chat,
+paging and email approvers' links. Deleting it revokes every link already
+sent; ariodb makes a new one for the next request. See
+[approvals](approvals.md#the-link-key).
 
 ## Plugins
 
