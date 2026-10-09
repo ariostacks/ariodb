@@ -34,6 +34,9 @@ pub struct Fixture {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Action {
     pub agent: String,
+    /// `postgres` (the default) or `clickhouse`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     pub sql: SqlAction,
 }
 
@@ -66,24 +69,38 @@ pub fn preview(
     agent_name: &str,
     sql: &str,
     database: &str,
+    engine: &str,
 ) -> Preview {
-    let Some(agent) = config.agent(agent_name) else {
-        return Preview {
-            verdict: "deny",
-            rule: "policy".into(),
-            reason: format!("unknown agent '{agent_name}'"),
-        };
+    let deny = |reason: String| Preview {
+        verdict: "deny",
+        rule: "policy".into(),
+        reason,
     };
-    let statements = match classify::classify(sql) {
-        Ok(s) => s,
-        Err(e) => {
-            return Preview {
-                verdict: "deny",
-                rule: "policy".into(),
-                reason: e.to_string(),
-            };
+    let Some(agent) = config.agent(agent_name) else {
+        return deny(format!("unknown agent '{agent_name}'"));
+    };
+    // ClickHouse statements are judged against the agent's ClickHouse access.
+    let (agent, statements) = if engine == "clickhouse" {
+        let Some(ch) = &agent.clickhouse else {
+            return deny("this agent has no ClickHouse access".into());
+        };
+        let mut view = agent.clone();
+        view.access = ch.access;
+        view.tables = ch.tables.clone();
+        match crate::chsql::classify(sql) {
+            Ok(mut s) => {
+                crate::chsql::scope_to_database(&mut s, database);
+                (view, vec![s])
+            }
+            Err(e) => return deny(e),
+        }
+    } else {
+        match classify::classify(sql) {
+            Ok(s) => (agent.clone(), s),
+            Err(e) => return deny(e.to_string()),
         }
     };
+    let agent = &agent;
     let mut approve: Option<(String, String)> = None;
     let mut allow_rule = String::new();
     for stmt in &statements {
@@ -129,6 +146,51 @@ pub fn preview(
             reason: String::new(),
         },
     }
+}
+
+/// The database name statements run in when none is given.
+pub fn default_database(config: &Config, engine: &str) -> String {
+    if engine == "clickhouse" {
+        return "default".to_string();
+    }
+    crate::upstream::Target::from_url(&config.database_url(), config.database.tls, None)
+        .map(|t| t.database)
+        .unwrap_or_default()
+}
+
+/// A recorded decision as a fixture, or `None` when it depended on data
+/// rather than policy (rollbacks and failures). A decision a rule sent for
+/// approval is expected to need approval again, whatever the approver said.
+pub fn fixture_for(d: &crate::audit::Decision, config: &Config) -> Option<serde_json::Value> {
+    let approval_rule = d
+        .rule
+        .as_ref()
+        .and_then(|r| config.rules.iter().find(|x| &x.name == r))
+        .is_some_and(|x| x.verdict == crate::rules::Verdict::Approve);
+    let verdict = match d.outcome.as_str() {
+        "allowed" | "refused" if approval_rule => "approve",
+        "allowed" => "allow",
+        "refused" => "deny",
+        _ => return None,
+    };
+    let mut expect = serde_json::json!({ "verdict": verdict });
+    if let Some(rule) = &d.rule {
+        expect["rule"] = serde_json::json!(rule);
+    } else if verdict == "deny" {
+        expect["rule"] = serde_json::json!("policy");
+    }
+    let mut action = serde_json::json!({ "agent": d.agent, "sql": { "statement": d.sql } });
+    if !d.database.is_empty() {
+        action["sql"]["database"] = serde_json::json!(d.database);
+    }
+    if d.engine != "postgres" {
+        action["engine"] = serde_json::json!(d.engine);
+    }
+    Some(serde_json::json!({
+        "name": format!("decision {} ({})", d.id, d.agent),
+        "action": action,
+        "match": expect,
+    }))
 }
 
 pub fn load_fixtures(path: &Path) -> Result<Vec<(String, Fixture)>, String> {
@@ -180,18 +242,20 @@ pub fn run(config: &Config, fixtures: &[(String, Fixture)]) -> Result<(usize, us
             .unwrap_or_default();
     let (mut passed, mut drifted) = (0, 0);
     for (label, f) in fixtures {
-        let database = f
-            .action
-            .sql
-            .database
-            .clone()
-            .unwrap_or_else(|| default_db.clone());
+        let engine = f.action.engine.as_deref().unwrap_or("postgres");
+        let fallback = if engine == "clickhouse" {
+            "default".to_string()
+        } else {
+            default_db.clone()
+        };
+        let database = f.action.sql.database.clone().unwrap_or(fallback);
         let got = preview(
             config,
             &rules,
             &f.action.agent,
             &f.action.sql.statement,
             &database,
+            engine,
         );
         let verdict_ok = got.verdict == f.expect.verdict;
         let rule_ok = f.expect.rule.as_ref().is_none_or(|r| *r == got.rule);
@@ -247,15 +311,39 @@ mod tests {
         let config = Config::from_toml(CONFIG).unwrap();
         let rules = RuleSet::compile(&config.rules).unwrap();
         assert_eq!(
-            preview(&config, &rules, "bot", "SELECT * FROM users", "app").rule,
+            preview(
+                &config,
+                &rules,
+                "bot",
+                "SELECT * FROM users",
+                "app",
+                "postgres"
+            )
+            .rule,
             "pii"
         );
         assert_eq!(
-            preview(&config, &rules, "bot", "DROP TABLE orders", "app").rule,
+            preview(
+                &config,
+                &rules,
+                "bot",
+                "DROP TABLE orders",
+                "app",
+                "postgres"
+            )
+            .rule,
             "policy"
         );
         assert_eq!(
-            preview(&config, &rules, "bot", "SELECT * FROM orders", "app").verdict,
+            preview(
+                &config,
+                &rules,
+                "bot",
+                "SELECT * FROM orders",
+                "app",
+                "postgres"
+            )
+            .verdict,
             "allow"
         );
     }
@@ -268,5 +356,49 @@ mod tests {
             ("drift".to_string(), serde_json::from_str::<Fixture>(r#"{"action":{"agent":"bot","sql":{"statement":"SELECT 1 FROM orders"}},"match":{"verdict":"deny"}}"#).unwrap()),
         ];
         assert_eq!(run(&config, &fixtures).unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn approvals_and_clickhouse_round_trip_as_fixtures() {
+        let text = CONFIG.replace(
+            "[[rules]]",
+            "[[approvers]]\nname = \"ops\"\ntype = \"dashboard\"\n\n[[rules]]\nname = \"ask\"\ncondition = \"'orders' in sql.tables\"\nverdict = \"approve\"\napprove = [\"ops\"]\n\n[[rules]]",
+        ) + "\n[agents.clickhouse]\naccess = \"read_only\"\ntables = [\"events\"]\n";
+        let config = Config::from_toml(&text).unwrap();
+        let decision =
+            |sql: &str, outcome: &str, rule: Option<&str>, engine: &str| crate::audit::Decision {
+                id: 1,
+                at_ms: 0,
+                session: "s".into(),
+                agent: "bot".into(),
+                sql: sql.into(),
+                kind: "read".into(),
+                tables: vec![],
+                outcome: outcome.into(),
+                rows: None,
+                reason: None,
+                rule: rule.map(str::to_string),
+                latency_ms: None,
+                engine: engine.into(),
+                database: String::new(),
+            };
+        let cases = [
+            decision("SELECT * FROM orders", "allowed", Some("ask"), "postgres"),
+            decision("SELECT * FROM orders", "refused", Some("ask"), "postgres"),
+            decision("SELECT count() FROM events", "allowed", None, "clickhouse"),
+            decision("SELECT * FROM secrets", "refused", None, "clickhouse"),
+        ];
+        let fixtures: Vec<(String, Fixture)> = cases
+            .iter()
+            .map(|d| {
+                (
+                    "x".to_string(),
+                    serde_json::from_value(fixture_for(d, &config).unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(fixtures[0].1.expect.verdict, "approve");
+        assert_eq!(fixtures[1].1.expect.verdict, "approve");
+        assert_eq!(run(&config, &fixtures).unwrap(), (4, 0));
     }
 }

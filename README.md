@@ -394,9 +394,10 @@ that read tables named in strings (`merge`, `dictionary`, `cluster`,
 
 ### `on_failure`
 
-A top-level `on_failure = "closed" | "open"` is accepted and shown by
-`ariodb check`, but nothing reads it yet: ariodb always refuses a statement
-it cannot check.
+ariodb always refuses a statement it cannot check. A top-level
+`on_failure = "closed"` is accepted for clarity; `"open"` is refused when the
+config loads, because letting statements through unchecked would defeat the
+point.
 
 ## Command line
 
@@ -527,7 +528,6 @@ and `E2E_NAME` keep parallel runs of the scripts apart.
 - **No agent-controlled transactions.** ariodb runs each query string (or
   extended-protocol batch up to `Sync`) in its own transaction; `BEGIN`,
   `COMMIT` and savepoints from agents are refused.
-- **`on_failure = "open"` does nothing yet**; ariodb always fails closed.
 - **`ariodb explain` and `ariodb test`** judge before-stage rules only; they
   cannot predict after-stage rules or the effect check, which need the write
   to run.

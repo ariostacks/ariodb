@@ -283,6 +283,8 @@ impl Session {
             reason,
             rule,
             latency_ms: Some(started.elapsed().as_millis() as u64),
+            engine: "postgres",
+            database: &self.database,
         });
     }
 }

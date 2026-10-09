@@ -28,7 +28,7 @@ mod upstream;
 mod wire;
 
 use clap::{Parser, Subcommand};
-use config::{Access, Config, FailureMode};
+use config::{Access, Config};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -125,6 +125,9 @@ enum Command {
         /// The agent name from the config file
         #[arg(long)]
         agent: String,
+        /// postgres or clickhouse
+        #[arg(long, default_value = "postgres")]
+        engine: String,
         /// The SQL to judge
         sql: String,
     },
@@ -209,7 +212,7 @@ async fn main() -> ExitCode {
         Command::Secret { action } => secret_command(&config, action),
         Command::Approvals { all } => approvals_command(&config, all),
         Command::ExportFixtures { out, limit } => {
-            audit::export_fixtures(Path::new(&config.journal.dir), &out, limit).map(|n| {
+            audit::export_fixtures(Path::new(&config.journal.dir), &out, limit, &config).map(|n| {
                 println!(
                     "wrote {n} fixtures to {}",
                     out.join("recorded.json").display()
@@ -228,15 +231,18 @@ async fn main() -> ExitCode {
                 println!("password set for '{user}'");
                 Ok(())
             }),
-        Command::Explain { agent, sql } => rules::RuleSet::compile(&config.rules).map(|rules| {
-            let p = testing::preview(&config, &rules, &agent, &sql, "");
-            let rule = if p.rule.is_empty() {
-                "-".to_string()
-            } else {
-                p.rule.clone()
-            };
-            println!("{}  (decided by: {rule})  {}", p.verdict, p.reason);
-        }),
+        Command::Explain { agent, engine, sql } => {
+            rules::RuleSet::compile(&config.rules).map(|rules| {
+                let database = testing::default_database(&config, &engine);
+                let p = testing::preview(&config, &rules, &agent, &sql, &database, &engine);
+                let rule = if p.rule.is_empty() {
+                    "-".to_string()
+                } else {
+                    p.rule.clone()
+                };
+                println!("{}  (decided by: {rule})  {}", p.verdict, p.reason);
+            })
+        }
         Command::Audit => audit::verify(Path::new(&config.journal.dir))
             .map(|n| println!("decisions log intact: {n} entries checked")),
     };
@@ -513,10 +519,7 @@ async fn undo_command(
 }
 
 fn print_summary(config: &Config) {
-    let on_failure = match config.on_failure {
-        FailureMode::Closed => "refuse queries (fail closed)",
-        FailureMode::Open => "let queries through (fail open)",
-    };
+    let on_failure = "refuse the statement (fail closed)";
 
     let via = |tunnel: &Option<String>| {
         tunnel

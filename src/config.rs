@@ -206,14 +206,15 @@ impl Default for Limits {
     }
 }
 
-/// What ariodb does when its own checks cannot run.
+/// What ariodb does when its own checks cannot run. Only `closed` is
+/// accepted: letting statements through unchecked would defeat ariodb.
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureMode {
-    /// Refuse the query. The safe choice, and the default.
+    /// Refuse the statement. The only mode.
     #[default]
     Closed,
-    /// Let the query through unchecked.
+    /// Rejected when the config loads.
     Open,
 }
 
@@ -298,6 +299,11 @@ impl Config {
 
     /// Rules that TOML alone cannot express.
     fn check(&self) -> Result<(), ConfigError> {
+        if self.on_failure == FailureMode::Open {
+            return Err(ConfigError::Problem(
+                "on_failure = \"open\" is not supported: ariodb always refuses a statement it cannot check. Remove the line or set it to \"closed\"".to_string(),
+            ));
+        }
         let url = &self.database.url;
         if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
             return Err(ConfigError::Problem(
@@ -555,6 +561,11 @@ mod tests {
         let config = Config::from_toml(GOOD).expect("config should load");
         assert_eq!(config.limits.max_rows_per_write, 500);
         assert_eq!(config.on_failure, FailureMode::Closed);
+        let open = format!("on_failure = \"open\"\n{GOOD}");
+        assert!(matches!(
+            Config::from_toml(&open),
+            Err(ConfigError::Problem(_))
+        ));
         assert_eq!(config.agents[0].access, Access::ReadWrite);
     }
 

@@ -414,17 +414,22 @@ where
                     chsql::scope_to_database(&mut s, database);
                     s
                 });
+                // "unsupported" marks what this transport cannot carry, as
+                // opposed to what the policy refuses, so recorded decisions
+                // replay cleanly with `ariodb test`.
                 let decision = match (&stmt, &data) {
-                    (_, Err(e)) => Err((None, e.clone())),
-                    (Err(e), _) => Err((None, e.clone())),
-                    (Ok(s), _) if s.kind == Kind::Write => {
-                        Err((None, "native-protocol INSERTs are not supported; use ariodb's ClickHouse HTTP interface".to_string()))
-                    }
+                    (_, Err(e)) => Err((None, e.clone(), "unsupported")),
+                    (Err(e), _) => Err((None, e.clone(), "refused")),
+                    (Ok(s), _) if s.kind == Kind::Write => Err((
+                        None,
+                        "native-protocol INSERTs are not supported; use ariodb's ClickHouse HTTP interface".to_string(),
+                        "unsupported",
+                    )),
                     (Ok(s), _) => {
                         let ctx = Ctx { agent, session, database };
                         gate::check_detailed(state, &ctx, std::slice::from_ref(s))
                             .await
-                            .map_err(|r| (r.rule.clone(), r.message))
+                            .map_err(|r| (r.rule.clone(), r.message, "refused"))
                     }
                 };
                 let kind = stmt
@@ -444,11 +449,13 @@ where
                         reason,
                         rule,
                         latency_ms: Some(started.elapsed().as_millis() as u64),
+                        engine: "clickhouse",
+                        database,
                     });
                 };
                 match decision {
-                    Err((rule, message)) => {
-                        record("refused", Some(&message), rule.as_deref());
+                    Err((rule, message, outcome)) => {
+                        record(outcome, Some(&message), rule.as_deref());
                         send(exception_packet(497, &message)).await?;
                     }
                     Ok((_, approved)) => {

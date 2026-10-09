@@ -47,6 +47,10 @@ pub struct Entry<'a> {
     pub reason: Option<&'a str>,
     pub rule: Option<&'a str>,
     pub latency_ms: Option<u64>,
+    /// `postgres` or `clickhouse`.
+    pub engine: &'a str,
+    /// The database the statement ran in.
+    pub database: &'a str,
 }
 
 /// A stored entry, as the dashboard and fixture export read it.
@@ -64,6 +68,8 @@ pub struct Decision {
     pub reason: Option<String>,
     pub rule: Option<String>,
     pub latency_ms: Option<i64>,
+    pub engine: String,
+    pub database: String,
 }
 
 pub struct AuditLog {
@@ -99,12 +105,17 @@ fn open_conn(dir: &Path) -> Result<Connection, String> {
     conn.execute_batch("PRAGMA journal_mode = WAL;")
         .map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    // Logs written before engines were recorded are all Postgres.
+    let _ = conn
+        .execute_batch("ALTER TABLE decisions ADD COLUMN engine TEXT NOT NULL DEFAULT 'postgres'");
+    let _ =
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN database TEXT NOT NULL DEFAULT ''");
     Ok(conn)
 }
 
 /// The text that is hashed for one entry.
 fn chain_text(at_ms: i64, prev: &str, d: &Decision) -> String {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "at_ms": at_ms,
         "prev": prev,
         "session": d.session,
@@ -117,8 +128,14 @@ fn chain_text(at_ms: i64, prev: &str, d: &Decision) -> String {
         "reason": d.reason,
         "rule": d.rule,
         "latency_ms": d.latency_ms,
-    })
-    .to_string()
+    });
+    if d.engine != "postgres" {
+        value["engine"] = serde_json::json!(d.engine);
+    }
+    if !d.database.is_empty() {
+        value["database"] = serde_json::json!(d.database);
+    }
+    value.to_string()
 }
 
 impl AuditLog {
@@ -154,6 +171,8 @@ impl AuditLog {
             reason: entry.reason.map(str::to_string),
             rule: entry.rule.map(str::to_string),
             latency_ms: entry.latency_ms.map(|l| l as i64),
+            engine: entry.engine.to_string(),
+            database: entry.database.to_string(),
         };
         let mut conn = self.conn.lock().expect("audit lock");
         let tx = conn
@@ -170,8 +189,8 @@ impl AuditLog {
             .unwrap_or_default();
         let hash = hex::encode(Sha256::digest(chain_text(d.at_ms, &prev, &d).as_bytes()));
         tx.execute(
-            "INSERT INTO decisions (at_ms, session, agent, sql, kind, tables, outcome, rows, reason, rule, latency_ms, prev, hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO decisions (at_ms, session, agent, sql, kind, tables, outcome, rows, reason, rule, latency_ms, prev, hash, engine, database)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 d.at_ms,
                 d.session,
@@ -185,7 +204,9 @@ impl AuditLog {
                 d.rule,
                 d.latency_ms,
                 prev,
-                hash
+                hash,
+                d.engine,
+                d.database
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -208,6 +229,8 @@ fn row_to_decision(r: &rusqlite::Row) -> rusqlite::Result<Decision> {
         reason: r.get("reason")?,
         rule: r.get("rule")?,
         latency_ms: r.get("latency_ms")?,
+        engine: r.get("engine")?,
+        database: r.get("database")?,
     })
 }
 
@@ -339,7 +362,12 @@ pub fn prune(dir: &Path, settings: &Settings) -> Result<usize, String> {
 
 /// Write recorded decisions as `ariodb test` fixtures, so today's verdicts
 /// become regression tests for tomorrow's policy.
-pub fn export_fixtures(dir: &Path, out: &Path, limit: i64) -> Result<usize, String> {
+pub fn export_fixtures(
+    dir: &Path,
+    out: &Path,
+    limit: i64,
+    config: &crate::config::Config,
+) -> Result<usize, String> {
     let decisions = query(
         dir,
         &Filter {
@@ -347,25 +375,10 @@ pub fn export_fixtures(dir: &Path, out: &Path, limit: i64) -> Result<usize, Stri
             ..Default::default()
         },
     )?;
-    let mut fixtures = Vec::new();
-    for d in decisions {
-        let verdict = match d.outcome.as_str() {
-            "allowed" => "allow",
-            "refused" => "deny",
-            _ => continue, // rollbacks and failures depend on data, not policy
-        };
-        let mut expect = serde_json::json!({ "verdict": verdict });
-        if let Some(rule) = &d.rule {
-            expect["rule"] = serde_json::json!(rule);
-        } else if verdict == "deny" {
-            expect["rule"] = serde_json::json!("policy");
-        }
-        fixtures.push(serde_json::json!({
-            "name": format!("decision {} ({})", d.id, d.agent),
-            "action": { "agent": d.agent, "sql": { "statement": d.sql } },
-            "match": expect,
-        }));
-    }
+    let fixtures: Vec<serde_json::Value> = decisions
+        .iter()
+        .filter_map(|d| crate::testing::fixture_for(d, config))
+        .collect();
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let path = out.join("recorded.json");
     let text = serde_json::to_string_pretty(&fixtures).map_err(|e| e.to_string())?;
@@ -396,6 +409,8 @@ mod tests {
             reason: None,
             rule: None,
             latency_ms: Some(2),
+            engine: "postgres",
+            database: "app",
         }
     }
 

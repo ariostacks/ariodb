@@ -173,6 +173,8 @@ async fn query(
             reason,
             rule,
             latency_ms: Some(started.elapsed().as_millis() as u64),
+            engine: "clickhouse",
+            database: &database,
         });
     };
 

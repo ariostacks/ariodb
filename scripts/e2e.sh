@@ -391,6 +391,25 @@ expect "model request: default model with fallback" '"anthropic-beta": "server-s
 expect "model request: structured output" '"format": "json_schema"' "$LAST"
 expect "model decisions are recorded" "model:claude-opus-5-5" "$($BIN "${CFG[@]}" approvals --all)"
 
+echo "recorded decisions as tests"
+$BIN "${CFG[@]}" export-fixtures --out "$WORK/recorded" >/dev/null
+# Decisions made under the rule added and removed in the hot-reload test
+# drift on purpose; that is what this command is for. Check the rest replay.
+python3 - "$WORK/recorded/recorded.json" "$WORK/replay" <<'PY'
+import json, os, sys
+items = json.load(open(sys.argv[1]))
+os.makedirs(sys.argv[2], exist_ok=True)
+keep = [f for f in items if f["match"].get("rule") != "hot-added"]
+gone = [f for f in items if f["match"].get("rule") == "hot-added"]
+json.dump(keep, open(os.path.join(sys.argv[2], "keep.json"), "w"))
+json.dump(gone, open(os.path.join(sys.argv[2], "gone.json.txt"), "w"))
+PY
+expect "approval decisions export as approve" '"verdict": "approve"' "$(cat "$WORK/recorded/recorded.json")"
+$BIN "${CFG[@]}" test "$WORK/replay" >"$WORK/replay.out" && pass "recorded decisions replay with no drift" || { cat "$WORK/replay.out" | grep DRIFT | head; fail "recorded decisions drifted"; }
+mv "$WORK/replay/gone.json.txt" "$WORK/replay/gone.json"
+set +e; $BIN "${CFG[@]}" test "$WORK/replay" >/dev/null; code=$?; set -e
+[ $code -eq 1 ] && pass "decisions under a removed rule show as drift" || fail "expected drift, got exit $code"
+
 echo "dashboard API"
 api() { curl -s -b "$WORK/cj" -H "$JSONH" -H "x-ariodb-csrf: $CSRF" "$@"; }
 expect "decisions are listed and filterable" '"outcome":"refused"' "$(api "$D/api/decisions?outcome=refused&limit=5")"

@@ -163,4 +163,16 @@ expect "client settings cannot lift read-only mode" "1001" "$(cli analyst $A "SE
 expect "the connection keeps working after a refusal" "1001" "$(docker run --rm "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE --user analyst --password $A --multiquery --query "SELECT * FROM secrets; SELECT count() FROM events" 2>&1 || true; docker run --rm "$IMAGE" clickhouse-client --host host.docker.internal --port $PROXY_NATIVE --user analyst --password $A --query "SELECT count() FROM events" 2>&1)"
 expect "uncompressed clients work too" "1001" "$(cli analyst $A "SELECT count() FROM events" --compression 0)"
 
+echo "recorded decisions as tests"
+$BIN "${CFG[@]}" export-fixtures --out "$WORK/recorded" >/dev/null
+expect "ClickHouse decisions export with their engine" '"engine": "clickhouse"' "$(cat "$WORK/recorded/recorded.json")"
+if $BIN "${CFG[@]}" test "$WORK/recorded" >"$WORK/replay.out"; then
+  pass "ClickHouse decisions replay with no drift"
+else
+  grep DRIFT "$WORK/replay.out" | head
+  python3 -c 'import json,sys; [print(f["name"], "|", f["action"]["sql"]["statement"]) for f in json.load(open(sys.argv[1]))]' "$WORK/recorded/recorded.json"
+  fail "ClickHouse decisions drifted"
+fi
+expect "explain judges ClickHouse statements" "deny" "$($BIN "${CFG[@]}" explain --agent analyst --engine clickhouse "SELECT * FROM url('http://x', CSV, 'a String')")"
+
 echo "all ClickHouse checks passed"

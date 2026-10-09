@@ -91,26 +91,14 @@ async fn decision_fixture(
     require_user(&state, &headers)?;
     let d = audit::get(&state_dir(&state), id)?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no such decision".into()))?;
-    let verdict = match d.outcome.as_str() {
-        "allowed" => "allow",
-        "refused" => "deny",
-        other => {
-            return Err(bad(format!(
-                "a {other} decision depends on data, so it makes no policy fixture"
-            )));
-        }
-    };
-    let mut expect = json!({ "verdict": verdict });
-    match (&d.rule, verdict) {
-        (Some(r), _) => expect["rule"] = json!(r),
-        (None, "deny") => expect["rule"] = json!("policy"),
-        _ => {}
-    }
-    Ok(Json(json!({
-        "name": format!("decision {} ({})", d.id, d.agent),
-        "action": { "agent": d.agent, "sql": { "statement": d.sql } },
-        "match": expect,
-    })))
+    testing::fixture_for(&d, &state.config())
+        .map(Json)
+        .ok_or_else(|| {
+            bad(format!(
+                "a {} decision depends on data, so it makes no policy fixture",
+                d.outcome
+            ))
+        })
 }
 
 async fn sessions(
@@ -215,6 +203,8 @@ async fn rules(
 struct ExplainBody {
     agent: String,
     sql: String,
+    #[serde(default)]
+    engine: Option<String>,
 }
 
 async fn explain(
@@ -224,7 +214,16 @@ async fn explain(
 ) -> Result<Json<Value>, ApiError> {
     require_user(&state, &headers)?;
     let config = state.config();
-    let p = testing::preview(&config, &state.rules(), &body.agent, &body.sql, "");
+    let engine = body.engine.as_deref().unwrap_or("postgres");
+    let database = testing::default_database(&config, engine);
+    let p = testing::preview(
+        &config,
+        &state.rules(),
+        &body.agent,
+        &body.sql,
+        &database,
+        engine,
+    );
     Ok(Json(
         json!({ "verdict": p.verdict, "rule": p.rule, "reason": p.reason }),
     ))
