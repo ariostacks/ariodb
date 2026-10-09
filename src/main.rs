@@ -406,6 +406,9 @@ fn approvals_command(config: &Config, all: bool) -> Result<(), String> {
             "{}  {:<8} agent {:<14} rule {:<16} {:<28} {}",
             a.id, a.status, a.agent, a.rule, by, a.sql
         );
+        if let Some(note) = &a.note {
+            println!("    note: {note}");
+        }
     }
     Ok(())
 }

@@ -314,6 +314,18 @@ expect "held statement runs once approved (CLI)" "(1 row)" "$(cat "$OUT")"
 ID=$(wait_for_pending); $BIN "${CFG[@]}" deny "$ID" --note "not during the freeze" >/dev/null; wait $BG
 expect "denied statement is refused with the note" "not during the freeze" "$(cat "$OUT")"
 expect "approval timeout refuses" "no decision from 'ops-quick' within 3 seconds" "$(agent coding-agent $T "SELECT /*ask-quick*/ 1 FROM orders")"
+# An agent that leaves while its statement waits must not have it run later.
+docker run -d --name ariodb-leaver${E2E_NAME:+-$E2E_NAME} -e PGPASSWORD=$T postgres:16 \
+  psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=disable" \
+  -c "UPDATE orders SET status = 'left-behind' WHERE id = 77 /*ask-dashboard*/" >/dev/null
+ID=$(wait_for_pending)
+docker rm -f ariodb-leaver${E2E_NAME:+-$E2E_NAME} >/dev/null
+sleep 1.5
+expect "a waiting request is withdrawn when the agent disconnects" "the agent disconnected" "$($BIN "${CFG[@]}" approvals --all | grep -A1 "$ID")"
+expect "and can no longer be approved" "is not pending" "$($BIN "${CFG[@]}" approve "$ID" 2>&1 || true)"
+expect "so the statement never ran" "paid" "$(admin -tAc "SELECT status FROM orders WHERE id = 77")"
+OUT=$(python3 -I scripts/pg_cancel.py $PROXY coding-agent $T "SELECT /*ask-dashboard*/ count(*) FROM orders" 1.5 2>&1 || true)
+expect "a cancel request withdraws a waiting statement" "the agent cancelled the statement" "$OUT"
 
 D=http://127.0.0.1:$DASH
 JSONH='content-type: application/json'

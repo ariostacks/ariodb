@@ -129,6 +129,18 @@ impl Db {
         })
     }
 
+    /// Mark a pending approval expired because the agent stopped waiting.
+    pub fn withdraw(&self, id: &str, why: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE approvals SET status = 'expired', decided_by = 'ariodb', note = ?2, decided_ms = ?3
+                 WHERE id = ?1 AND status = 'pending'",
+                params![id, why, now_ms()],
+            )
+            .map(|_| ())
+        })
+    }
+
     pub fn approvals(&self, only_pending: bool, limit: i64) -> Result<Vec<Approval>, String> {
         let sql = if only_pending {
             "SELECT * FROM approvals WHERE status = 'pending' ORDER BY created_ms DESC LIMIT ?1"

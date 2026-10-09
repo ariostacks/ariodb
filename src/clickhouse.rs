@@ -153,6 +153,7 @@ async fn query(
         agent: &agent,
         session: &session,
         database: &database,
+        live: None,
     };
     let audit = |outcome: &str,
                  rows: Option<u64>,

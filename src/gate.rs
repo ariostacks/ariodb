@@ -132,6 +132,29 @@ pub struct Ctx<'a> {
     pub agent: &'a Agent,
     pub session: &'a str,
     pub database: &'a str,
+    /// Whether the agent is still there. Approvals give up when it is not.
+    pub live: Option<&'a Liveness>,
+}
+
+/// Set by the connection: the agent disconnected, or asked to cancel.
+#[derive(Debug, Default)]
+pub struct Liveness {
+    pub gone: std::sync::atomic::AtomicBool,
+    pub cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl Liveness {
+    /// Why the agent is no longer waiting, if it is not.
+    pub fn stopped(&self) -> Option<&'static str> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.gone.load(SeqCst) {
+            Some("the agent disconnected")
+        } else if self.cancelled.load(SeqCst) {
+            Some("the agent cancelled the statement")
+        } else {
+            None
+        }
+    }
 }
 
 /// An approval a rule asked for.
@@ -195,6 +218,10 @@ pub async fn check_detailed(
     let approved = needs.first().map(|n| n.rule.clone());
     for need in needs {
         crate::approvals::require(state, ctx, statements, &need).await?;
+    }
+    // An approval can arrive just as the agent leaves; do not run then.
+    if let Some(why) = ctx.live.and_then(|l| l.stopped()) {
+        return Err(Refusal::new(format!("{why} while the statement waited")));
     }
     Ok((plan, approved))
 }

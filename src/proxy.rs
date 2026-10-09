@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 
-type CancelMap = Arc<Mutex<HashMap<(i32, i32), (Target, (i32, i32))>>>;
+/// Our cancel key to: where the real query runs, its cancel key, and the
+/// session's liveness (a cancel also withdraws a waiting approval).
+type CancelMap = Arc<Mutex<HashMap<(i32, i32), (Target, (i32, i32), Arc<crate::gate::Liveness>)>>>;
 
 pub async fn serve(state: Arc<State>) -> Result<(), String> {
     let config = state.config();
@@ -167,10 +169,10 @@ async fn handle(
 
     let our_key = (rand::random::<i32>().abs(), rand::random::<i32>());
     let target = state.config().target_for(&session.agent)?;
-    cancels
-        .lock()
-        .expect("cancel map")
-        .insert(our_key, (target, session.up.cancel_key));
+    cancels.lock().expect("cancel map").insert(
+        our_key,
+        (target, session.up.cancel_key, session.live.clone()),
+    );
 
     let mut hello = vec![wire::auth_ok()];
     hello.extend(session.up.parameter_frames.iter().cloned());
@@ -181,7 +183,34 @@ async fn handle(
     }
     io.flush_all().await.map_err(e)?;
 
-    let result = Connection::new(session, io).run().await;
+    // A reader task watches the agent's socket the whole time, so a
+    // disconnect is noticed even while a statement waits for approval.
+    let live = session.live.clone();
+    let (mut reader, writer) = tokio::io::split(io);
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match wire::read_frame(&mut reader).await {
+                Ok(f) => {
+                    if tx.send(Ok(f)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(WireError::TooLarge(n)) => {
+                    if tx.send(Err(WireError::TooLarge(n))).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    live.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+    });
+    let result = Connection::new(session, writer, rx).run().await;
+    reader_task.abort();
     cancels.lock().expect("cancel map").remove(&our_key);
     result
 }
@@ -195,7 +224,9 @@ async fn handle_cancel(body: &[u8], cancels: &CancelMap) {
         i32::from_be_bytes(body[4..8].try_into().unwrap()),
     );
     let found = cancels.lock().expect("cancel map").get(&key).cloned();
-    if let Some((target, upstream_key)) = found {
+    if let Some((target, upstream_key, live)) = found {
+        live.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         upstream::cancel(&target, upstream_key).await;
     }
 }
@@ -213,7 +244,7 @@ trait FrameIo {
     async fn flush_all(&mut self) -> Result<(), WireError>;
 }
 
-impl FrameIo for Box<dyn Io> {
+impl<T: tokio::io::AsyncWrite + Unpin + Send> FrameIo for T {
     async fn write_all_frame(&mut self, f: &[u8]) -> Result<(), WireError> {
         tokio::io::AsyncWriteExt::write_all(self, f).await?;
         Ok(())
@@ -224,7 +255,9 @@ impl FrameIo for Box<dyn Io> {
     }
 }
 
-struct ClientSink<'a>(&'a mut Box<dyn Io>);
+type ClientWriter = tokio::io::WriteHalf<Box<dyn Io>>;
+
+struct ClientSink<'a>(&'a mut ClientWriter);
 
 impl Sink for ClientSink<'_> {
     async fn send(&mut self, frame: Bytes) -> Result<(), WireError> {
@@ -394,7 +427,9 @@ struct Prepared {
 
 struct Connection {
     session: Session,
-    client: Box<dyn Io>,
+    client: ClientWriter,
+    /// Frames from the agent, read by a separate task.
+    frames: tokio::sync::mpsc::Receiver<Result<Frame, WireError>>,
     prepared: HashMap<String, Prepared>,
     portals: HashMap<String, String>,
     batch: Vec<Frame>,
@@ -405,10 +440,15 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(session: Session, client: Box<dyn Io>) -> Connection {
+    fn new(
+        session: Session,
+        client: ClientWriter,
+        frames: tokio::sync::mpsc::Receiver<Result<Frame, WireError>>,
+    ) -> Connection {
         Connection {
             session,
             client,
+            frames,
             prepared: HashMap::new(),
             portals: HashMap::new(),
             batch: Vec::new(),
@@ -420,7 +460,11 @@ impl Connection {
     async fn run(mut self) -> Result<(), String> {
         let e = |e: WireError| e.to_string();
         loop {
-            let f = match wire::read_frame(&mut self.client).await {
+            let next = match self.frames.recv().await {
+                Some(next) => next,
+                None => return Ok(()),
+            };
+            let f = match next {
                 Ok(f) => f,
                 Err(WireError::TooLarge(n)) => {
                     self.session.audit(
@@ -447,6 +491,13 @@ impl Connection {
                 }
                 Err(err) => return Err(err.to_string()),
             };
+            if matches!(f.tag, b'Q' | b'S' | b'H') {
+                // A cancel only applies to the statement in flight.
+                self.session
+                    .live
+                    .cancelled
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             match f.tag {
                 b'Q' => {
                     let sql = wire::take_cstr(&mut f.body.clone()).map_err(e)?;

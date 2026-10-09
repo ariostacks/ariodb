@@ -235,6 +235,10 @@ async fn ask_person(
                 _ => {}
             }
         }
+        if let Some(why) = ctx.live.and_then(|l| l.stopped()) {
+            state.db.withdraw(&approval.id, why)?;
+            return Err(format!("{why}, so the request was withdrawn"));
+        }
         if Instant::now() >= deadline {
             state.db.expire(&approval.id)?;
             return Err(format!(

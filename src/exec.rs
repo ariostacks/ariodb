@@ -41,6 +41,8 @@ pub struct Session {
     pub state: Arc<State>,
     /// The database name this session's queries run in.
     pub database: String,
+    /// Whether the agent is still connected; see `gate::Liveness`.
+    pub live: Arc<gate::Liveness>,
 }
 
 impl Session {
@@ -55,6 +57,7 @@ impl Session {
             up,
             state,
             database: target.database,
+            live: Arc::new(gate::Liveness::default()),
         })
     }
 
@@ -104,6 +107,7 @@ impl Session {
             agent: &self.agent,
             session: &self.id,
             database: &self.database,
+            live: Some(&self.live),
         }
     }
 

@@ -426,7 +426,7 @@ where
                         "unsupported",
                     )),
                     (Ok(s), _) => {
-                        let ctx = Ctx { agent, session, database };
+                        let ctx = Ctx { agent, session, database, live: None };
                         gate::check_detailed(state, &ctx, std::slice::from_ref(s))
                             .await
                             .map_err(|r| (r.rule.clone(), r.message, "refused"))
