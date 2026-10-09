@@ -117,7 +117,7 @@ expect "doctor: and says what it cannot see" "triggers, cascades and functions a
 start
 expect "a small write commits" "UPDATE 3" "$(agent coder "UPDATE orders SET status = 'x' WHERE id < 4")"
 expect "and landed" "3" "$(sql "SELECT count(*) FROM orders WHERE status = 'x'")"
-expect "a write over the row limit is rolled back" "would change 100 rows (as reported by the database); the limit is 50" "$(agent coder "UPDATE orders SET status = 'y' WHERE id > 0")"
+expect "a write over the row limit is rolled back" "would change 100 rows (as counted by the database); the limit is 50" "$(agent coder "UPDATE orders SET status = 'y' WHERE id > 0")"
 expect "so nothing changed" "0" "$(sql "SELECT count(*) FROM orders WHERE status = 'y'")"
 expect "read-only agents still cannot write" "is read only" "$(agent reader "UPDATE orders SET status = 'z' WHERE id = 1")"
 expect "reads still work" "97" "$(agent reader "SELECT count(*) FROM orders WHERE status = 'paid'")"

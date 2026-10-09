@@ -83,6 +83,11 @@ pub fn decide(agent: &Agent, stmt: &Statement) -> Decision {
         );
     }
 
+    if let Some(table) = stmt.tables.iter().find(|t| never_allowed(stmt.engine, t)) {
+        return Decision::Deny(format!(
+            "agents may not use '{table}', whatever their tables say: it shows other sessions' statements or data, or belongs to the server or to ariodb"
+        ));
+    }
     let blocked = stmt.tables.iter().find(|t| {
         !agent.allows_table(t) && !(mode == Mode::ReadOnly && is_catalog(stmt.engine, t))
     });
@@ -232,6 +237,26 @@ const MYSQL_SAFE_SETTINGS: &[&str] = &[
 /// refused here; the MySQL proxy deliberately intercepts both before the
 /// policy (KILL of the agent's own query becomes a cancel, and USE of the
 /// configured database is answered without reaching the server), because
+/// Whether a statement sets the isolation level to exactly one of the
+/// levels that never show uncommitted data.
+fn safe_isolation(sql: &str) -> bool {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let upper = sql.to_uppercase();
+    let value = match (upper.find('='), upper.rfind(" LEVEL ")) {
+        (Some(i), _) if upper.matches('=').count() == 1 => &sql[i + 1..],
+        (None, Some(i)) => &sql[i + " LEVEL ".len()..],
+        _ => return false,
+    };
+    let value = value.trim();
+    let unquoted = match value.as_bytes() {
+        [q @ (b'\'' | b'"'), .., last] if q == last && value.len() >= 2 => &value[1..value.len() - 1],
+        _ => value,
+    };
+    let level = unquoted.to_uppercase().replace(['-', '_'], " ");
+    let level = level.split_whitespace().collect::<Vec<_>>().join(" ");
+    matches!(level.as_str(), "READ COMMITTED" | "REPEATABLE READ" | "SERIALIZABLE")
+}
+
 /// connection ids and the current database are the proxy's to manage.
 fn mysql_session(stmt: &Statement) -> Result<(), String> {
     match stmt.command {
@@ -258,11 +283,16 @@ fn mysql_session(stmt: &Statement) -> Result<(), String> {
             return Err(format!("agents may not change the '{name}' setting"));
         }
         // READ UNCOMMITTED would let an agent read another agent's write
-        // before ariodb has judged it, and perhaps rolled it back.
-        if name == "transaction_isolation"
-            && stmt.sql.to_uppercase().replace(['-', '_'], " ").contains("UNCOMMITTED")
+        // before ariodb has judged it, and perhaps rolled it back. It can be
+        // asked for in many spellings (0, CONCAT(...), tx_isolation), so
+        // only a plain safe level is accepted, set on its own.
+        if (name == "transaction_isolation" || name == "tx_isolation")
+            && !(names.split(", ").count() == 1 && safe_isolation(&stmt.sql))
         {
-            return Err("agents may not read uncommitted data (READ UNCOMMITTED)".to_string());
+            return Err(
+                "agents may only choose READ COMMITTED, REPEATABLE READ or SERIALIZABLE, one setting at a time"
+                    .to_string(),
+            );
         }
     }
     Ok(())
@@ -308,6 +338,30 @@ const PG_CATALOGUE: &[&str] = &[
     "pg_ts_dict", "pg_ts_parser", "pg_ts_template", "pg_type", "pg_user", "pg_views",
 ];
 
+/// System tables refused even to an agent with `tables = ["*"]`, which
+/// means every user table, not the server's own: on Postgres the parts of
+/// the catalogue outside `PG_CATALOGUE`, on ClickHouse `system.*` beyond
+/// its catalogue, and on MySQL the server's schemas, the runtime views the
+/// gateway's PROCESS privilege opens, and ariodb's own `ariodb` database
+/// (where the journal's tag table lives by default).
+fn never_allowed(engine: &str, table: &str) -> bool {
+    match engine {
+        "mysql" => {
+            ["mysql.", "sys.", "performance_schema.", "ariodb."]
+                .iter()
+                .any(|s| table.starts_with(s))
+                || table == "information_schema.processlist"
+                || table.starts_with("information_schema.innodb_")
+        }
+        "clickhouse" => table.starts_with("system.") && !is_catalog(engine, table),
+        _ => {
+            let catalogue_name = table.starts_with("pg_catalog.")
+                || (table.starts_with("pg_") && !table.contains('.'));
+            catalogue_name && !is_catalog(engine, table)
+        }
+    }
+}
+
 /// The engine's own catalogue. Agents may read the parts that describe the
 /// schema. On Postgres, unqualified catalogue names resolve to `pg_catalog`
 /// first, because Postgres searches it before other schemas.
@@ -345,6 +399,7 @@ mod tests {
             token_secret: None,
             clickhouse: None,
             mysql: None,
+            literal_names: false,
             max_rows_per_write: None,
             credential: None,
         }
@@ -490,6 +545,39 @@ mod tests {
 
     fn denied(d: Decision) -> bool {
         matches!(d, Decision::Deny(_))
+    }
+
+    #[test]
+    fn a_wildcard_agent_still_cannot_reach_system_tables() {
+        let mut wide = agent(Access::ReadWrite);
+        wide.tables = vec!["*".into()];
+        let pg = |sql: &str| decide(&wide, &classify(sql).unwrap().remove(0));
+        assert!(denied(pg("SELECT query FROM pg_stat_activity")), "pg_stat_activity");
+        assert!(denied(pg("SELECT * FROM pg_catalog.pg_stats")), "pg_stats");
+        assert_eq!(pg("SELECT * FROM anything_at_all"), Decision::Allow(Mode::ReadOnly));
+        let my = |sql: &str| {
+            let mut stmts = crate::mysql_sql::classify(sql).unwrap();
+            crate::mysql_sql::scope_to_database(&mut stmts, "app");
+            decide(&wide, &stmts[0])
+        };
+        for sql in [
+            "SELECT * FROM mysql.user",
+            "SELECT * FROM performance_schema.threads",
+            "SELECT info FROM information_schema.processlist",
+            "INSERT INTO ariodb.session_tags (session, agent) VALUES ('s-forged', 'x')",
+        ] {
+            assert!(denied(my(sql)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_database_named_public_is_not_postgres_s_default_schema() {
+        let mut view = agent(Access::ReadOnly);
+        view.literal_names = true;
+        assert!(view.allows_table("orders"));
+        assert!(!view.allows_table("public.orders"));
+        // On Postgres `public.orders` is `orders`.
+        assert!(agent(Access::ReadOnly).allows_table("public.orders"));
     }
 
     #[test]
@@ -648,6 +736,11 @@ mod tests {
         for sql in [
             "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
             "SET @@session.transaction_isolation = 'READ-UNCOMMITTED'",
+            "SET tx_isolation = 'READ-UNCOMMITTED'",
+            "SET transaction_isolation = 0",
+            "SET transaction_isolation = CONCAT('READ-UNCOMM', 'ITTED')",
+            "SET transaction_isolation = 0 + 'SERIALIZABLE'",
+            "SET @x = 'SERIALIZABLE', transaction_isolation = 0",
             "SET GLOBAL wait_timeout = 1",
             "SET @@global.time_zone = '+00:00'",
             "SET PERSIST wait_timeout = 1",

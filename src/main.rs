@@ -626,8 +626,24 @@ async fn undo_command(
 ) -> Result<(), String> {
     let mysql_records = mysql_journal::read_all(config)?;
     if mysql_records.iter().any(|r| r.session.as_deref() == Some(session)) {
-        let text = mysql_undo::undo(config, &mysql_records, session, apply, skip_conflicts).await?;
-        print!("{text}");
+        // Notifiers hear about the undo, as for Postgres sessions below.
+        let plugins = if apply {
+            Some(start_plugins(config, plugins::Roles { audit_sink: false }).await)
+        } else {
+            None
+        };
+        let done = mysql_undo::undo(config, &mysql_records, session, apply, skip_conflicts).await;
+        if let Ok((_, Some(rows))) = &done {
+            let by = format!("cli:{}", std::env::var("USER").unwrap_or_default());
+            plugins::notify(
+                "undo_applied",
+                serde_json::json!({ "session": session, "rows": rows, "by": by }),
+            );
+        }
+        if let Some(p) = plugins {
+            stop_plugins(p).await;
+        }
+        print!("{}", done?.0);
         return Ok(());
     }
     let records = journal::read_all(config)?;

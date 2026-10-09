@@ -653,7 +653,7 @@ them as, for example,
 | Situation | Error | SQLSTATE | Example message |
 |---|---|---|---|
 | Refused by the policy or a rule | 1142 | `42000` | `ariodb: agent 'support-bot' is read only` |
-| Write rolled back after running | 1142 | `42000` | `ariodb: rolled back: the statement would change 120 rows (as reported by the database); the limit is 100` |
+| Write rolled back after running | 1142 | `42000` | `ariodb: rolled back: the statement would change 120 rows (as counted by the database); the limit is 100` |
 | Wrong token, unknown agent, no MySQL access | 1045 | `28000` | `ariodb: access denied for agent 'coding-agent': wrong token` |
 | Another database at login, or `COM_INIT_DB` | 1044 | `42000` | `ariodb: agents may only use database 'app'` |
 | TLS required but not used | 3159 | `HY000` | `ariodb: connections must use TLS (for example --ssl-mode=REQUIRED)` |
@@ -712,7 +712,7 @@ ariodb then checks:
 1. **The total is within the row limit** (`max_rows_per_write`, from the
    agent or `[limits]`; default 500). An update of 30 orders whose trigger
    writes three log rows for each counts as 120:
-   `rolled back: the statement would change 120 rows (as reported by the database); the limit is 100`.
+   `rolled back: the statement would change 120 rows (as counted by the database); the limit is 100`.
 2. **After-stage rules** pass, judged on `effects.rows` (the count above)
    and `effects.tables` (the tables the write statement names). See
    [rules](rules.md).

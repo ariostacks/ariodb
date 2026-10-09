@@ -356,7 +356,7 @@ pub fn judge_reported(config: &Config, agent: &Agent, reported: u64) -> Result<(
         .unwrap_or(config.limits.max_rows_per_write);
     if reported > limit {
         return Err(Refusal::new(format!(
-            "rolled back: the statement would change {reported} rows (as reported by the database); the limit is {limit}"
+            "rolled back: the statement would change {reported} rows (as counted by the database); the limit is {limit}"
         )));
     }
     Ok(())

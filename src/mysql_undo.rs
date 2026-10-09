@@ -109,7 +109,7 @@ pub async fn undo(
     session: &str,
     apply: bool,
     skip_conflicts: bool,
-) -> Result<String, String> {
+) -> Result<(String, Option<u64>), String> {
     let mut conn = connect(config).await?;
     let plan = plan(&mut conn, config, records, session).await?;
     let mut text = String::new();
@@ -131,12 +131,13 @@ pub async fn undo(
     }
     if !apply {
         text.push_str("\nnothing changed. Run again with --apply to undo.\n");
-        return Ok(text);
+        return Ok((text, None));
     }
     print!("{text}");
     let done = apply_plan(&mut conn, config, &plan, skip_conflicts).await?;
-    Ok(format!(
-        "\nundone: {done} rows restored in one transaction\n"
+    Ok((
+        format!("\nundone: {done} rows restored in one transaction\n"),
+        Some(done as u64),
     ))
 }
 

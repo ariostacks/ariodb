@@ -547,6 +547,7 @@ mod tests {
             token_secret: None,
             clickhouse: None,
             mysql: None,
+            literal_names: false,
             max_rows_per_write: None,
             credential: None,
         }

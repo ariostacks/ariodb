@@ -369,15 +369,25 @@ pub struct Agent {
     /// MySQL access, if this agent may use MySQL.
     #[serde(default)]
     pub mysql: Option<EngineAccess>,
+    /// Set on another engine's view of the agent (`engine_agent`): table
+    /// names are compared as written, because `public.` there names a
+    /// database, not Postgres's default schema.
+    #[serde(skip)]
+    pub literal_names: bool,
 }
 
 impl Agent {
     /// May this agent touch this table? Names are compared after normalising.
     pub fn allows_table(&self, table: &str) -> bool {
-        let table = crate::classify::normalise_table(table);
-        self.tables
-            .iter()
-            .any(|t| t == "*" || crate::classify::normalise_table(t) == table)
+        let norm = |t: &str| {
+            if self.literal_names {
+                t.to_lowercase()
+            } else {
+                crate::classify::normalise_table(t)
+            }
+        };
+        let table = norm(table);
+        self.tables.iter().any(|t| t == "*" || norm(t) == table)
     }
 }
 
@@ -467,7 +477,8 @@ impl Config {
             .chain(std::iter::once((
                 "[clickhouse]".to_string(),
                 &self.clickhouse.tunnel,
-            )));
+            )))
+            .chain(std::iter::once(("[mysql]".to_string(), &self.mysql.tunnel)));
         for (who, tunnel) in uses {
             if let Some(name) = tunnel
                 && !self.tunnels.iter().any(|t| &t.name == name)
@@ -616,6 +627,7 @@ impl Config {
         let mut view = agent.clone();
         view.access = access.access;
         view.tables = access.tables.clone();
+        view.literal_names = true;
         Ok(view)
     }
 

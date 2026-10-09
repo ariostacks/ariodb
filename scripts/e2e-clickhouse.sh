@@ -137,7 +137,7 @@ expect "readonly cannot be switched off" "readonly or allow_ddl" "$(ch analyst $
 expect "client settings cannot switch off read-only" "1000" "$(curl -s -u analyst:$A "http://127.0.0.1:$PROXY_HTTP/?readonly=0&allow_ddl=1" --data-binary "SELECT count() FROM events")"
 expect "rules apply to ClickHouse" "data hold" "$(ch analyst $A "SELECT count() FROM events WHERE user = 'user7'")"
 expect "schema discovery allowed" "events" "$(ch analyst $A "SELECT name FROM system.tables WHERE database = 'default'")"
-expect "system.query_log is not" "may not use table 'system.query_log'" "$(ch analyst $A "SELECT * FROM system.query_log")"
+expect "system.query_log is not" "may not use 'system.query_log'" "$(ch analyst $A "SELECT * FROM system.query_log")"
 expect "comma joins are checked" "may not use table 'secrets'" "$(ch analyst $A "SELECT * FROM events, secrets")"
 expect "IN <table> is checked" "may not use table 'secrets'" "$(ch analyst $A "SELECT count() FROM events WHERE user IN secrets")"
 expect "INSERT with a column list is checked" "may not use table 'secrets'" "$(ch loader $L "INSERT INTO secrets (note) VALUES ('planted')")"
