@@ -60,10 +60,11 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
         let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(socket, state).await {
-                if !e.contains("early eof") && !e.contains("connection reset") {
-                    eprintln!("ariodb: ClickHouse native connection ended: {e}");
-                }
+            if let Err(e) = handle(socket, state).await
+                && !e.contains("early eof")
+                && !e.contains("connection reset")
+            {
+                eprintln!("ariodb: ClickHouse native connection ended: {e}");
             }
         });
     }

@@ -171,10 +171,10 @@ fn name(t: &Tok) -> Option<String> {
 /// index after it.
 fn table_name(toks: &[Tok], i: usize) -> Option<(String, usize)> {
     let first = name(toks.get(i)?)?;
-    if toks.get(i + 1) == Some(&Tok::Punct('.')) {
-        if let Some(second) = toks.get(i + 2).and_then(name) {
-            return Some((format!("{first}.{second}"), i + 3));
-        }
+    if toks.get(i + 1) == Some(&Tok::Punct('.'))
+        && let Some(second) = toks.get(i + 2).and_then(name)
+    {
+        return Some((format!("{first}.{second}"), i + 3));
     }
     Some((first, i + 1))
 }
@@ -301,10 +301,10 @@ const NOT_FUNCTIONS: &[&str] = &[
 pub fn classify(sql: &str) -> Result<Statement, String> {
     let toks = tokenize(sql)?;
     // One statement only: a semicolon may only end the text.
-    if let Some(pos) = toks.iter().position(|t| *t == Tok::Punct(';')) {
-        if toks[pos + 1..].iter().any(|t| *t != Tok::Punct(';')) {
-            return Err("send one statement per request".to_string());
-        }
+    if let Some(pos) = toks.iter().position(|t| *t == Tok::Punct(';'))
+        && toks[pos + 1..].iter().any(|t| *t != Tok::Punct(';'))
+    {
+        return Err("send one statement per request".to_string());
     }
     let toks: Vec<Tok> = toks.into_iter().filter(|t| *t != Tok::Punct(';')).collect();
     let words: Vec<Option<String>> = toks.iter().map(word).collect();

@@ -273,17 +273,17 @@ async fn query(
     let rows = summary
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .and_then(|v| {
+        .map(|v| {
             let n = |k: &str| {
                 v[k].as_str()
                     .and_then(|x| x.parse::<u64>().ok())
                     .unwrap_or(0)
             };
-            Some(if stmt.kind == Kind::Write {
+            if stmt.kind == Kind::Write {
                 n("written_rows")
             } else {
                 n("read_rows")
-            })
+            }
         });
     let outcome = if status.is_success() {
         "allowed"

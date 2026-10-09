@@ -1,46 +1,175 @@
-# Example ariodb config. No real credentials belong in this file.
-# Set the real database URL in ARIODB_DATABASE_URL instead.
+# Example ariodb config. Every value here is made up: no real credential
+# belongs in this file. Put real ones in environment variables or in the
+# encrypted secret store (`ariodb secret set <name>`).
+#
+# Check it with:  ariodb check --config ariodb.toml
+# ariodb reloads this file while it runs; rule and agent changes apply to
+# the next statement. Listen addresses and tunnels need a restart.
 
-on_failure = "closed"
+# ---------------------------------------------------------------------------
+# The Postgres database agents work on.
 
 [database]
-url = "postgres://ariodb:not-a-real-password@localhost:5432/app"
-
-# Reach the database through a side process that ariodb starts and keeps
-# running, such as cloud-sql-proxy or an SSH port-forward. Connections that
-# name the tunnel dial its listen address; user, password, database and TLS
-# still come from the URL.
+# The login agents' queries run as (the "gateway" role). ARIODB_DATABASE_URL,
+# if set, wins over this, so the password need not live here.
+url = "postgres://ariodb_gw:not-a-real-password@localhost:5432/app"
+# Or keep the URL in the secret store:
+# secret = "database-url"
+# TLS to the database: "disable", "require" (encrypt, accept any certificate)
+# or "verify". Default: disable for localhost, verify otherwise.
+# tls = "verify"
+# ca_file = "/etc/ariodb/db-ca.pem"
+# Reach the database through a [[tunnels]] entry (see below).
 # tunnel = "cloudsql"
-#
-# [[tunnels]]
-# name = "cloudsql"
-# command = ["cloud-sql-proxy", "--port", "5433", "my-project:europe-west2:app-db"]
-# listen = "127.0.0.1:5433"
-# ready_probe = "tcp"
-# ready_timeout_seconds = 30
-# restart = true
 
 [limits]
-max_rows_per_write = 500
-statement_timeout_ms = 5000
+max_rows_per_write = 500     # a write that changes more rows is rolled back
+statement_timeout_ms = 5000  # SET LOCAL statement_timeout for every statement
+
+# ---------------------------------------------------------------------------
+# Where agents connect.
 
 [proxy]
-listen = "127.0.0.1:6543"
+listen = "127.0.0.1:6543"    # "" switches the Postgres proxy off
+# TLS between agents and ariodb. Agents send their token as a password, so
+# use TLS whenever they connect over a network.
+# tls_cert = "/etc/ariodb/proxy.crt"
+# tls_key = "/etc/ariodb/proxy.key"
+# require_tls = true
 
 [journal]
-enabled = true
-dir = ".ariodb"
-slot = "ariodb"
-publication = "ariodb"
+enabled = true               # record every row agents change, for undo
+dir = ".ariodb"              # state directory: journal, decisions log, secrets
+slot = "ariodb"              # logical replication slot
+publication = "ariodb"       # publication listing the protected tables
+
+# ---------------------------------------------------------------------------
+# Agents. Each logs in with its name as the user and its token as the
+# password. The token is never the database password.
 
 [[agents]]
 name = "coding-agent"
-access = "read_write"
-tables = ["orders", "customers"]
+access = "read_write"        # or "read_only"
+tables = ["orders", "customers"]   # ["*"] means every table
 token_env = "ARIODB_TOKEN_CODING_AGENT"
+# max_rows_per_write = 100   # overrides [limits] for this agent
 
 [[agents]]
 name = "support-bot"
 access = "read_only"
 tables = ["orders"]
 token_env = "ARIODB_TOKEN_SUPPORT_BOT"
+# Or keep the token in the secret store instead of token_env:
+# token_secret = "support-bot-token"
+# Run this agent's queries as a different database login (see [[credentials]]).
+credential = "reporting"
+
+# ClickHouse access is separate from Postgres access. It only matters when
+# a [clickhouse] listener is on. Tables outside the `default` database are
+# named as database.table.
+[agents.clickhouse]
+access = "read_only"
+tables = ["events"]
+
+# ---------------------------------------------------------------------------
+# Extra database logins, so agents can run as different roles.
+
+[[credentials]]
+name = "reporting"
+url_env = "ARIODB_REPORTING_URL"   # holds a postgres:// URL; or: secret = "reporting-url"
+# tls = "verify"
+# tunnel = "cloudsql"
+
+# ---------------------------------------------------------------------------
+# Rules, in CEL, on top of each agent's built-in policy. They can refuse or
+# hold statements the policy allows; they cannot allow what it refuses.
+# Any matching deny wins; otherwise the highest-priority match decides.
+
+[[rules]]
+name = "no-file-functions"
+condition = "sets.intersects(sql.functions, ['pg_read_file', 'pg_ls_dir', 'pg_stat_file'])"
+verdict = "deny"
+reason = "functions that read server files are off-limits"
+
+[[rules]]
+name = "customer-emails-need-a-human"
+condition = "'customers' in sql.tables && sql.statement.contains('email')"
+verdict = "approve"
+approve = ["ops"]
+reason = "reading customer emails needs a person to agree"
+
+[[rules]]
+name = "big-writes-need-a-human"
+stage = "after"              # judged on what the write actually changed, before commit
+condition = "effects.rows > 50"
+verdict = "approve"
+approve = ["ops"]
+agents = ["coding-agent"]
+
+# ---------------------------------------------------------------------------
+# Approvers, named by rules with verdict = "approve". All listed must allow.
+
+[[approvers]]
+name = "ops"
+type = "dashboard"           # decide in the dashboard or with `ariodb approve`
+
+# [[approvers]]
+# name = "ops-slack"
+# type = "slack"
+# channel = "C0123456789"
+# bot_token_env = "ARIODB_SLACK_BOT_TOKEN"
+# interactive = true                         # Approve and Deny buttons
+# signing_secret_env = "ARIODB_SLACK_SIGNING_SECRET"
+#
+# [[approvers]]
+# name = "pager"
+# type = "webhook"
+# url = "https://hooks.example.com/ariodb"
+# hmac_secret_env = "ARIODB_WEBHOOK_SECRET"
+#
+# [[approvers]]
+# name = "model"
+# type = "llm"
+# policy = "Allow reads of order data. Deny anything that exports personal data in bulk."
+# api_key_env = "ANTHROPIC_API_KEY"
+# # model = "claude-opus-5-5"
+# # effort = "low"
+
+[approvals]
+timeout_seconds = 90         # no decision in time means refused
+llm_fail_mode = "closed"     # model unreachable: "closed" refuses, "open" allows
+llm_cache_seconds = 300
+
+# ---------------------------------------------------------------------------
+# The dashboard, and the callbacks Slack and webhooks use.
+
+[dashboard]
+listen = "127.0.0.1:8080"    # "" switches it off
+public_url = "http://127.0.0.1:8080"   # the address people and Slack use
+config_writes = false        # true lets the dashboard save this file
+
+[audit]
+retention_days = 30          # 0 keeps every decision
+redact_literals = false      # true stores SQL with values replaced by $1, $2, ...
+
+# ---------------------------------------------------------------------------
+# ClickHouse (optional). Agents need an [agents.clickhouse] block.
+
+# [clickhouse]
+# http_listen = "127.0.0.1:8124"       # HTTP interface for agents; "" is off
+# http_url = "http://127.0.0.1:8123"   # the real ClickHouse HTTP interface
+# native_listen = "127.0.0.1:9001"     # native protocol for agents (reads only); "" is off
+# native_addr = "127.0.0.1:9000"       # the real native port
+# user = "ariodb"
+# password_env = "ARIODB_CLICKHOUSE_PASSWORD"   # or password_secret = "..."
+
+# ---------------------------------------------------------------------------
+# Tunnels (optional): side processes that carry connections to a database.
+# ariodb starts them, waits for the port, restarts them and stops them.
+
+# [[tunnels]]
+# name = "cloudsql"
+# command = ["cloud-sql-proxy", "--port", "5433", "my-project:europe-west2:app-db"]
+# listen = "127.0.0.1:5433"
+# ready_timeout_seconds = 30
+# restart = true
