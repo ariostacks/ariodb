@@ -84,11 +84,12 @@ satisfied before any of it runs.
 
 ### After: judged on what a write did
 
-After-stage rules (`stage = "after"`) run once per Postgres checked
-write, after the statements have run and the built-in effect check has
-passed (tables changed, row limit), and before commit. They add the
-[`effects.*`](#effects-effects) facts: how many rows the transaction
-really changed and which tables, including through triggers and cascades.
+After-stage rules (`stage = "after"`) run once per Postgres or MySQL
+checked write, after the statements have run and the built-in effect
+check has passed (tables changed, row limit), and before commit. They add
+the [`effects.*`](#effects-effects) facts: how many rows the transaction
+really changed and which tables, including through triggers and cascades
+(on MySQL, the tables the statement names; see below).
 
 - `deny` rolls the write back.
 - `approve` keeps the transaction open, with its row locks held, until the
@@ -177,12 +178,10 @@ with [`ariodb explain`](testing-policies.md).
 | `sql.statement` | string | The statement as the agent sent it, in its original case, comments included. |
 | `sql.verb` | string | The first keyword, lower case: `select`, `insert`, `update`, `delete`, `merge`, `set`, `explain`, `prepare`, `copy`, ... A statement starting `WITH` (or a comment) gives the command it runs instead, such as `select` or `delete`. |
 | `sql.kind` | string | ariodb's judgement: `read`, `write` or `session` (the others never reach the rules; see [policy](policy.md#statement-kinds)). |
-| `sql.tables` | list of strings | Tables named, lower case, without `public.`; other schemas stay (`billing.invoices`). On ClickHouse, scoped to the session's database. CTE names are not included. |
+| `sql.tables` | list of strings | Tables named, lower case, without `public.`; other schemas stay (`billing.invoices`). On ClickHouse, scoped to the session's database; on MySQL, tables in `[mysql] database` are unqualified and others are `database.table`. CTE names are not included. |
 | `sql.functions` | list of strings | Functions called, lower case, **with the schema if the statement wrote one** (`pg_catalog.pg_read_file`). |
-| `sql.database` | string | The database the statement runs in: the one in the Postgres login's URL, or the ClickHouse session's database. |
-| `sql.engine` | string | `postgres` or `clickhouse`. |
-
-<!-- TODO: add 'mysql' to sql.engine once MySQL support is merged. -->
+| `sql.database` | string | The database the statement runs in: the one in the Postgres login's URL, the ClickHouse session's database, or `[mysql] database`. |
+| `sql.engine` | string | `postgres`, `clickhouse` or `mysql` (MySQL and MariaDB). |
 
 Two things to know when writing security rules:
 
@@ -206,7 +205,7 @@ with tables, grants and column privileges.
 | Fact | Type | Meaning |
 |---|---|---|
 | `agent.name` | string | The agent's name from `[[agents]]`. |
-| `agent.access` | string | `read_only` or `read_write`. For a ClickHouse statement, the agent's `[agents.clickhouse]` access. |
+| `agent.access` | string | `read_only` or `read_write`. For a ClickHouse statement, the agent's `[agents.clickhouse]` access; for a MySQL statement, its `[agents.mysql]` access. |
 
 <!-- TODO: document agent.credential once that fact is merged. -->
 
@@ -224,6 +223,13 @@ Under [`write_check = "reported"`](postgres.md#when-the-database-cannot-measure-
 `effects.rows` is the row count the database reported and
 `effects.tables` is the tables the write statements name; changes made by
 triggers and cascades are not seen.
+
+On MySQL and MariaDB, `effects.rows` is the larger of the count the
+server reported and InnoDB's count for the transaction, which includes
+rows changed by triggers and cascades (when the gateway login has
+`PROCESS`). `effects.tables` is the tables the write statement names:
+tables changed only by triggers and cascades are not in it. See
+[MySQL and MariaDB](mysql.md#how-this-compares-with-postgres).
 
 ### Plugin facts (`plugin`)
 
@@ -460,8 +466,17 @@ approve = ["ops"]
 reason = "reading customer records needs a person to agree"
 ```
 
-A rule without an engine test applies to both engines. After-stage rules
-only ever see Postgres.
+```toml
+[[rules]]
+name = "mysql-order-writes-need-a-human"
+condition = "sql.engine == 'mysql' && sql.kind == 'write' && 'orders' in sql.tables"
+verdict = "approve"
+approve = ["ops"]
+reason = "changes to orders through MySQL need a person to agree"
+```
+
+A rule without an engine test applies to every engine. After-stage rules
+see Postgres and MySQL writes, never ClickHouse.
 
 ### Allow writes only in working hours
 
@@ -547,7 +562,7 @@ plugin facts show as unevaluable (a deny). Details in
 - Conditions see the SQL text and what ariodb parsed from it; they cannot
   see inside functions or views, or read the data.
 - No clock, no network, no database lookups from CEL; use plugin facts.
-- After-stage rules apply to Postgres checked writes only.
+- After-stage rules apply to Postgres and MySQL checked writes only.
 - An unevaluable condition refuses, including when a plugin it reads is
   unavailable.
 

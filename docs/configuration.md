@@ -318,7 +318,36 @@ access = "read_only"
 tables = ["events", "analytics.page_views"]
 ```
 
-<!-- TODO: document [agents.mysql] once MySQL and MariaDB support is merged. -->
+### `[agents.mysql]`
+
+MySQL and MariaDB access, separate from Postgres access. Like
+`[agents.clickhouse]`, it attaches to the `[[agents]]` entry written just
+above it. Without this block the agent cannot log in to the
+[`[mysql]`](#mysql) listener (`this agent has no MySQL access`).
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `access` | string | required | `read_only` or `read_write`. Writes are counted before commit and can be undone; see [MySQL and MariaDB](mysql.md#how-writes-are-checked-before-commit). |
+| `tables` | list of strings | required | MySQL tables. Unqualified names mean `[mysql] database`; name tables in other databases as `database.table`. Names ignore case. `["*"]` means every table, except the ones ariodb [reserves](mysql.md#reserved-tables) (its tag table, `mysql`, `sys`, `performance_schema`, the process list and InnoDB's views). Agents may always read the `information_schema` views that describe structure. |
+
+The agent logs in with the same `name` and token as for Postgres. Its
+`max_rows_per_write` applies to MySQL writes too. The tables that
+`read_write` agents list here are the MySQL protected tables: the journal
+records everyone's changes to them, and undo needs write access to them.
+An agent's MySQL access is read when it connects, so a change applies from
+its next connection.
+
+```toml
+[[agents]]
+name = "coding-agent"
+access = "read_only"
+tables = ["orders"]
+token_secret = "coding-agent-token"
+
+[agents.mysql]
+access = "read_write"
+tables = ["orders", "customers", "reporting.daily"]
+```
 
 ## `[[credentials]]`
 
@@ -583,7 +612,53 @@ tls_key = "/etc/ariodb/ch.key"
 
 <!-- TODO: ClickHouse native INSERT is refused today; document it once merged. -->
 
-<!-- TODO: document the [mysql] section once MySQL and MariaDB support is merged. -->
+## `[mysql]`
+
+ariodb in front of MySQL or MariaDB: agents connect with any MySQL client,
+and ariodb relays their statements to the server as its own login. See
+[MySQL and MariaDB](mysql.md) for behaviour, grants, server settings and
+limits.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `listen` | string | `""` (off) | Where agents connect, as `host:port`. While empty, the rest of `[mysql]` is unused and the MySQL journal does not run. |
+| `addr` | string | `"127.0.0.1:3306"` | The real server, as `host:port`. |
+| `database` | string | none | The database agents work in. Required when `listen` is set. Agents may log in to it or to no database, and unqualified table names (in statements and in `[agents.mysql] tables`) mean tables in it. |
+| `user` | string | `"ariodb"` | The gateway login every agent's queries run as. Agents never see it. Needs the table grants agents need, `INSERT` on `tag_table`, and `PROCESS`. |
+| `password_env` / `password_secret` | string | none (empty password) | The gateway's password. If both are set, the secret wins. |
+| `tls` | string | `disable` for `localhost`, `127.*` and `[::1]`; `verify` otherwise | TLS to the server: `disable`, `require` (encrypted, certificate not checked) or `verify` (chain and host name checked). See [TLS](mysql.md#tls). |
+| `ca_file` | string | none | An extra CA (PEM) trusted under `verify`. Used by the proxy, `setup`, `doctor`, the journal and `undo`. |
+| `tls_cert` / `tls_key` | string | none | Certificate and key (PEM) for agents' connections. Set both or neither. |
+| `require_tls` | boolean | `false` | Refuse agents that do not use TLS. Needs `tls_cert` and `tls_key`. |
+| `tunnel` | string | none | Dial this `[[tunnels]]` entry instead of `addr`. TLS is still checked against `addr`'s host name. |
+| `journal` | boolean | `true` | Tag every write with its session and read the binlog, for undo. Independent of `[journal] enabled`, which is Postgres's; the files go in `[journal] dir` either way. |
+| `journal_user` | string | `user`, with its password | The login `ariodb setup`, the journal and `ariodb undo` use. Needs `REPLICATION SLAVE`, `REPLICATION CLIENT`, `SELECT, INSERT, DELETE` on `tag_table`, write access to the protected tables for undo, and `PROCESS`; for `setup`, `CREATE` on the tag table's database. |
+| `journal_password_env` / `journal_password_secret` | string | none (empty password) | Its password, when `journal_user` is set. If both are set, the secret wins. |
+| `server_id` | integer | `4242` | The server id the journal registers with to read the binlog. Must not be 0 while the journal is on, and must differ from the server's and every real replica's. Run one `ariodb serve` per id. |
+| `tag_table` | string | `"ariodb.session_tags"` | The table each write transaction records its session in, as `database.table`; an unqualified name is in `database`. `ariodb setup` creates it. No agent may use it, whatever its `tables` say. |
+
+```toml
+[mysql]
+listen = "0.0.0.0:3307"
+addr = "mysql.internal.example:3306"
+database = "app"
+user = "ariodb_gw"
+password_secret = "mysql-gateway-password"
+tls = "verify"
+ca_file = "/etc/ariodb/mysql-ca.pem"
+tls_cert = "/etc/ariodb/mysql-proxy.crt"
+tls_key = "/etc/ariodb/mysql-proxy.key"
+require_tls = true
+journal_user = "ariodb_journal"
+journal_password_secret = "mysql-journal-password"
+server_id = 4242
+```
+
+Unlike the other sections' tunnels, a `[mysql] tunnel` that names no
+`[[tunnels]]` entry is not caught when the config loads: connections fail
+with `tunnel '<name>' is not defined in [[tunnels]]`. Check the name with
+`ariodb check`, which prints `(through tunnel '<name>')` on the `mysql`
+line.
 
 ## `[[tunnels]]`
 
@@ -597,7 +672,7 @@ listening, or start their own.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `name` | string | required | Unique; `[database]`, credentials and `[clickhouse]` refer to it with `tunnel = "<name>"`. |
+| `name` | string | required | Unique; `[database]`, credentials, `[clickhouse]` and `[mysql]` refer to it with `tunnel = "<name>"`. |
 | `command` | list of strings | required | The program and its arguments, run directly (not through a shell). |
 | `listen` | string | required | The local address the process listens on, as an IP address and port (`127.0.0.1:5433`, not `localhost:5433`). Must be unique across tunnels. |
 | `ready_probe` | string | `"tcp"` | How ariodb knows the tunnel is up. `tcp` (a connection succeeds) is the only probe. |
@@ -678,7 +753,7 @@ env = { ARIODB_EXAMPLE_CUTOFF_HOUR = "18" }
 | `ARIODB_SLACK_API` | Slack approvers | Replace `https://slack.com/api`. Meant for tests. |
 | `USER` | `approve`, `deny`, `undo --apply` | Recorded as the decider, `cli:<user>`. |
 | `PATH`, `HOME` | plugins | Passed to every plugin. |
-| Any name in a `*_env` key | as configured | Agent tokens, credential URLs, approver secrets, ClickHouse password, plugin `pass_env`. |
+| Any name in a `*_env` key | as configured | Agent tokens, credential URLs, approver secrets, ClickHouse and MySQL passwords, plugin `pass_env`. |
 
 Environment variables are read from ariodb's own process, so a change
 needs a restart of that process to take effect. Secrets in the store do
@@ -700,6 +775,7 @@ live in environment variables or the config file.
   `ariodb secret delete <name>`, or the dashboard's settings page.
 - **Keys that take a secret name:** `[database] secret`, `[[credentials]]
   secret`, `[[agents]] token_secret`, `[clickhouse] password_secret`,
+  `[mysql] password_secret` and `journal_password_secret`,
   `bot_token_secret`, `signing_secret_secret`, `hmac_secret_secret` and
   `api_key_secret` on approvers, and the values of a plugin's `secret_env`.
 - **When values are read:** at the moment they are used (each new agent
@@ -750,7 +826,8 @@ flowchart LR
 | `[proxy] require_tls` (new connections; the certificate must already be loaded) | `[journal]` (any key, including `dir`) |
 | `[dashboard] public_url`, `config_writes` | `[audit] redact_literals` for the decisions log |
 | `[audit] retention_days` (next hourly prune) | Environment variables, including `*_env` tokens |
-| `[clickhouse] http_url`, `native_addr`, `user`, password, `accept_invalid_certificate` (next request) | |
+| `[clickhouse] http_url`, `native_addr`, `user`, password, `accept_invalid_certificate` (next request) | `[mysql] listen`, `tls_cert`, `tls_key`, `journal`, `server_id`, `tag_table`, and the journal login |
+| `[mysql] addr`, `database`, `user`, password, `tls`, `ca_file`, `require_tls` (new agent connections) | |
 
 A config that points at a tunnel or plugin added since start-up is valid,
 but connections through that tunnel fail until ariodb restarts. Other
@@ -786,7 +863,14 @@ text follows `ariodb: kept the previous config:`.
 | `agent 'coding-agent' is listed twice` | Agent names must be unique. |
 | `agent 'coding-agent' uses credential 'ro', which is not defined` | Add a `[[credentials]]` entry with that name. |
 | `agent 'coding-agent' needs exactly one of token_env or token_secret` | Set one, not both. |
-| `agent 'coding-agent' must list at least one table` | Add tables, or `["*"]`. |
+| `agent 'coding-agent' must list at least one table` | Add tables, or `["*"]`. An agent that only uses ClickHouse or MySQL still needs one Postgres table. |
+
+### `[mysql]`
+
+| Message | Fix |
+|---|---|
+| `[mysql] database must name the database agents work in` | Set `database` whenever `listen` is set. |
+| `[mysql] server_id must not be 0: the journal registers with it as a replica` | Pick a number no server or replica uses, or set `journal = false`. |
 
 ### Rules and approvers
 
@@ -838,6 +922,7 @@ These are not checked by `ariodb check`:
 |---|---|
 | `proxy.tls_cert and proxy.tls_key must be set together` | Set both or neither. Likewise `clickhouse.tls_cert and clickhouse.tls_key must be set together`. |
 | `proxy.require_tls needs proxy.tls_cert and proxy.tls_key` | Add the certificate and key. |
+| `ariodb: MySQL proxy stopped: mysql.tls_cert and mysql.tls_key must be set together` | Set both or neither. Also `mysql.require_tls needs mysql.tls_cert and mysql.tls_key`, and `cannot listen on ...`. These stop only the MySQL listener; `ariodb serve` logs them and keeps running. |
 | `/etc/ariodb/proxy.key: no private key found` | The file holds no PEM private key. A missing file gives `/etc/ariodb/proxy.key: No such file or directory (os error 2)`. |
 | `TLS certificate: ...` | The certificate and key do not match, or the certificate is unusable. |
 | `cannot listen on 0.0.0.0:6543: Address already in use (os error 98)` | Something else holds the port; often a second ariodb. |

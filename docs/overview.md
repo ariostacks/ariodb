@@ -16,7 +16,11 @@ what every write actually changed before it commits, records every row an
 agent changed, and lets a person undo one agent session later without
 touching anyone else's work.
 
-<!-- TODO: MySQL and MariaDB front door, once merged. -->
+Agents can also connect as if it were MySQL or MariaDB, with the `mysql`
+client or any MySQL driver. The same policy, rules, approvals, decisions
+log and undo apply there, with a weaker write check: ariodb counts the
+rows a MySQL write changed, triggers included, but only checks the tables
+the statement names. See [MySQL and MariaDB](mysql.md).
 
 It is a single Rust binary with an embedded web dashboard and a small
 SQLite database for its own state. It is source-available under the
@@ -128,10 +132,12 @@ Step by step, for an agent connected to the Postgres proxy:
 11. **The dashboard shows it all.** Approvals waiting, decisions, sessions
     and undo, rules, config and settings. See [dashboard](dashboard.md).
 
-The ClickHouse proxies and the MCP server go through the same policy, rules,
-approvals and decisions log. ClickHouse has no transactions, so its writes
-cannot be measured, rolled back or undone; see [ClickHouse](clickhouse.md)
-and [MCP](mcp.md).
+The ClickHouse proxies, the MySQL proxy and the MCP server go through the
+same policy, rules, approvals and decisions log. ClickHouse has no
+transactions, so its writes cannot be measured, rolled back or undone; see
+[ClickHouse](clickhouse.md) and [MCP](mcp.md). MySQL writes are counted
+before commit and journalled from the binlog; see
+[MySQL and MariaDB](mysql.md).
 
 ## Key concepts
 

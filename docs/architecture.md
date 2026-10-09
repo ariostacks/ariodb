@@ -3,7 +3,7 @@
 This page is for contributors and for operators who want to know how
 ariodb works inside. It maps every source file to its job, follows a
 statement through the Postgres wire proxy (simple and extended protocol),
-the ClickHouse paths and the MCP server, and then covers the decision
+the ClickHouse and MySQL paths and the MCP server, and then covers the decision
 layer, approvals, the journal, undo, the decisions log, ariodb's own store,
 the dashboard, plugins and model providers. It ends with the tests and how
 to run them. Read the [overview](overview.md) first for the vocabulary.
@@ -21,15 +21,18 @@ flowchart LR
         PG[psql or a Postgres driver]
         CHH[ClickHouse HTTP client]
         CHN[clickhouse-client]
+        MYC[mysql or a MySQL driver]
         MCPC[MCP client]
     end
     subgraph serve ["ariodb serve"]
         PX[proxy.rs + exec.rs]
         CH[clickhouse.rs]
         CN[clickhouse_native.rs]
+        MX["mysql_proxy.rs<br/>mysql_wire.rs"]
         G["gate.rs<br/>policy, rules, approvals"]
         DASH["dashboard.rs<br/>dashboard_api.rs"]
         J[journal.rs]
+        MJ[mysql_journal.rs]
         PL[plugins.rs]
         TN[tunnels.rs]
     end
@@ -37,14 +40,18 @@ flowchart LR
     PG --> PX
     CHH --> CH
     CHN --> CN
+    MYC --> MX
     MCPC --> MCP
-    PX & CH & CN & MCP --> G
+    PX & CH & CN & MX & MCP --> G
     G --> ST[("state directory<br/>ariodb.db, journal.jsonl,<br/>secrets.json")]
     DASH --> ST
     PX --> DB[(Postgres)]
     J -->|replication slot| DB
     J --> ST
     CH & CN --> CKH[(ClickHouse)]
+    MX --> MYDB[(MySQL or MariaDB)]
+    MJ -->|binlog| MYDB
+    MJ --> ST
 ```
 
 Processes coordinate through the state directory, not through each other:
@@ -59,10 +66,10 @@ Each file in [`src/`](../src) and its job.
 
 | File | Job |
 |---|---|
-| [`main.rs`](../src/main.rs) | The command line (clap), and `serve`: starts tunnels, plugins, the config watcher, decisions-log pruning, the ClickHouse listeners, the dashboard, the journal and the Postgres proxy, and stops them on Ctrl-C or `SIGTERM`. |
-| [`config.rs`](../src/config.rs) | Reads and validates `ariodb.toml`, and resolves secrets: database URLs, credentials, agent tokens, connection targets through tunnels. |
+| [`main.rs`](../src/main.rs) | The command line (clap), and `serve`: starts tunnels, plugins, the config watcher, decisions-log pruning, the ClickHouse listeners, the dashboard, the MySQL listener and journal, the Postgres journal and the Postgres proxy, and stops them on Ctrl-C or `SIGTERM`. `sessions` and `undo` read both journals and hand a MySQL session to `mysql_undo`. |
+| [`config.rs`](../src/config.rs) | Reads and validates `ariodb.toml`, and resolves secrets: database URLs, credentials, agent tokens, connection targets through tunnels. The `[mysql]` section and `[agents.mysql]` (an `EngineAccess`, shared with ClickHouse) live here, with the `mysql_*` helpers for its passwords, the journal login, the address to dial, the TLS mode and the listener's TLS, and `engine_agent`, which checks a token and swaps in an agent's access for another engine. |
 | [`secrets.rs`](../src/secrets.rs) | The encrypted secret store (`secrets.json`), XChaCha20-Poly1305 under a key from `ARIODB_MASTER_KEY` or `master.key`; also creates the state directory `0700`. |
-| [`doctor.rs`](../src/doctor.rs) | `ariodb doctor`: per-login checks (TLS, read-only enforcement, write measurement, session tagging, table grants) and journal checks (`wal_level`, slot, publication, replica identity, stream). Also run once at startup for the summary line. |
+| [`doctor.rs`](../src/doctor.rs) | `ariodb doctor`: per-login checks (TLS, read-only enforcement, write measurement, session tagging, table grants) and journal checks (`wal_level`, slot, publication, replica identity, stream), and the MySQL gateway checks (TLS, table-name case, `READ ONLY`, tagging, InnoDB's row count, tables). Also run once at startup for the summary line. |
 | [`testing.rs`](../src/testing.rs) | `ariodb explain`, `ariodb test` and the dashboard's explain: judge a statement against the policy and before-stage rules without running it; load and replay fixtures. |
 
 **Understanding SQL and deciding**
@@ -124,7 +131,16 @@ Each file in [`src/`](../src) and its job.
 | [`proptests.rs`](../src/proptests.rs) | Property tests for the classifiers, the replication decoder and the wire reader. Compiled only for `cargo test`. |
 | [`tests/sim_undo.rs`](../tests/sim_undo.rs) | A seeded random workload for undo against a real database, driven by `scripts/sim-undo.sh`. |
 
-<!-- TODO: src/mysql_proxy.rs, src/mysql_sql.rs, src/mysql_journal.rs and src/mysql_undo.rs (MySQL and MariaDB support), and the [mysql] config section in config.rs, once merged. -->
+**MySQL and MariaDB**
+
+| File | Job |
+|---|---|
+| [`mysql_proxy.rs`](../src/mysql_proxy.rs) | The listener agents connect to: the handshake and token check, one server connection per agent, the per-command loop (queries, prepared statements, `KILL`, refused commands), reserved tables, ariodb's own transactions, holding a write's reply, and counting its rows from `innodb_trx`. |
+| [`mysql_wire.rs`](../src/mysql_wire.rs) | The MySQL client/server protocol: packets, the handshake both ways, `caching_sha2_password` and `mysql_native_password` scrambles (and RSA for full authentication), following a reply to its end, and ariodb's own login to the server. |
+| [`mysql_sql.rs`](../src/mysql_sql.rs) | MySQL SQL: a lexer that reads comments, strings and quoted names as the server does, cross-checked against sqlparser's MySQL dialect; kind, tables, functions and settings, scoped to `[mysql] database`. When in doubt, `Unknown`. |
+| [`mysql_journal.rs`](../src/mysql_journal.rs) | `ariodb setup` and `doctor` for the binlog side, and the MySQL journal: read the binlog as a replica, tie transactions to sessions through the tag table, append to `mysql-journal.jsonl`, then save the position; prune old tags. |
+| [`mysql_binlog.rs`](../src/mysql_binlog.rs) | Turning binlog row events into journal changes: column names from the binlog or `information_schema`, and every value recorded as text undo can turn back into the same value. |
+| [`mysql_undo.rs`](../src/mysql_undo.rs) | Undo of a MySQL session: plan one step per row, find conflicts in the journal and the live rows, and apply in one tagged transaction with savepoints, foreign-key retries and cascade checks. |
 
 ## A statement through the Postgres proxy
 
@@ -308,6 +324,45 @@ decoded to be relayed safely.
 <!-- TODO: ClickHouse native INSERT, once merged (today it is refused). -->
 
 See [ClickHouse](clickhouse.md) for configuration.
+
+## The MySQL path
+
+[`mysql_proxy::serve`](../src/mysql_proxy.rs) listens on
+`[mysql] listen` and handles each agent connection:
+
+1. **Handshake.** ariodb sends its own handshake (the server's version, a
+   connection id of its own, TLS if configured), checks the agent's
+   `caching_sha2_password` or `mysql_native_password` scramble against the
+   token, and requires an `[agents.mysql]` block and, if a database is
+   named, `[mysql] database`. Only then does it log in to the server as
+   `[mysql] user`, with the agent's reply-shaping capabilities and a safe
+   character set, and set the session's `sql_mode` and time limits.
+2. **Commands.** A reader task watches the agent's socket throughout, so a
+   disconnect is noticed while a statement waits for approval. Each
+   `COM_QUERY` and `COM_STMT_PREPARE` is classified by
+   [`mysql_sql.rs`](../src/mysql_sql.rs), scoped to the database, checked
+   for reserved tables and for more than one statement, and judged by
+   `gate::check_detailed`; prepares are judged without approvals, and every
+   execute is judged in full. `KILL` is answered by ariodb, for the agent's
+   own connections only.
+3. **Running.** A read runs inside `START TRANSACTION READ ONLY` and its
+   reply is relayed packet by packet as it arrives. A write runs inside
+   `START TRANSACTION WITH CONSISTENT SNAPSHOT`, after a tag row in
+   `[mysql] tag_table`; its reply is held while ariodb reads
+   `trx_rows_modified` from `information_schema.innodb_trx` (spaced
+   110 ms apart across connections, with a per-read marker that proves the
+   list is fresh), then `gate::judge_write` judges the larger of that count
+   and the reported one, with the tables the statement names. A pass
+   commits and releases the reply; anything else rolls back.
+
+The MySQL journal ([`mysql_journal.rs`](../src/mysql_journal.rs)) reads
+the binlog with `[mysql] server_id`, keeps a transaction's changes under
+the session its first-row tag names (and changes to protected tables by
+anyone, without a session), appends whole transactions to
+`mysql-journal.jsonl` and only then saves its position to
+`mysql-binlog-position.json`. [`mysql_undo.rs`](../src/mysql_undo.rs)
+plans and applies undo from that file with the journal login. See
+[MySQL and MariaDB](mysql.md).
 
 ## The decision layer
 
@@ -566,6 +621,10 @@ ariodb with real clients. Build first (`cargo build`):
 PG_IMAGE=postgres:18 ./scripts/e2e.sh  # another Postgres or Postgres-based image
 ./scripts/e2e-compat.sh cockroach      # YugabyteDB (yugabyte) or CockroachDB (cockroach)
 ./scripts/e2e-clickhouse.sh            # ClickHouse over HTTP and the native protocol
+./scripts/e2e-mysql.sh                 # MySQL 8.4 through the MySQL listener
+MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql.sh           # the same against MariaDB
+./scripts/e2e-mysql-journal.sh         # MySQL setup, doctor, the binlog journal and undo
+MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql-journal.sh
 ./scripts/e2e-plugins.sh               # the example plugin, and a broken one
 ./scripts/sim-undo.sh                  # seeded random agent and human writes, then undo
 SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh
@@ -578,6 +637,10 @@ Helpers used by the scripts:
   else's statement, a batch that fails half way).
 - [`scripts/pg_cancel.py`](../scripts/pg_cancel.py): sends a query and
   cancels it from a second connection, as `psql` does on Ctrl-C.
+- [`scripts/mysql_raw.py`](../scripts/mysql_raw.py): a minimal MySQL
+  client for what the `mysql` client does not send: prepared statements
+  with parameters, `mysql_native_password` logins, `COM_RESET_CONNECTION`,
+  and a query cancelled with `KILL QUERY` from a second connection.
 - [`scripts/mock_services.py`](../scripts/mock_services.py): local stand-ins
   for Slack, a webhook receiver and the model providers' APIs, which check
   what ariodb sends.
