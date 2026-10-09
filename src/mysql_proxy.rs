@@ -240,7 +240,7 @@ async fn handle(
         sha2,
     } = login;
     let config = state.config();
-    let up = match connect_upstream(&config, caps & w::RELAYED_CAPS, charset).await {
+    let up = match connect_upstream(&config, caps & w::RELAYED_CAPS, w::safe_collation(charset)).await {
         Ok(up) => up,
         Err(e) => {
             let msg = format!("ariodb: cannot connect to MySQL: {e}");

@@ -566,6 +566,23 @@ pub fn rsa_encrypt_password(password: &[u8], nonce: &[u8], pem: &[u8]) -> Result
     Ok(out)
 }
 
+/// The collation to log in upstream with: the agent's, when its character
+/// set is one in which a quote or backslash byte is always that character
+/// (utf8mb4, utf8mb3, latin1, ascii, binary), so the server splits
+/// statements where ariodb's parser does. In GBK or Shift-JIS a backslash
+/// can be the second byte of a character. Anything else becomes
+/// utf8mb4_general_ci, which MySQL and MariaDB both know.
+pub fn safe_collation(id: u8) -> u8 {
+    match id {
+        5 | 8 | 15 | 31 | 47 | 48 | 49 | 94 // latin1
+        | 11 | 65 // ascii
+        | 63 // binary
+        | 33 | 76 | 83 | 192..=215 | 223 // utf8mb3
+        | 45 | 46 | 224..=247 | 255 => id, // utf8mb4
+        _ => 45,
+    }
+}
+
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -1152,6 +1169,20 @@ mod tests {
         p.extend_from_slice(&[0, 0, 0]);
         assert_eq!(prepare_ok_tail(&p, false).unwrap(), (7, 2, 1, 5));
         assert_eq!(prepare_ok_tail(&p, true).unwrap(), (7, 2, 1, 3));
+    }
+
+    #[test]
+    fn multibyte_character_sets_are_not_passed_upstream() {
+        assert_eq!(safe_collation(255), 255); // utf8mb4_0900_ai_ci
+        assert_eq!(safe_collation(45), 45);
+        assert_eq!(safe_collation(33), 33); // utf8mb3
+        assert_eq!(safe_collation(8), 8); // latin1
+        assert_eq!(safe_collation(63), 63); // binary
+        assert_eq!(safe_collation(28), 45); // gbk
+        assert_eq!(safe_collation(13), 45); // sjis
+        assert_eq!(safe_collation(1), 45); // big5
+        assert_eq!(safe_collation(95), 45); // cp932
+        assert_eq!(safe_collation(248), 45); // gb18030
     }
 
     #[test]

@@ -48,7 +48,7 @@ docker run -d --name "$MY" -e MYSQL_ROOT_PASSWORD=local-test-only-pw -e MYSQL_DA
 admin() {
   local out code=0
   out=$(docker exec -i "$MY" $CLIENT -h127.0.0.1 -uroot -plocal-test-only-pw "$@" 2>&1) || code=$?
-  grep -v 'Using a password' <<<"$out" || true
+  [ -z "$out" ] || grep -v 'Using a password' <<<"$out" || true
   return $code
 }
 ok=0
@@ -204,10 +204,15 @@ expect "mysql_native_password login works too" "ROW 1000" "$(raw coding-agent $T
 echo "reads"
 expect "several rows stream back" "Customer 50" "$(agent coding-agent $T "SELECT name FROM customers ORDER BY id")"
 expect "read-only agent reads" "paid" "$(agent support-bot $B "SELECT status FROM orders WHERE id = 1")"
+# In GBK a backslash can end a character, so the server would read quotes
+# differently from ariodb's parser: the session is utf8mb4 whatever the client asks.
+expect "a multibyte client character set is not passed on" "utf8mb4" "$(agent coding-agent $T "SELECT @@character_set_client" "${PLAIN[@]}" --default-character-set=gbk)"
 expect "other tables refused" "may not use table 'secrets'" "$(agent coding-agent $T "SELECT * FROM secrets")"
 expect "joins are checked" "may not use table 'secrets'" "$(agent coding-agent $T "SELECT o.id FROM orders o JOIN secrets s ON s.id = o.id")"
 expect "other databases refused" "may not use table 'other.notes'" "$(agent coding-agent $T "SELECT * FROM other.notes")"
-expect "USE of another database refused" "ariodb: " "$(agent coding-agent $T "USE other")"
+# The client sends USE as COM_INIT_DB; as SQL, the classifier refuses it.
+expect "USE of another database refused" "may only use database 'app'" "$(agent coding-agent $T "USE other")"
+expect "USE as SQL refused" "agents stay in the database" "$(raw coding-agent $T "Q:USE other")"
 
 echo "writes"
 expect "read-only agent cannot write" "is read only" "$(agent support-bot $B "UPDATE orders SET status = 'x' WHERE id = 1")"
@@ -216,8 +221,8 @@ expect "TRUNCATE refused" "destructive" "$(agent coding-agent $T "TRUNCATE TABLE
 expect "DELETE without WHERE refused" "destructive" "$(agent coding-agent $T "DELETE FROM orders")"
 expect "BEGIN refused" "ariodb runs every statement in its own transaction" "$(agent coding-agent $T "BEGIN")"
 expect "COMMIT refused" "ariodb runs every statement in its own transaction" "$(agent coding-agent $T "COMMIT")"
-expect "autocommit cannot be switched off" "ariodb: " "$(agent coding-agent $T "SET autocommit = 0")"
-expect "LOCK TABLES refused" "ariodb: " "$(agent coding-agent $T "LOCK TABLES orders WRITE")"
+expect "autocommit cannot be switched off" "its own transaction" "$(agent coding-agent $T "SET autocommit = 0")"
+expect "LOCK TABLES refused" "its own transaction" "$(agent coding-agent $T "LOCK TABLES orders WRITE")"
 BEFORE=$(tags)
 expect_not "a write within the limit commits" "ERROR" "$(agent coding-agent $T "UPDATE orders SET status = 'shipped' WHERE id = 5")"
 expect "and changed the row" "shipped" "$(q "SELECT status FROM orders WHERE id = 5")"
@@ -236,7 +241,7 @@ expect "nor did the trigger" "0" "$(q "SELECT COUNT(*) FROM order_log")"
 expect_not "a small triggered write commits" "ERROR" "$(agent coding-agent $T "UPDATE orders SET status = 'audited' WHERE id <= 5")"
 expect "with its trigger's rows" "15" "$(q "SELECT COUNT(*) FROM order_log")"
 expect "two statements in one query refused" "one statement at a time" "$(raw coding-agent $T "Q:SELECT 1; DELETE FROM orders WHERE id = 1")"
-expect "LOAD DATA LOCAL refused" "ariodb: " "$(agent coding-agent $T "LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE orders" "${PLAIN[@]}" --local-infile=1)"
+expect "LOAD DATA LOCAL refused" "LOAD reads a file" "$(agent coding-agent $T "LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE orders" "${PLAIN[@]}" --local-infile=1)"
 expect "rules apply to MySQL" "marked statements are refused on MySQL" "$(agent coding-agent $T "SELECT 'blocked-marker' FROM orders LIMIT 1")"
 expect "KILL of another agent's connection refused" "unknown thread id" "$(agent support-bot $B "KILL QUERY 1")"
 expect "the connection keeps working after a refusal" "ROW 1000" "$(raw coding-agent $T "Q:SELECT * FROM secrets" "Q:SELECT COUNT(*) FROM orders")"
