@@ -214,6 +214,54 @@ expect "an insert into another table is refused over native" "may not use table 
 expect "INSERT ... SELECT is refused over native" "only INSERT ... VALUES and INSERT ... FORMAT" "$(cli loader $L "INSERT INTO loads SELECT number, 'x', 'select' FROM numbers(1000)")"
 expect "  and nothing landed" "0" "$(landed select)"
 expect "external tables are still refused" "external tables are not supported" "$(cli_in analyst $A "SELECT count() FROM events WHERE id IN ext" "1" --external --file=- --name=ext --structure='id UInt32')"
+# clickhouse-client keeps rows out of the query text, but a client may send
+# them there: ClickHouse inserts whatever follows the first newline after
+# FORMAT, blank lines and Unicode spaces included, before any data block.
+raw_native() { # raw_native <agent> <token> <sql>: send the query text as given
+  python3 - "$PROXY_NATIVE" "$1" "$2" "$3" <<'PY3'
+import socket, sys, time
+port, user, password, sql = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+def varint(n):
+    out = bytearray()
+    while True:
+        b, n = n & 0x7f, n >> 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+def s(x):
+    x = x.encode()
+    return varint(len(x)) + x
+REV = 54429  # settings as strings; no addendum
+sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+sock.sendall(varint(0) + s("raw") + varint(24) + varint(10) + varint(REV) + s("default") + s(user) + s(password))
+time.sleep(0.3)
+sock.recv(65536)  # the server's Hello
+client_info = bytes([1]) + s("") + s("") + s("0.0.0.0:0") + bytes([1]) + s("") + s("") + s("raw")
+client_info += varint(24) + varint(10) + varint(REV) + s("") + varint(0)
+query = varint(1) + s("") + client_info + s("") + varint(2) + varint(0) + s(sql)
+empty = varint(2) + s("") + bytes([1, 0, 2, 0xff, 0xff, 0xff, 0xff, 0]) + varint(0) + varint(0)
+sock.sendall(query + empty)
+time.sleep(0.5)
+try:
+    sock.sendall(empty)
+except OSError:
+    pass
+reply = b""
+try:
+    while chunk := sock.recv(65536):
+        reply += chunk
+except OSError:
+    pass
+print(reply.decode("utf-8", "replace"))
+PY3
+}
+blank() { admin "SELECT count() FROM loads WHERE kind = ''"; }
+expect "rows in the query text after FORMAT are refused (blank lines)" "only INSERT ... VALUES and INSERT ... FORMAT" \
+  "$(raw_native loader $L "$(printf 'INSERT INTO loads (user) FORMAT TSV\n'; python3 -c 'print("\n" * 80 + " ", end="")')")" # $() drops trailing newlines
+expect "  and nothing landed" "0" "$(blank)"
+expect "rows in the query text after FORMAT are refused (Unicode spaces)" "only INSERT ... VALUES and INSERT ... FORMAT" \
+  "$(raw_native loader $L "$(printf 'INSERT INTO loads (user) FORMAT TSV\n'; python3 -c 'print("\u00a0\n" * 80, end="")')")"
+expect "  and nothing landed" "0" "$(blank)"
 expect "native insert decisions are logged" "decisions log intact" "$($BIN "${CFG[@]}" audit)"
 
 echo "recorded decisions as tests"

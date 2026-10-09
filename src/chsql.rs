@@ -549,16 +549,29 @@ pub fn insert_from_client(sql: &str) -> Result<(), String> {
         }
         i = j + 1;
     }
-    let end = match word(i) {
-        Some((w, j)) if w == "values" => j,
+    // Nothing may follow, not even a comment: ClickHouse would read it as
+    // rows. After VALUES it skips ASCII whitespace before the rows; after a
+    // format name, spaces and one line break, and everything after that is
+    // rows, blank lines included. Unicode spaces are rows to ClickHouse too.
+    let rest = match word(i) {
+        Some((w, j)) if w == "values" => {
+            let rest = &b[j..];
+            &rest[rest.iter().take_while(|c| c.is_ascii_whitespace()).count()..]
+        }
         Some((w, j)) if w == "format" => match word(j) {
-            Some((_, k)) => k,
+            Some((_, k)) => {
+                let mut rest = &b[k..];
+                while let [b' ' | b'\t' | b'\x0c', tail @ ..] = rest {
+                    rest = tail;
+                }
+                let rest = rest.strip_prefix(b"\r").unwrap_or(rest);
+                rest.strip_prefix(b"\n").unwrap_or(rest)
+            }
             None => return refuse(),
         },
         _ => return refuse(),
     };
-    // Nothing may follow, not even a comment: ClickHouse would read it as rows.
-    if !sql[end.min(sql.len())..].trim().is_empty() {
+    if !rest.is_empty() {
         return refuse();
     }
     Ok(())
@@ -721,6 +734,8 @@ mod tests {
             "insert into TABLE db.`my events` (id, `user`) values  ",
             "/* load */ INSERT INTO events (a, b) FORMAT CSV",
             "INSERT INTO events FORMAT JSONEachRow\n",
+            "INSERT INTO events FORMAT CSV \t\r\n",
+            "INSERT INTO events VALUES\n\n  \r\n",
         ] {
             assert_eq!(insert_from_client(ok), Ok(()), "{ok}");
         }
@@ -731,6 +746,12 @@ mod tests {
             "INSERT INTO events FORMAT CSV 1,a,b",
             "INSERT INTO events FORMAT CSV\n/*\n1,a,b\n2,c,d\n*/",
             "INSERT INTO events FORMAT CSV -- 1,a,b",
+            // Blank or space-only lines are rows to formats such as TSV.
+            "INSERT INTO events FORMAT TSV\n\n\n",
+            "INSERT INTO events FORMAT TSV\n \n",
+            "INSERT INTO events FORMAT TSV\n\u{a0}\n\u{a0}",
+            "INSERT INTO events FORMAT TSV \u{3000}",
+            "INSERT INTO events VALUES \u{a0}",
             "INSERT INTO events SETTINGS async_insert = 1 VALUES",
             "INSERT INTO events FROM INFILE '/etc/passwd' FORMAT CSV",
             "INSERT INTO FUNCTION numbers(1) VALUES",
