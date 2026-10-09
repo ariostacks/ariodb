@@ -42,6 +42,7 @@ const AUDIT_BATCH_BYTES: usize = 4 << 20;
 const AUDIT_POLL: Duration = Duration::from_millis(500);
 /// The most text kept from a plugin's note, error message or log line.
 const MAX_TEXT: usize = 1_000;
+/// The most facts answers kept per plugin (with `facts_cache_ms`).
 const FACTS_CACHE_SWEEP: usize = 1_000;
 /// Restart delays, as for tunnels: 1 s doubling to 30 s, reset by a
 /// minute's good running.
@@ -340,46 +341,53 @@ fn clean(text: &str, max: usize) -> String {
 #[derive(Debug, PartialEq)]
 enum Frame {
     Line(Vec<u8>),
-    /// The line was longer than the cap; it was read and thrown away.
+    /// The line is longer than the cap. What was read of it is thrown
+    /// away; the rest is still unread (see `skip_line`).
     TooLong,
 }
 
 /// Read one newline-terminated line, holding at most `cap` bytes of it in
-/// memory however long it is. `None` at the end of the stream.
+/// memory. Returns as soon as a line passes the cap, so a line that never
+/// ends cannot keep the caller waiting. `None` at the end of the stream.
 async fn read_frame<R: AsyncBufRead + Unpin>(
     r: &mut R,
     cap: usize,
 ) -> std::io::Result<Option<Frame>> {
     let mut buf = Vec::new();
-    let mut too_long = false;
     loop {
         let available = r.fill_buf().await?;
         if available.is_empty() {
-            return Ok(match (too_long, buf.is_empty()) {
-                (true, _) => Some(Frame::TooLong),
-                (false, true) => None,
-                (false, false) => Some(Frame::Line(buf)),
-            });
+            return Ok((!buf.is_empty()).then_some(Frame::Line(buf)));
         }
         let newline = available.iter().position(|b| *b == b'\n');
         let take = newline.unwrap_or(available.len());
-        if !too_long {
-            if buf.len() + take > cap {
-                too_long = true;
-                buf = Vec::new();
-            } else {
-                buf.extend_from_slice(&available[..take]);
-            }
+        if buf.len() + take > cap {
+            r.consume(take);
+            return Ok(Some(Frame::TooLong));
         }
+        buf.extend_from_slice(&available[..take]);
         r.consume(newline.map_or(take, |i| i + 1));
         if newline.is_some() {
-            if too_long {
-                return Ok(Some(Frame::TooLong));
-            }
             if buf.last() == Some(&b'\r') {
                 buf.pop();
             }
             return Ok(Some(Frame::Line(buf)));
+        }
+    }
+}
+
+/// Discard the rest of the current line, without holding any of it.
+async fn skip_line<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<()> {
+    loop {
+        let available = r.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let newline = available.iter().position(|b| *b == b'\n');
+        let used = newline.map_or(available.len(), |i| i + 1);
+        r.consume(used);
+        if newline.is_some() {
+            return Ok(());
         }
     }
 }
@@ -619,6 +627,9 @@ async fn write_loop(mut stdin: ChildStdin, mut outgoing: mpsc::Receiver<Out>) {
     // Dropping stdin closes it: the plugin sees the end of its input.
 }
 
+/// Why a plugin's output ended when it simply closed it.
+const CLOSED: &str = "closed its output";
+
 /// Read the plugin's output, handing each answer to whoever is waiting
 /// for it. Answers to requests nobody is waiting for (late, or never asked)
 /// are dropped, so an answer can only ever decide the request it names.
@@ -630,7 +641,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
 ) -> String {
     let why = loop {
         let line = match read_frame(&mut stdout, MAX_LINE).await {
-            Ok(None) => break "closed its output".to_string(),
+            Ok(None) => break CLOSED.to_string(),
             Err(e) => break format!("could not be read: {e}"),
             Ok(Some(Frame::TooLong)) => break format!("sent a line longer than {MAX_LINE} bytes"),
             Ok(Some(Frame::Line(line))) => line,
@@ -683,7 +694,10 @@ async fn relay_stderr<R: AsyncRead + Unpin>(name: String, from: R) {
                 )
             }
             Frame::TooLong => {
-                eprintln!("plugin {name}: (a line over {MAX_LINE} bytes was dropped)")
+                eprintln!("plugin {name}: (a line over {MAX_LINE} bytes was dropped)");
+                if skip_line(&mut from).await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -717,7 +731,7 @@ struct Plugin {
     /// The event delivery task holds an event it has not yet written.
     event_in_hand: AtomicBool,
     dropped: AtomicU64,
-    facts_cache: Mutex<HashMap<String, (Instant, Value)>>,
+    facts_cache: Mutex<FactsCache>,
 }
 
 enum Approved {
@@ -832,11 +846,12 @@ impl Plugin {
             return Err("the answer to facts must be a JSON object".to_string());
         }
         if !ttl.is_zero() {
-            let mut cache = self.facts_cache.lock().expect("cache");
-            if cache.len() >= FACTS_CACHE_SWEEP {
-                cache.retain(|_, (at, _)| at.elapsed() < ttl);
-            }
-            cache.insert(key, (Instant::now(), facts.clone()));
+            remember(
+                &mut self.facts_cache.lock().expect("cache"),
+                key,
+                facts.clone(),
+                ttl,
+            );
         }
         Ok(facts)
     }
@@ -867,6 +882,28 @@ impl Plugin {
             && s.declared.as_ref().is_none_or(|h| h.capabilities.notifier);
         waiting && able
     }
+}
+
+type FactsCache = HashMap<String, (Instant, Value)>;
+
+/// Keep a facts answer. Agents choose their statements, so every distinct
+/// one is a new key: the cache never holds more than FACTS_CACHE_SWEEP
+/// answers, dropping expired ones first and then the oldest.
+fn remember(cache: &mut FactsCache, key: String, facts: Value, ttl: Duration) {
+    if cache.len() >= FACTS_CACHE_SWEEP {
+        cache.retain(|_, (at, _)| at.elapsed() < ttl);
+    }
+    while cache.len() >= FACTS_CACHE_SWEEP {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => cache.remove(&k),
+            None => break,
+        };
+    }
+    cache.insert(key, (Instant::now(), facts));
 }
 
 /// The plugins one ariodb process runs.
@@ -1035,9 +1072,12 @@ async fn supervise(plugin: Arc<Plugin>, state_dir: PathBuf, mut stop: watch::Rec
                     },
                     r = &mut session.reader => {
                         let why = r.unwrap_or_else(|e| e.to_string());
-                        // Output usually ends because the process did: say how.
-                        match tokio::time::timeout(Duration::from_millis(500), session.child.wait()).await {
-                            Ok(Ok(status)) => crate::tunnels::describe(status),
+                        // Output usually ends because the process did: say
+                        // how. A protocol error is the reason, though, even
+                        // if the plugin then dies of the closed pipe.
+                        let exited = tokio::time::timeout(Duration::from_millis(500), session.child.wait()).await;
+                        match exited {
+                            Ok(Ok(status)) if why == CLOSED => crate::tunnels::describe(status),
                             _ => why,
                         }
                     }
@@ -1496,7 +1536,11 @@ mod tests {
     async fn frames(input: &[u8], cap: usize) -> Vec<Frame> {
         let mut r = BufReader::with_capacity(4, input);
         let mut out = Vec::new();
+        // As the stderr relay does: after a long line, skip the rest of it.
         while let Some(f) = read_frame(&mut r, cap).await.unwrap() {
+            if f == Frame::TooLong {
+                skip_line(&mut r).await.unwrap();
+            }
             out.push(f);
         }
         out
@@ -1509,8 +1553,9 @@ mod tests {
             frames(b"{\"a\":1}\n{\"b\":2}\r\n\nlast", 64).await,
             vec![line("{\"a\":1}"), line("{\"b\":2}"), line(""), line("last")]
         );
-        // A line over the cap is read through and reported, and the next
-        // line is read normally: memory never holds more than the cap.
+        // A line over the cap is reported once it passes the cap; after
+        // skipping the rest, the next line is read normally. Memory never
+        // holds more than the cap.
         assert_eq!(
             frames(b"0123456789abcdef\nok\n", 8).await,
             vec![Frame::TooLong, line("ok")]
@@ -1801,6 +1846,137 @@ for line in sys.stdin:
             "plugin outlived stop"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_endless_line_ends_the_session_at_the_cap() {
+        // A plugin stuck writing one line that never ends is a protocol
+        // error as soon as the line passes the cap, so it is restarted
+        // rather than left wedged with every call timing out.
+        let (mut w, r) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            let chunk = vec![b'x'; 64 * 1024];
+            while w.write_all(&chunk).await.is_ok() {}
+        });
+        let (outbox, _rx) = mpsc::channel(4);
+        let read = read_loop("t".into(), BufReader::new(r), Pending::default(), outbox);
+        let why = tokio::time::timeout(Duration::from_secs(5), read).await;
+        writer.abort();
+        assert!(why.expect("still reading").contains("longer than"));
+    }
+
+    #[test]
+    fn the_facts_cache_stays_bounded() {
+        // Every distinct statement is a new key, and agents choose their
+        // statements: however many arrive within the TTL, the cache holds
+        // at most FACTS_CACHE_SWEEP answers.
+        let mut cache = HashMap::new();
+        let ttl = Duration::from_secs(600);
+        for i in 0..FACTS_CACHE_SWEEP * 3 {
+            remember(&mut cache, format!("k{i}"), json!({}), ttl);
+            assert!(cache.len() <= FACTS_CACHE_SWEEP, "{} entries", cache.len());
+        }
+        // The newest answer is always kept.
+        assert!(cache.contains_key(&format!("k{}", FACTS_CACHE_SWEEP * 3 - 1)));
+    }
+
+    /// Approval events honour `[audit] redact_literals`, as statement events do.
+    #[tokio::test]
+    async fn approval_events_are_redacted_like_the_decisions_log() {
+        if !have_python() {
+            eprintln!("skipped: python3 is not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ariodb-plugins-ev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("notifier.py");
+        std::fs::write(
+            &script,
+            r#"
+import json, os, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "event":
+        with open(os.environ["EVENTS"], "a") as f:
+            f.write(json.dumps(msg["params"]) + "\n")
+        continue
+    if msg["method"] == "initialize":
+        result = {"name": "n", "version": "0", "capabilities": {"approver": True, "notifier": True}}
+    else:
+        result = {"verdict": "allow"}
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let events = dir.join("events.jsonl");
+        let toml = format!(
+            r#"
+            [database]
+            url = "postgres://localhost/app"
+            [journal]
+            dir = "{dir}"
+            [audit]
+            redact_literals = true
+            [[agents]]
+            name = "bot"
+            access = "read_write"
+            tables = ["t"]
+            token_env = "ARIODB_TOKEN_TEST"
+            [[plugins]]
+            name = "n"
+            command = ["python3", "-I", "{script}"]
+            env = {{ EVENTS = "{events}" }}
+            [[approvers]]
+            name = "np"
+            type = "plugin"
+            plugin = "n"
+            timeout_seconds = 5
+            "#,
+            dir = dir.display(),
+            script = script.display(),
+            events = events.display(),
+        );
+        let config = crate::config::Config::from_toml(&toml).unwrap();
+        let audit = Arc::new(crate::audit::AuditLog::open(&dir, &config.audit).unwrap());
+        let host = Host::start(&config.plugins, &dir, Roles { audit_sink: false });
+        host.settle(Duration::from_secs(10)).await;
+        install(host.clone());
+        let state = State::new(
+            crate::config::Config::from_toml(&toml).unwrap(),
+            dir.join("ariodb.toml"),
+            audit,
+        )
+        .unwrap();
+        let statements =
+            crate::classify::classify("UPDATE t SET card = 'not-a-real-card-4242' WHERE id = 7")
+                .unwrap();
+        let ctx = Ctx {
+            agent: &config.agents[0],
+            session: "s-test",
+            database: "app",
+            live: None,
+        };
+        let need = ApprovalNeed {
+            rule: "r".into(),
+            approvers: vec!["np".into()],
+            reason: "held".into(),
+        };
+        let verdict = crate::approvals::require(&state, &ctx, &statements, &need).await;
+        let mut text = String::new();
+        for _ in 0..100 {
+            text = std::fs::read_to_string(&events).unwrap_or_default();
+            if text.contains("approval_decided") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        uninstall();
+        host.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(text.contains("approval_requested"), "{text}");
+        assert!(!text.contains("not-a-real-card-4242"), "{text}");
     }
 
     #[test]

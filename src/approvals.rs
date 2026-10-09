@@ -179,6 +179,12 @@ pub async fn require(
                 format!("approver '{name}' is not defined"),
             ));
         };
+        // Notifiers get the statement as the decisions log stores it.
+        let stored = statements
+            .iter()
+            .map(|s| crate::audit::stored_sql(&s.sql, config.audit.redact_literals))
+            .collect::<Vec<_>>()
+            .join("; ");
         let event = json!({
             "rule": need.rule,
             "approver": approver.name,
@@ -186,7 +192,7 @@ pub async fn require(
             "agent": ctx.agent.name,
             "session": ctx.session,
             "database": ctx.database,
-            "sql": sql,
+            "sql": stored,
             "reason": need.reason,
         });
         crate::plugins::notify("approval_requested", event.clone());

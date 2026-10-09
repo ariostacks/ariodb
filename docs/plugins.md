@@ -226,7 +226,8 @@ Answer with a JSON object; rules read its keys as `plugin.<name>.<key>`
   that reads this plugin's facts cannot be evaluated, which, as for any
   rule, refuses the statement. A missing key is an evaluation error too.
 - With `facts_cache_ms`, an answer is reused for an identical request
-  (same agent, session, database and statement) for that long.
+  (same agent, session, database and statement) for that long. At most
+  1,000 answers are kept per plugin; past that the oldest are dropped.
 - Plugin facts are for before-stage rules only; `ariodb check` refuses a
   `stage = "after"` rule that reads them. `ariodb explain` and `ariodb test`
   do not start plugins, so they report such rules as unevaluable (a deny).
@@ -254,8 +255,9 @@ A notification (no `id`, no answer) for each event:
   When the queue is full, new events are dropped and counted; the log says
   how many, and the dashboard shows the count. Events wait in the queue
   while the plugin restarts.
-- `statement_refused` and `write_rolled_back` carry the statement as stored
-  in the decisions log, so `[audit] redact_literals` applies.
+- Every event carries statements as the decisions log stores them, so
+  `[audit] redact_literals` applies to approval events too. (The approver
+  itself, like a person approving in Slack, sees the statement as written.)
 - Delivery is at most once. Use `audit_sink` for a complete record.
 
 ### `audit` (audit_sink)
@@ -345,7 +347,8 @@ variables, described at the top of the file.
   down, starting, slow, crashing, answering with the wrong id, or answering
   anything other than `allow` or `deny`.
 - What ariodb guards against in the protocol: lines are capped at 1 MiB and
-  read without holding more; every message ariodb writes is a single
+  read without holding more (a line that passes the cap restarts the
+  plugin at once, even if it never ends); every message ariodb writes is a single
   serialised JSON value, so agent SQL cannot forge a message; each plugin
   has its own pipes; answers are matched to requests by id; plugin text
   (notes, errors, stderr) has control characters removed before it is

@@ -113,6 +113,7 @@ ln -s "$PWD/examples/plugins/python/ariodb_plugin.py" "$WORK/example_plugin.py"
 #   slow      answers after 4 seconds
 #   crash     exits at once; while $WORK/hold exists, the next start waits
 #             before answering initialize, so the plugin stays down
+#   endless   starts a line on stdout that never ends
 cat > "$WORK/broken.py" <<'PY'
 import json, os, sys, time
 hold = os.environ["BROKEN_HOLD_FILE"]
@@ -132,6 +133,9 @@ for line in sys.stdin:
     sql = " ".join(s["sql"] for s in params.get("statements", []))
     if "crash" in sql:
         os._exit(3)
+    if "endless" in sql:
+        while True:
+            sys.stdout.write("x" * 65536); sys.stdout.flush()
     if "slow" in sql:
         time.sleep(4)
     if "garbage" in sql:
@@ -300,6 +304,14 @@ PLUGINS=$(curl -s -b "$WORK/cj" $D/api/plugins)
 expect "the dashboard API lists plugins" '"name":"example"' "$PLUGINS"
 expect "with their state" '"state":"running"' "$PLUGINS"
 expect "and restarts" '"restarts":1' "$PLUGINS"
+
+echo "endless line"
+expect "a line that never ends refuses at the cap, not at the timeout" "stopped before answering" \
+  "$(agent "SELECT /*ask-broken*/ 'endless'")"
+expect "and restarts the plugin" "plugin 'broken' sent a line longer than 1048576 bytes; restarting it" "$(cat "$WORK/serve.log")"
+broken_is_back_again() { [ "$(running_count broken serve.log)" -ge 3 ]; }
+wait_for "the plugin comes back after the endless line" broken_is_back_again
+expect "and it allows again" "(1 row)" "$(agent "SELECT /*ask-broken*/ 4")"
 
 echo "audit sink"
 decisions() { $BIN "${CFG[@]}" audit | sed -n 's/.*: \([0-9]*\) entries checked/\1/p'; }

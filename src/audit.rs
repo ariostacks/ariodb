@@ -158,11 +158,7 @@ impl AuditLog {
     }
 
     fn try_record(&self, entry: &Entry) -> Result<Decision, String> {
-        let sql = if self.redact {
-            pg_query::normalize(entry.sql).unwrap_or_else(|_| "<unparseable statement>".into())
-        } else {
-            entry.sql.to_string()
-        };
+        let sql = stored_sql(entry.sql, self.redact);
         let d = Decision {
             id: 0,
             at_ms: now_ms() as i64,
@@ -217,6 +213,17 @@ impl AuditLog {
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(d)
+    }
+}
+
+/// A statement as the decisions log stores it: with `redact_literals`,
+/// literal values become placeholders. Events for notifier plugins use it
+/// too, so redaction keeps literals out of them as well.
+pub fn stored_sql(sql: &str, redact: bool) -> String {
+    if redact {
+        pg_query::normalize(sql).unwrap_or_else(|_| "<unparseable statement>".into())
+    } else {
+        sql.to_string()
     }
 }
 
