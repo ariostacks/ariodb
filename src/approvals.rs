@@ -179,6 +179,17 @@ pub async fn require(
                 format!("approver '{name}' is not defined"),
             ));
         };
+        let event = json!({
+            "rule": need.rule,
+            "approver": approver.name,
+            "approver_type": approver.kind,
+            "agent": ctx.agent.name,
+            "session": ctx.session,
+            "database": ctx.database,
+            "sql": sql,
+            "reason": need.reason,
+        });
+        crate::plugins::notify("approval_requested", event.clone());
         let verdict = match approver.kind {
             ApproverKind::Llm => ask_model(state, approver, ctx, statements, need).await,
             ApproverKind::Plugin => {
@@ -186,6 +197,10 @@ pub async fn require(
             }
             _ => ask_person(state, approver, ctx, &sql, need).await,
         };
+        let mut decided = event;
+        decided["verdict"] = json!(if verdict.is_ok() { "allow" } else { "deny" });
+        decided["why"] = json!(verdict.as_ref().err());
+        crate::plugins::notify("approval_decided", decided);
         if let Err(why) = verdict {
             return Err(Refusal::by_rule(
                 &need.rule,

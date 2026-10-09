@@ -193,11 +193,19 @@ pub async fn check_detailed(
             Decision::Allow(Mode::CheckedWrite) => plan = Plan::Write,
             Decision::Allow(Mode::ReadOnly) => {}
         }
-        match rules.evaluate(&Facts {
+        // Plugins are asked only when a rule for this agent reads their facts.
+        let wanted = rules.facts_plugins(&ctx.agent.name);
+        let plugin_facts = if wanted.is_empty() {
+            Default::default()
+        } else {
+            crate::plugins::facts(&wanted, ctx, stmt).await
+        };
+        let facts = Facts {
             agent: ctx.agent,
             statement: stmt,
             database: ctx.database,
-        }) {
+        };
+        match rules.evaluate_with(&facts, &plugin_facts) {
             RuleOutcome::Deny { rule, reason } => return Err(Refusal::by_rule(&rule, reason)),
             RuleOutcome::Approve {
                 rule,

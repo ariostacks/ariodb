@@ -32,6 +32,7 @@ pub fn routes() -> Router<Arc<State>> {
         .route("/api/secrets/{name}", post(set_secret))
         .route("/api/users", get(list_users).post(add_user))
         .route("/api/audit/verify", get(verify_audit))
+        .route("/api/plugins", get(list_plugins))
 }
 
 fn state_dir(state: &State) -> std::path::PathBuf {
@@ -170,6 +171,10 @@ async fn session_undo(
     println!(
         "ariodb: {} undid session {id} from the dashboard ({restored} rows)",
         user.name
+    );
+    crate::plugins::notify(
+        "undo_applied",
+        json!({ "session": id, "rows": restored, "by": format!("dashboard:{}", user.name) }),
     );
     Ok(Json(json!({ "restored": restored })))
 }
@@ -471,6 +476,15 @@ fn cel_string(s: &str) -> String {
 /// A TOML basic string, escaped by the TOML library itself.
 fn toml_string(s: &str) -> String {
     toml::Value::String(s.to_string()).to_string()
+}
+
+/// The plugins `ariodb serve` runs and how each is doing.
+async fn list_plugins(
+    AxState(state): AxState<Arc<State>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_user(&state, &headers)?;
+    Ok(Json(json!({ "plugins": crate::plugins::statuses() })))
 }
 
 async fn list_secrets(

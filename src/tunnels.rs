@@ -373,7 +373,7 @@ async fn wait_ready(
     }
 }
 
-fn describe(status: std::process::ExitStatus) -> String {
+pub(crate) fn describe(status: std::process::ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("exited with status {code}"),
         None => format!("was stopped ({status})"),
@@ -381,7 +381,7 @@ fn describe(status: std::process::ExitStatus) -> String {
 }
 
 /// Ask the tunnel's process group to stop, then insist after five seconds.
-async fn terminate(child: &mut Child) {
+pub(crate) async fn terminate(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         let group = -(pid as i32);
