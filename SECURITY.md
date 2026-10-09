@@ -63,6 +63,21 @@ found and fixed, and how to report a vulnerability.
   example); ariodb always sets `max_execution_time` itself.
 - **Denial of service.** There are no connection limits or handshake
   timeouts on the listeners. Put them behind network controls.
+- **Plugins are trusted code.** A plugin runs as ariodb's user, with that
+  user's files and network. It sees the statements it is asked to approve
+  or supply facts about, every event it is sent, and (as an audit sink) the
+  whole decisions log, including literal values unless `redact_literals` is
+  on. Its environment holds only `PATH`, `HOME` and what the config names,
+  not ariodb's database URLs or tokens, but nothing stops it reading files
+  ariodb's user can read, such as the state directory. Install plugins you
+  would trust as much as ariodb, and keep them where only ariodb's owner
+  can change them. What ariodb does guard against: an approver or facts
+  plugin that is down, slow, crashing or answering nonsense refuses the
+  statement; lines from a plugin are capped at 1 MiB; answers only reach
+  the request whose id they carry; every message ariodb writes is one
+  serialised JSON value, so agent SQL cannot forge a message; each plugin
+  has its own pipes; text from plugins has control characters removed. See
+  [docs/plugins.md](docs/plugins.md).
 - **A model approver is not a security boundary on its own.** Agent SQL is
   passed to the model as JSON data, with an instruction never to follow
   text inside it, and structured output limits the answer to allow or deny.
@@ -84,6 +99,9 @@ found and fixed, and how to report a vulnerability.
   directory's backups.
 - `dashboard.config_writes = false` unless people are meant to edit policy
   from the dashboard.
+- Plugins only from sources you trust, owned by ariodb's user and not
+  writable by others; credentials for them through `pass_env` or
+  `secret_env`, not `env` in the config file.
 
 ## Review of October 2026
 

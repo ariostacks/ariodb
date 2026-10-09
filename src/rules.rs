@@ -14,10 +14,15 @@
 //! | `agent.name`, `agent.access` | string | Who is asking |
 //! | `effects.rows` | int | Rows actually changed (after-stage rules only) |
 //! | `effects.tables` | list | Tables actually changed, including by triggers (after-stage only) |
+//! | `plugin.<name>.<key>` | any | Facts from a `[[plugins]]` entry (before-stage only) |
 //!
 //! Matching: every rule is evaluated. Any matching `deny` wins. Otherwise
 //! the highest-priority matching rule decides between `allow` and
 //! `approve`. A condition that cannot be evaluated counts as a deny.
+//!
+//! Plugin facts are fetched only for rules that mention `plugin.<name>`,
+//! and only when such a rule applies to the agent. A plugin that fails or
+//! times out makes those rules unevaluable, so they deny.
 
 use crate::classify::Statement;
 use crate::config::Agent;
@@ -67,7 +72,13 @@ pub enum Stage {
 struct Rule {
     config: RuleConfig,
     program: Option<Program>,
+    /// Plugins whose facts the condition reads.
+    plugins: Vec<String>,
 }
+
+/// Facts from plugins for one statement, by plugin name. An `Err` makes
+/// every rule that reads that plugin unevaluable.
+pub type PluginFacts = HashMap<String, Result<serde_json::Value, String>>;
 
 /// Compiled rules, rebuilt whenever the config is (re)loaded.
 #[derive(Default)]
@@ -128,9 +139,22 @@ impl RuleSet {
                 Some(text) => Some(compile(&c.name, text)?),
                 None => None,
             };
+            let plugins = match &c.condition {
+                Some(text) => {
+                    plugins_mentioned(text).map_err(|e| format!("rule '{}': {e}", c.name))?
+                }
+                None => Vec::new(),
+            };
+            if !plugins.is_empty() && c.stage == Stage::After {
+                return Err(format!(
+                    "rule '{}': plugin facts are only available to before-stage rules",
+                    c.name
+                ));
+            }
             rules.push(Rule {
                 config: c.clone(),
                 program,
+                plugins,
             });
         }
         // Highest priority first; ties keep file order.
@@ -138,28 +162,68 @@ impl RuleSet {
         Ok(RuleSet { rules })
     }
 
+    /// Evaluate before-stage rules without plugin facts (`ariodb explain`
+    /// and `ariodb test`): rules that read plugin facts cannot be evaluated.
     pub fn evaluate(&self, facts: &Facts) -> Outcome {
+        self.evaluate_with(facts, &PluginFacts::new())
+    }
+
+    pub fn evaluate_with(&self, facts: &Facts, plugin_facts: &PluginFacts) -> Outcome {
         let ctx = context_for(
             facts.agent,
             std::slice::from_ref(facts.statement),
             facts.database,
             None,
+            plugin_facts,
         );
-        self.run(Stage::Before, &facts.agent.name, &ctx)
+        self.run(Stage::Before, &facts.agent.name, &ctx, plugin_facts)
     }
 
     pub fn evaluate_effects(&self, facts: &EffectFacts) -> Outcome {
         let effects = (facts.rows, facts.tables.clone());
-        let ctx = context_for(facts.agent, facts.statements, facts.database, Some(effects));
-        self.run(Stage::After, &facts.agent.name, &ctx)
+        let none = PluginFacts::new();
+        let ctx = context_for(
+            facts.agent,
+            facts.statements,
+            facts.database,
+            Some(effects),
+            &none,
+        );
+        self.run(Stage::After, &facts.agent.name, &ctx, &none)
     }
 
-    fn run(&self, stage: Stage, agent: &str, ctx: &Context) -> Outcome {
+    /// The plugins whose facts some before-stage rule for this agent reads.
+    /// Only these are asked, so a statement no such rule applies to costs
+    /// no plugin call.
+    pub fn facts_plugins(&self, agent: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .rules
+            .iter()
+            .filter(|r| r.config.stage == Stage::Before && applies(&r.config, agent))
+            .flat_map(|r| r.plugins.iter().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn run(&self, stage: Stage, agent: &str, ctx: &Context, plugin_facts: &PluginFacts) -> Outcome {
         let mut decided: Option<Outcome> = None;
         for rule in &self.rules {
             let c = &rule.config;
-            if c.stage != stage || (!c.agents.is_empty() && !c.agents.iter().any(|a| a == agent)) {
+            if c.stage != stage || !applies(c, agent) {
                 continue;
+            }
+            let unavailable = rule.plugins.iter().find_map(|p| match plugin_facts.get(p) {
+                Some(Ok(_)) => None,
+                Some(Err(e)) => Some(format!("plugin '{p}': {e}")),
+                None => Some(format!("facts from plugin '{p}' are not available here")),
+            });
+            if let Some(why) = unavailable {
+                return Outcome::Deny {
+                    rule: c.name.clone(),
+                    reason: format!("rule '{}' could not be evaluated: {why}", c.name),
+                };
             }
             let matched = match &rule.program {
                 None => Ok(true),
@@ -208,6 +272,129 @@ impl RuleSet {
             }
         }
         decided.unwrap_or(Outcome::NoMatch)
+    }
+}
+
+fn applies(rule: &RuleConfig, agent: &str) -> bool {
+    rule.agents.is_empty() || rule.agents.iter().any(|a| a == agent)
+}
+
+/// The plugins a condition reads facts from, written `plugin.<name>`.
+/// Any other use of `plugin` (such as `plugin[name]`) is refused, so that
+/// ariodb always knows which plugins a rule needs. Text in string literals
+/// and comments is skipped.
+pub fn plugins_mentioned(condition: &str) -> Result<Vec<String>, String> {
+    let chars: Vec<char> = condition.chars().collect();
+    let is_start = |c: char| c.is_ascii_alphabetic() || c == '_';
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let skip_space = |mut i: usize| {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut previous: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            i = skip_string(&chars, i, false);
+            previous = Some(c);
+            continue;
+        }
+        if !is_start(c) {
+            if !c.is_whitespace() {
+                previous = Some(c);
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && is_ident(chars[i]) {
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect();
+        let quote = chars.get(i).is_some_and(|q| *q == '\'' || *q == '"');
+        if quote && matches!(word.to_ascii_lowercase().as_str(), "r" | "b" | "rb" | "br") {
+            i = skip_string(&chars, i, word.to_ascii_lowercase().contains('r'));
+            previous = Some('"');
+            continue;
+        }
+        if word == "plugin" && previous != Some('.') {
+            let dot = skip_space(i);
+            let name_start = skip_space(dot + 1);
+            let mut end = name_start;
+            while end < chars.len() && is_ident(chars[end]) {
+                end += 1;
+            }
+            if chars.get(dot) != Some(&'.') || end == name_start {
+                return Err(
+                    "read plugin facts as plugin.<plugin name>.<key>, so ariodb knows which plugin to ask"
+                        .to_string(),
+                );
+            }
+            let name: String = chars[name_start..end].iter().collect();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+            i = end;
+            previous = Some('x');
+            continue;
+        }
+        previous = Some('x');
+    }
+    Ok(names)
+}
+
+/// Skip a CEL string literal starting at `i` (its opening quote), with
+/// triple quotes and, unless raw, backslash escapes.
+fn skip_string(chars: &[char], mut i: usize, raw: bool) -> usize {
+    let q = chars[i];
+    let triple = chars.len() >= i + 3 && chars[i + 1] == q && chars[i + 2] == q;
+    i += if triple { 3 } else { 1 };
+    while i < chars.len() {
+        if !raw && chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == q {
+            if !triple {
+                return i + 1;
+            }
+            if chars.len() >= i + 3 && chars[i + 1] == q && chars[i + 2] == q {
+                return i + 3;
+            }
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+/// Plugin facts (JSON) as CEL values.
+fn json_value(v: &serde_json::Value) -> Value {
+    use serde_json::Value as J;
+    match v {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::Number(n) => n
+            .as_i64()
+            .map(Value::Int)
+            .or_else(|| n.as_u64().map(Value::UInt))
+            .unwrap_or_else(|| Value::Float(n.as_f64().unwrap_or(f64::NAN))),
+        J::String(text) => s(text),
+        J::Array(items) => Value::List(Arc::new(items.iter().map(json_value).collect())),
+        J::Object(o) => {
+            let m: HashMap<String, Value> =
+                o.iter().map(|(k, v)| (k.clone(), json_value(v))).collect();
+            Value::Map(m.into())
+        }
     }
 }
 
@@ -284,6 +471,7 @@ fn context_for(
     statements: &[Statement],
     database: &str,
     effects: Option<(i64, Vec<String>)>,
+    plugin_facts: &PluginFacts,
 ) -> Context<'static> {
     let first = statements.first();
     let mut tables: Vec<String> = statements.iter().flat_map(|s| s.tables.clone()).collect();
@@ -324,6 +512,13 @@ fn context_for(
             "effects",
             map(vec![("rows", Value::Int(rows)), ("tables", list(tables))]),
         );
+    }
+    let available: HashMap<String, Value> = plugin_facts
+        .iter()
+        .filter_map(|(name, facts)| Some((name.clone(), json_value(facts.as_ref().ok()?))))
+        .collect();
+    if !available.is_empty() {
+        ctx.add_variable_from_value("plugin", Value::Map(available.into()));
     }
     ctx.add_function(
         "intersects",
@@ -478,6 +673,111 @@ mod tests {
             eval(&set, "DELETE FROM customers WHERE id = 3"),
             Outcome::NoMatch
         );
+    }
+
+    #[test]
+    fn finds_the_plugins_a_condition_reads() {
+        let m = |text: &str| plugins_mentioned(text);
+        assert_eq!(
+            m("plugin.clock.out_of_hours && sql.kind == 'write'").unwrap(),
+            vec!["clock"]
+        );
+        assert_eq!(
+            m("plugin . a.x || plugin.b['y'] || plugin.a.z").unwrap(),
+            vec!["a", "b"]
+        );
+        // Strings, raw strings, triple quotes and comments are not code.
+        assert!(m("sql.statement.contains('plugin[0]')").unwrap().is_empty());
+        assert!(
+            m(r#"sql.statement == "plugin" || sql.statement == r'\plugin'"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(m("sql.statement == '''it's plugin'''").unwrap().is_empty());
+        assert!(m("true // plugin facts later").unwrap().is_empty());
+        // A field called plugin elsewhere is not plugin facts.
+        assert!(m("sql.plugin == 1").unwrap().is_empty());
+        assert!(m("plugin[name].x").is_err());
+        assert!(m("has(plugin)").is_err());
+        assert!(m("plugin.").is_err());
+    }
+
+    fn eval_with(set: &RuleSet, sql: &str, facts: &PluginFacts) -> Outcome {
+        let stmt = classify(sql).unwrap().remove(0);
+        let a = agent();
+        set.evaluate_with(
+            &Facts {
+                agent: &a,
+                statement: &stmt,
+                database: "app",
+            },
+            facts,
+        )
+    }
+
+    #[test]
+    fn plugin_facts_drive_rules_and_fail_closed() {
+        let set = rules(
+            r#"
+            [[rules]]
+            name = "freeze"
+            condition = "plugin.clock.freeze && sql.kind == 'write'"
+            verdict = "deny"
+            reason = "change freeze"
+
+            [[rules]]
+            name = "reads"
+            condition = "sql.kind == 'read' && plugin.clock.hour >= 0 && plugin.clock.tags[0] == 'x'"
+            verdict = "allow"
+            agents = ["someone-else"]
+        "#,
+        );
+        assert_eq!(set.facts_plugins("bot"), vec!["clock"]);
+        assert_eq!(set.facts_plugins("someone-else"), vec!["clock"]);
+        let facts = |v: serde_json::Value| PluginFacts::from([("clock".to_string(), Ok(v))]);
+        let frozen = facts(serde_json::json!({"freeze": true, "hour": 19, "tags": ["x"]}));
+        let open = facts(serde_json::json!({"freeze": false, "hour": 9.5, "tags": []}));
+        let update = "UPDATE t SET a = 1 WHERE id = 1";
+        assert!(
+            matches!(eval_with(&set, update, &frozen), Outcome::Deny { reason, .. } if reason == "change freeze")
+        );
+        assert_eq!(eval_with(&set, update, &open), Outcome::NoMatch);
+        // A failed plugin call makes the rule unevaluable: deny.
+        let failed = PluginFacts::from([(
+            "clock".to_string(),
+            Err("no answer within 5000 ms".to_string()),
+        )]);
+        assert!(
+            matches!(eval_with(&set, update, &failed), Outcome::Deny { reason, .. } if reason.contains("no answer within 5000 ms"))
+        );
+        // Without plugins (ariodb explain, ariodb test), likewise.
+        assert!(matches!(eval(&set, update), Outcome::Deny { rule, .. } if rule == "freeze"));
+        // A missing key is an evaluation error, which also denies.
+        let partial = facts(serde_json::json!({"hour": 3}));
+        assert!(matches!(
+            eval_with(&set, update, &partial),
+            Outcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn plugin_facts_are_before_stage_only() {
+        #[derive(Deserialize)]
+        struct F {
+            rules: Vec<RuleConfig>,
+        }
+        let f: F = toml::from_str(
+            r#"
+            [[rules]]
+            name = "late"
+            stage = "after"
+            condition = "plugin.clock.freeze"
+            verdict = "deny"
+        "#,
+        )
+        .unwrap();
+        let err = RuleSet::compile(&f.rules).err().unwrap();
+        assert!(err.contains("before-stage"), "{err}");
     }
 
     #[test]

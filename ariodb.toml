@@ -222,3 +222,26 @@ redact_literals = false      # true stores SQL with values replaced by $1, $2, .
 # listen = "127.0.0.1:5433"
 # ready_timeout_seconds = 30
 # restart = true
+
+# ---------------------------------------------------------------------------
+# Plugins (optional): programs ariodb runs and talks to over stdin and
+# stdout (JSON-RPC, one message per line), as approvers, sources of facts
+# for rules, notifiers and audit sinks. See docs/plugins.md. They run as
+# ariodb's user and see the statements they are asked about.
+
+# [[plugins]]
+# name = "office_hours"                 # rules read its facts as plugin.office_hours.<key>
+# command = ["python3", "-I", "examples/plugins/python/ariodb_plugin.py"]
+# timeout_ms = 5000                     # per call; approvals use the approver's timeout
+# pass_env = ["ARIODB_PAGER_TOKEN"]     # only PATH, HOME and what is named here are passed on
+# env = { ARIODB_EXAMPLE_AUDIT_FILE = "/var/log/ariodb/decisions.jsonl" }
+#
+# [[approvers]]
+# name = "office-hours"
+# type = "plugin"
+# plugin = "office_hours"
+#
+# [[rules]]
+# name = "change-freeze"
+# condition = "plugin.office_hours.freeze && sql.kind != 'read'"
+# verdict = "deny"

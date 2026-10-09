@@ -8,7 +8,8 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { api, errorText, type AuditCheck } from "@/lib/api"
+import { StatusBadge } from "@/components/status-badge"
+import { api, errorText, type AuditCheck, type PluginStatus } from "@/lib/api"
 import { useApi } from "@/lib/hooks"
 
 const NAME_PATTERN = "[A-Za-z0-9_-]+"
@@ -182,6 +183,59 @@ function Users() {
   )
 }
 
+const CAPABILITIES = ["approver", "facts", "notifier", "audit_sink"] as const
+
+function Plugins() {
+  const { data, error, loading } = useApi<{ plugins: PluginStatus[] }>("/api/plugins", 5000)
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Plugins</CardTitle>
+        <CardDescription>
+          Programs ariodb runs as approvers, rule facts, notifiers and audit sinks. Changes to them need a restart.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        {error && <ErrorNote message={error} />}
+        {loading && !data ? (
+          <Loading rows={1} />
+        ) : !data?.plugins.length ? (
+          <span className="text-sm text-muted-foreground">None configured.</span>
+        ) : (
+          data.plugins.map((p) => (
+            <div key={p.name} className="flex flex-col gap-1.5 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono font-medium">{p.name}</span>
+                <StatusBadge status={p.state} />
+                {p.declared && (
+                  <span className="text-muted-foreground">
+                    {p.declared.name} {p.declared.version}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {CAPABILITIES.filter((c) => p.declared?.capabilities[c]).map((c) => (
+                  <Badge key={c} variant="secondary" className="font-mono">
+                    {c}
+                  </Badge>
+                ))}
+              </div>
+              <div className="text-muted-foreground">
+                {p.pid !== null && <>pid {p.pid} · </>}
+                {p.restarts} {p.restarts === 1 ? "restart" : "restarts"}
+                {p.dropped_events > 0 && <> · {p.dropped_events.toLocaleString()} events dropped</>}
+              </div>
+              {p.last_error && (
+                <div className="font-mono text-xs break-all text-muted-foreground">Last error: {p.last_error}</div>
+              )}
+            </div>
+          ))
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 function AuditLog() {
   const [result, setResult] = useState<AuditCheck | null>(null)
   const [busy, setBusy] = useState(false)
@@ -235,6 +289,7 @@ export function SettingsPage({ user, onSignOut }: { user: string; onSignOut: () 
         <Secrets />
         <Users />
         <AuditLog />
+        <Plugins />
         <Card>
           <CardHeader>
             <CardTitle>This session</CardTitle>

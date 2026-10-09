@@ -150,3 +150,20 @@ export type ConfigCheck =
   | { ok: false; error: string }
 
 export type AuditCheck = { ok: true; entries: number } | { ok: false; error: string }
+
+export type PluginStatus = {
+  name: string
+  command: string[]
+  /** starting, running, restarting or stopped */
+  state: string
+  /** What the plugin said about itself when it last started. */
+  declared: {
+    name: string
+    version: string
+    capabilities: { approver: boolean; facts: boolean; notifier: boolean; audit_sink: boolean }
+  } | null
+  pid: number | null
+  restarts: number
+  last_error: string | null
+  dropped_events: number
+}

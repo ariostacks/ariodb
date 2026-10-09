@@ -129,6 +129,11 @@ enum Command {
         #[command(subcommand)]
         action: SecretAction,
     },
+    /// List plugins, or try one out
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
     /// Show what the policy would decide for a statement, without running it
     Explain {
         /// The agent name from the config file
@@ -139,6 +144,17 @@ enum Command {
         engine: String,
         /// The SQL to judge
         sql: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginAction {
+    /// Start each configured plugin and show what it says it can do
+    List,
+    /// Start one plugin and send it a sample call for each capability (exit 1 on failure)
+    Test {
+        /// The plugin's name from the config file
+        name: String,
     },
 }
 
@@ -225,8 +241,19 @@ async fn main() -> ExitCode {
             Err(e) => Err(e),
         },
         Command::Mcp { agent } => match make_state(&config, &cli.config) {
-            Ok(state) => with_tunnels(&config, mcp::serve(state, &agent)).await,
+            Ok(state) => {
+                // Approvers and facts are needed here too; the audit sink is
+                // left to `ariodb serve`, which reads the same decisions log.
+                let plugins = start_plugins(&config, plugins::Roles { audit_sink: false }).await;
+                let result = with_tunnels(&config, mcp::serve(state, &agent)).await;
+                stop_plugins(plugins).await;
+                result
+            }
             Err(e) => Err(e),
+        },
+        Command::Plugin { action } => match action {
+            PluginAction::List => plugins::list_command(&config).await,
+            PluginAction::Test { name } => plugins::test_command(&config, &name).await,
         },
         Command::Sessions => sessions_command(&config),
         Command::Undo {
@@ -285,6 +312,24 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Start the configured plugins for this process, if there are any.
+async fn start_plugins(config: &Config, roles: plugins::Roles) -> Option<Arc<plugins::Host>> {
+    if config.plugins.is_empty() {
+        return None;
+    }
+    let host = plugins::Host::start(&config.plugins, Path::new(&config.journal.dir), roles);
+    plugins::install(host.clone());
+    host.settle(std::time::Duration::from_secs(10)).await;
+    Some(host)
+}
+
+async fn stop_plugins(host: Option<Arc<plugins::Host>>) {
+    if let Some(host) = host {
+        plugins::uninstall();
+        host.stop().await;
+    }
+}
+
 fn fail(message: String) -> ExitCode {
     eprintln!("error: {message}");
     ExitCode::FAILURE
@@ -339,6 +384,9 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
     // Tunnels first: agents, the journal and ClickHouse may all need them.
     // Tunnel changes in a reloaded config need a restart, like listen addresses.
     let mut tunnels = tunnels::Supervisor::start(&state.config().tunnels, false).await?;
+    // Plugins next, so approvers and facts are there for the first agent.
+    // Like tunnels, plugin changes in a reloaded config need a restart.
+    let plugins = start_plugins(&state.config(), plugins::Roles { audit_sink: true }).await;
     tokio::spawn(gate::watch_config(state.clone()));
     let prune_state = state.clone();
     tokio::spawn(async move {
@@ -416,6 +464,7 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
             Ok(())
         }
     };
+    stop_plugins(plugins).await;
     tunnels.stop().await;
     result
 }
@@ -582,8 +631,18 @@ async fn undo_command(
         println!("\nnothing changed. Run again with --apply to undo.");
         return Ok(());
     }
-    let done = undo::apply(&mut client, &plan, skip_conflicts).await?;
-    println!("\nundone: {done} rows restored in one transaction");
+    // Notifiers hear about the undo; this process starts them just for that.
+    let plugins = start_plugins(config, plugins::Roles { audit_sink: false }).await;
+    let done = undo::apply(&mut client, &plan, skip_conflicts).await;
+    if let Ok(rows) = &done {
+        let by = format!("cli:{}", std::env::var("USER").unwrap_or_default());
+        plugins::notify(
+            "undo_applied",
+            serde_json::json!({ "session": session, "rows": rows, "by": by }),
+        );
+    }
+    stop_plugins(plugins).await;
+    println!("\nundone: {} rows restored in one transaction", done?);
     Ok(())
 }
 
@@ -637,6 +696,12 @@ fn print_summary(config: &Config) {
         );
     }
     if !config.tunnels.is_empty() {
+        println!();
+    }
+    for p in &config.plugins {
+        println!("plugin {:<15} {}", p.name, p.command.join(" "));
+    }
+    if !config.plugins.is_empty() {
         println!();
     }
 

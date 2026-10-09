@@ -94,7 +94,11 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS decisions (
     hash TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_at ON decisions(at_ms);
-CREATE INDEX IF NOT EXISTS decisions_agent ON decisions(agent, id);";
+CREATE INDEX IF NOT EXISTS decisions_agent ON decisions(agent, id);
+CREATE TABLE IF NOT EXISTS plugin_cursors (
+    plugin TEXT PRIMARY KEY,
+    last_id INTEGER NOT NULL
+);";
 
 fn open_conn(dir: &Path) -> Result<Connection, String> {
     crate::secrets::ensure_private_dir(dir)?;
@@ -147,17 +151,14 @@ impl AuditLog {
     }
 
     pub fn record(&self, entry: &Entry) {
-        if let Err(e) = self.try_record(entry) {
-            eprintln!("ariodb: could not write the decisions log: {e}");
+        match self.try_record(entry) {
+            Ok(d) => notify_plugins(&d),
+            Err(e) => eprintln!("ariodb: could not write the decisions log: {e}"),
         }
     }
 
-    fn try_record(&self, entry: &Entry) -> Result<(), String> {
-        let sql = if self.redact {
-            pg_query::normalize(entry.sql).unwrap_or_else(|_| "<unparseable statement>".into())
-        } else {
-            entry.sql.to_string()
-        };
+    fn try_record(&self, entry: &Entry) -> Result<Decision, String> {
+        let sql = stored_sql(entry.sql, self.redact);
         let d = Decision {
             id: 0,
             at_ms: now_ms() as i64,
@@ -210,7 +211,121 @@ impl AuditLog {
             ],
         )
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(d)
+    }
+}
+
+/// A statement as the decisions log stores it: with `redact_literals`,
+/// literal values become placeholders. Events for notifier plugins use it
+/// too, so redaction keeps literals out of them as well.
+pub fn stored_sql(sql: &str, redact: bool) -> String {
+    if redact {
+        pg_query::normalize(sql).unwrap_or_else(|_| "<unparseable statement>".into())
+    } else {
+        sql.to_string()
+    }
+}
+
+/// Tell notifier plugins about refusals and rollbacks. The statement is the
+/// one stored, so `redact_literals` applies here too.
+fn notify_plugins(d: &Decision) {
+    let event = match d.outcome.as_str() {
+        "refused" => "statement_refused",
+        "rolled_back" => "write_rolled_back",
+        _ => return,
+    };
+    crate::plugins::notify(
+        event,
+        serde_json::json!({
+            "agent": d.agent,
+            "session": d.session,
+            "database": d.database,
+            "engine": d.engine,
+            "sql": d.sql,
+            "kind": d.kind,
+            "tables": d.tables,
+            "rows": d.rows,
+            "reason": d.reason,
+            "rule": d.rule,
+        }),
+    );
+}
+
+/// A stored entry with its links in the hash chain, as audit sinks get it,
+/// so a sink can check the chain itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct Chained {
+    #[serde(flatten)]
+    pub decision: Decision,
+    pub prev: String,
+    pub hash: String,
+}
+
+/// How far each audit-sink plugin has acknowledged the decisions log.
+pub struct SinkCursor {
+    conn: Connection,
+}
+
+impl SinkCursor {
+    pub fn open(dir: &Path) -> Result<SinkCursor, String> {
+        Ok(SinkCursor {
+            conn: open_conn(dir)?,
+        })
+    }
+
+    /// The last entry id the plugin acknowledged; 0 before its first.
+    pub fn position(&self, plugin: &str) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT last_id FROM plugin_cursors WHERE plugin = ?1",
+                [plugin],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|id| id.unwrap_or(0))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Move the cursor forward (never back) to `id`.
+    pub fn advance(&self, plugin: &str, id: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO plugin_cursors (plugin, last_id) VALUES (?1, ?2)
+                 ON CONFLICT (plugin) DO UPDATE SET last_id = max(last_id, excluded.last_id)",
+                params![plugin, id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Entries after `id`, oldest first: at most `limit`, and stopping once
+    /// their statements add up to `max_bytes` (always at least one entry).
+    pub fn after(&self, id: i64, limit: usize, max_bytes: usize) -> Result<Vec<Chained>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT *, prev AS p, hash AS h FROM decisions WHERE id > ?1 ORDER BY id LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query(params![id, limit as i64])
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        let mut bytes = 0;
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            let decision = row_to_decision(r).map_err(|e| e.to_string())?;
+            bytes += decision.sql.len() + decision.reason.as_ref().map_or(0, |r| r.len());
+            out.push(Chained {
+                decision,
+                prev: r.get("p").map_err(|e| e.to_string())?,
+                hash: r.get("h").map_err(|e| e.to_string())?,
+            });
+            if bytes >= max_bytes {
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -440,6 +555,35 @@ mod tests {
         conn.execute("DELETE FROM decisions WHERE sql = 'SELECT 2'", [])
             .unwrap();
         assert!(verify(&dir).unwrap_err().contains("removed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sink_cursors_only_move_forward() {
+        let dir = std::env::temp_dir().join(format!("ariodb-audit-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tables = vec![];
+        let log = AuditLog::open(&dir, &Settings::default()).unwrap();
+        for sql in ["SELECT 1", "SELECT 2", "SELECT 3"] {
+            log.record(&entry(sql, &tables));
+        }
+        let cursor = SinkCursor::open(&dir).unwrap();
+        assert_eq!(cursor.position("sink").unwrap(), 0);
+        let first = cursor.after(0, 2, 1 << 20).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].decision.sql, "SELECT 1");
+        assert_eq!(first[1].prev, first[0].hash);
+        cursor.advance("sink", first[1].decision.id).unwrap();
+        cursor.advance("sink", 1).unwrap();
+        assert_eq!(cursor.position("sink").unwrap(), first[1].decision.id);
+        assert_eq!(cursor.position("other").unwrap(), 0);
+        let rest = cursor
+            .after(cursor.position("sink").unwrap(), 100, 1 << 20)
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].decision.sql, "SELECT 3");
+        // The byte budget stops a batch early, but never empties it.
+        assert_eq!(cursor.after(0, 100, 1).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

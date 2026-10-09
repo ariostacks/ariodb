@@ -46,8 +46,11 @@ it changed, and lets a person undo one agent session later.
 - **ClickHouse too.** A proxy for ClickHouse's HTTP interface (reads and
   `INSERT`) and its native protocol (reads), with the same rules and
   approvals.
+- **Plugins.** Any program that speaks JSON-RPC over stdin and stdout can
+  approve statements, supply facts for rules, receive notifications or
+  receive the decisions log. Examples in Python and TypeScript.
 - **A dashboard.** Approvals queue, decisions, sessions and undo, rules,
-  config editor, secrets and users, built into the binary.
+  config editor, secrets, users and plugins, built into the binary.
 
 ## Quick start: the demo
 
@@ -296,6 +299,7 @@ matches everything. A condition that fails to evaluate counts as a deny.
 | `agent.name`, `agent.access` | string | Who is asking |
 | `effects.rows` | int | Rows changed (after-stage only) |
 | `effects.tables` | list | Tables changed, including by triggers and cascades (after-stage only) |
+| `plugin.<name>.<key>` | any | Facts from a [plugin](#plugins) (before-stage only) |
 
 `intersects(a, b)` (or the CEL sets extension's spelling, `sets.intersects(a, b)`) is
 true when two lists share an item.
@@ -434,6 +438,38 @@ decisions log only). OpenAI, Azure and Gemini requests ask not to be stored
 apply. Use a local model through `openai_compatible` to keep statements on
 your own machines.
 
+A fifth type, `plugin`, hands the decision to a [plugin](#plugins):
+
+```toml
+[[approvers]]
+name = "office-hours"
+type = "plugin"
+plugin = "office_hours"       # a [[plugins]] entry that declares the approver capability
+```
+
+### `[[plugins]]`
+
+Programs ariodb starts (with `serve` and `mcp`) and talks to over stdin and
+stdout with newline-delimited JSON-RPC 2.0, as MCP's stdio transport does.
+A plugin declares what it does: approve statements, supply facts that rules
+read as `plugin.<name>.<key>`, receive events (approvals, refusals,
+rollbacks, undos), or receive every decisions-log entry at least once, in
+order. Any failure where a statement is being decided refuses it.
+
+```toml
+[[plugins]]
+name = "office_hours"
+command = ["python3", "-I", "examples/plugins/python/ariodb_plugin.py"]
+timeout_ms = 5000             # default 5000, per call
+pass_env = ["ARIODB_PAGER_TOKEN"]          # the environment is PATH, HOME and what is named here
+secret_env = { PAGER_KEY = "pager-key" }   # from the secret store
+env = { ARIODB_EXAMPLE_CUTOFF_HOUR = "18" }
+```
+
+Plugins are restarted with backoff when they exit and stopped with ariodb.
+They run as ariodb's user and see what they are sent. The protocol, the
+examples and the security notes are in [docs/plugins.md](docs/plugins.md).
+
 ### `[approvals]`
 
 ```toml
@@ -524,6 +560,8 @@ Every command takes `-c, --config <path>` (default `ariodb.toml`).
 | `export-fixtures --out <dir> [--limit 500]` | Write recent decisions to `<dir>/recorded.json` as test fixtures |
 | `test <file or dir>` | Replay fixtures against the policy; exit 0 all match, 1 drift, 2 error |
 | `dashboard-password [--user root]` | Set a dashboard password, read from stdin |
+| `plugin list` | Start each plugin and show the capabilities it declares |
+| `plugin test <name>` | Send a plugin a sample call for each capability; exit 1 on failure |
 | `secret set <name>` | Store a secret, read from stdin |
 | `secret list` | List secret names (never values) |
 | `secret delete <name>` | Delete a secret |
@@ -583,8 +621,8 @@ Pages: overview; approvals (approve or deny with a note); decisions
 test fixture; "block requests like this" builds a deny rule); sessions
 (see the undo plan, then undo); rules (list, and explain a statement for an
 agent); config (edit with a check before saving, database passwords
-masked; saving needs `config_writes = true`); settings (secrets, users and a
-decisions-log check).
+masked; saving needs `config_writes = true`); settings (secrets, users, a
+decisions-log check, and each plugin's state).
 
 Changes need a logged-in session, a CSRF token and a same-origin request.
 Failed logins are limited per address and per user.
@@ -607,6 +645,7 @@ example `./scripts/demo.sh`), then `cd dashboard && npm run dev`; Vite passes
 cargo test                      # unit and property tests (PROPTEST_CASES=100000 for a longer hunt)
 cargo build && ./scripts/e2e.sh # end to end against Postgres in Docker
 ./scripts/e2e-clickhouse.sh     # end to end against ClickHouse in Docker (needs cargo build)
+./scripts/e2e-plugins.sh        # plugins: the example and a broken one, against Postgres in Docker
 PG_IMAGE=postgres:18 ./scripts/e2e.sh          # the full suite against another Postgres-compatible image
 ./scripts/e2e-compat.sh cockroach              # YugabyteDB (yugabyte) or CockroachDB (cockroach)
 ./scripts/sim-undo.sh           # seeded random agent and human writes, then undo, checked against a model
@@ -637,7 +676,8 @@ and `E2E_NAME` keep parallel runs of the scripts apart.
   `COMMIT` and savepoints from agents are refused.
 - **`ariodb explain` and `ariodb test`** judge before-stage rules only; they
   cannot predict after-stage rules or the effect check, which need the write
-  to run.
+  to run. They do not start plugins, so rules that read plugin facts count
+  as unevaluable (a deny) there.
 - **Databases only.** ariodb does not guard Kubernetes, HTTP APIs, SSH or
   other tools agents use.
 - **Accepted risks** listed in [SECURITY.md](SECURITY.md): the decisions log
