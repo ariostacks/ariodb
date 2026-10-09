@@ -1060,7 +1060,7 @@ text follows `ariodb: kept the previous config:`.
 | `approver 'e' (email) needs smtp_host` | Also: `needs from`, `needs at least one address in to`, `needs both smtp_user and smtp_password_secret or smtp_password_env, or neither`. |
 | `approver 'e': 'ops at example' is not an email address: ...` | Write `from` and every `to` as `name@example.com` or `Name <name@example.com>`. |
 | `approver 'e': smtp_tls = "none" is only allowed for a mail server on this machine; use "starttls" or "tls"` | Also: `smtp_tls must be "starttls", "tls" or "none", not "..."`. |
-| `approver 's' (Slack) cannot set groups: only dashboard and webhook approvers are decided by signed-in people` | Remove `groups` from a `slack`, `llm` or `plugin` approver. |
+| `approver 's' (Slack) cannot set groups: Slack, model and plugin approvers are not decided by signed-in people` | Remove `groups` from a `slack`, `llm` or `plugin` approver. |
 | `approver 'ops' sets groups, which need [dashboard.oidc]` | Configure single sign-on, or remove `groups`. |
 | `approver 'pager' sets groups, which its approval links can only check with [dashboard] approval_links = "sign_in"` | Use `sign_in` (the default with single sign-on), or remove `groups`. |
 

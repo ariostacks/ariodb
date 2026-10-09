@@ -193,7 +193,7 @@ pub fn validate(
             )
         {
             return Err(format!(
-                "approver '{}' ({:?}) cannot set groups: only dashboard and webhook approvers are decided by signed-in people",
+                "approver '{}' ({:?}) cannot set groups: Slack, model and plugin approvers are not decided by signed-in people",
                 a.name, a.kind
             ));
         }
