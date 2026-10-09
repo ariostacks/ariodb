@@ -135,6 +135,7 @@ name = "ariodb"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "aws-lc-rs",
  "axum",
  "base64 0.23.1",
  "bytes",
