@@ -500,7 +500,7 @@ approval_links = "sign_in"    # signed | sign_in; default sign_in with single si
 
 [dashboard.oidc]              # single sign-on with any OpenID Connect provider
 issuer = "https://login.example.com/realms/ops"   # https; http only for localhost
-provider_name = "Okta"        # the sign-in button says "Sign in with Okta"
+provider_name = "Keycloak"    # the sign-in button says "Sign in with Keycloak"
 client_id = "ariodb"
 client_secret_env = "ARIODB_OIDC_CLIENT_SECRET"   # or client_secret_secret; neither for a public client
 redirect_path = "/auth/callback"   # default; register <public_url><redirect_path> with the provider
