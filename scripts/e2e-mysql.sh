@@ -356,14 +356,14 @@ expect "a denied one names who denied it" '["cli:' "$(decided_by refused "SET st
 
 echo "connection limits"
 # Room for two connections, for a moment: the config reloads while ariodb runs.
-set_max_connections() { # set_max_connections <n or "">
+set_limit() { # set_limit <key> <n or "">
   local reloads; reloads=$(grep -c "reloaded" "$WORK/serve.log" || true)
-  python3 -I - "$WORK/ariodb.toml" "$1" <<'PY'
+  python3 -I - "$WORK/ariodb.toml" "$1" "$2" <<'PY'
 import re, sys
-path, n = sys.argv[1:]
-s = re.sub(r"max_connections = \d+\n", "", open(path).read())
+path, key, n = sys.argv[1:]
+s = re.sub(rf"{key} = \d+\n", "", open(path).read())
 if n:
-    s = s.replace("statement_timeout_ms = 5000\n", f"statement_timeout_ms = 5000\nmax_connections = {n}\n", 1)
+    s = s.replace("statement_timeout_ms = 5000\n", f"statement_timeout_ms = 5000\n{key} = {n}\n", 1)
 open(path, "w").write(s)
 PY
   for _ in $(seq 1 50); do
@@ -372,10 +372,18 @@ PY
   done
   fail "the config was not reloaded"
 }
-set_max_connections 2
+set_limit max_connections 2
 expect "a client over max_connections gets error 1040" "ERROR 1040 (08004): ariodb: too many connections" "$(python3 -I scripts/conn_limits.py mysql-full $PROXY 2 2>&1 || true)"
-set_max_connections ""
+set_limit max_connections ""
 expect "and connections are accepted again once the limit is lifted" "1000" "$(agent coding-agent $T "SELECT COUNT(*) FROM orders")"
+# One connection per agent: a second, while the first is open, is refused.
+set_limit max_connections_per_agent 1
+raw coding-agent $T "S:3" >/dev/null & HELD=$!
+sleep 1
+expect "an agent over max_connections_per_agent gets error 1203" "ERROR 1203 ariodb: agent 'coding-agent' already has 1 connections open" "$(raw coding-agent $T "Q:SELECT 1")"
+wait $HELD
+expect "  and may connect again once its first connection ends" "ROW 1" "$(raw coding-agent $T "Q:SELECT 1")"
+set_limit max_connections_per_agent ""
 
 echo "TLS"
 kill $SERVE_PID 2>/dev/null || true; wait $SERVE_PID 2>/dev/null || true

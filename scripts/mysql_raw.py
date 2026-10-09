@@ -10,6 +10,7 @@ Actions: Q:<sql>           COM_QUERY
          C                 COM_STMT_CLOSE the current statement
          R                 COM_RESET_CONNECTION
          CANCEL:<secs>:<sql>  COM_QUERY, then KILL QUERY it from a second connection
+         S:<secs>          wait, keeping the session open
 Prints one line per reply: OK <rows>, ROW <values>, ERROR <code> <message>,
 PREPARED <params>, ID <connection id>.
 """
@@ -198,6 +199,8 @@ for action in actions:
     elif kind == "R":
         conn.command(b"\x1f")
         read_result(conn, binary=False)
+    elif kind == "S":
+        time.sleep(float(rest))
     elif kind == "CANCEL":
         delay, _, sql = rest.partition(":")
         conn.command(b"\x03" + sql.encode())
