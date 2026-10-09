@@ -37,12 +37,24 @@ trap cleanup EXIT
 
 pass() { printf '  \033[32mpass\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
+# Client containers reach ariodb on this machine as host.docker.internal.
+# Docker Desktop resolves that name itself. On Linux a client shares the
+# host's network instead, with the name pointing at 127.0.0.1, where ariodb
+# listens: the host-gateway address reaches the host only on its Docker
+# bridge, which listeners on 127.0.0.1 do not accept.
+if [ "$(uname -s)" = Linux ]; then
+  HOST_NET=(--network host --add-host=host.docker.internal:127.0.0.1)
+else
+  HOST_NET=(--add-host=host.docker.internal:host-gateway)
+fi
+# Whether something listens on a local port (bash's /dev/tcp, so no nc).
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 expect() { # expect <description> <needle> <output>
   if grep -qF -- "$2" <<<"$3"; then pass "$1"; else echo "$3"; fail "$1"; fi
 }
 wait_for_proxy() {
   for _ in $(seq 1 100); do
-    nc -z 127.0.0.1 $PROXY 2>/dev/null && return 0
+    port_open $PROXY && return 0
     kill -0 "$SERVE_PID" 2>/dev/null || { cat "$WORK"/serve*.log; fail "ariodb exited"; }
     sleep 0.2
   done
@@ -60,7 +72,7 @@ wait_for() {
 admin() { docker exec -i -e PGPASSWORD=local-test-only-pw $PG psql -q -v ON_ERROR_STOP=1 -U postgres -d app "$@"; }
 # Run SQL through the proxy as the agent. Prints psql output, never fails.
 agent() {
-  docker run --rm -e PGPASSWORD="$T" $CLIENT \
+  docker run "${HOST_NET[@]}" --rm -e PGPASSWORD="$T" $CLIENT \
     psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=disable" -c "$1" 2>&1 || true
 }
 start_serve() { # start_serve <log name>

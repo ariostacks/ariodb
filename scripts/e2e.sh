@@ -25,16 +25,20 @@ PROXY=$((6544 + OFF))
 DASH=$((8091 + OFF))
 MOCK=$((8092 + OFF))
 SMTP=$((8093 + OFF))
+# A second ariodb with small connection limits, and its dashboard.
+LIMP=$((58433 + OFF))
+LIMD=$((59433 + OFF))
 WORK=$(mktemp -d)
 SERVE_PID=""
-trap 'kill $SERVE_PID $MOCK_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+LIMITS_PID=""
+trap 'kill $SERVE_PID $MOCK_PID $LIMITS_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 python3 -I "$(dirname "$0")/mock_services.py" $MOCK "$WORK/mock.log" $SMTP &
 MOCK_PID=$!
 
 # Wait for ariodb to listen; fail fast if it exits instead.
 wait_for_proxy() {
   for _ in $(seq 1 100); do
-    nc -z 127.0.0.1 $PROXY 2>/dev/null && return 0
+    port_open $PROXY && return 0
     kill -0 $SERVE_PID 2>/dev/null || { cat "$WORK"/serve*.log; fail "ariodb exited"; }
     sleep 0.2
   done
@@ -42,16 +46,28 @@ wait_for_proxy() {
 }
 pass() { printf '  \033[32mpass\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
+# Client containers reach ariodb on this machine as host.docker.internal.
+# Docker Desktop resolves that name itself. On Linux a client shares the
+# host's network instead, with the name pointing at 127.0.0.1, where ariodb
+# listens: the host-gateway address reaches the host only on its Docker
+# bridge, which listeners on 127.0.0.1 do not accept.
+if [ "$(uname -s)" = Linux ]; then
+  HOST_NET=(--network host --add-host=host.docker.internal:127.0.0.1)
+else
+  HOST_NET=(--add-host=host.docker.internal:host-gateway)
+fi
+# Whether something listens on a local port (bash's /dev/tcp, so no nc).
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 admin() { docker exec -i -e PGPASSWORD=local-test-only-pw $PG psql -q -v ON_ERROR_STOP=1 -U $PG_SUPERUSER -d app "$@"; }
 # Run SQL through the proxy as an agent. Prints psql output, never fails.
 agent() {
-  docker run --rm -e PGPASSWORD="$2" $CLIENT \
+  docker run "${HOST_NET[@]}" --rm -e PGPASSWORD="$2" $CLIENT \
     psql "host=host.docker.internal port=$PROXY user=$1 dbname=app sslmode=disable" -c "$3" 2>&1 || true
 }
 # Same, but the SQL is a psql script on stdin (needed for \bind).
 agent_script() {
-  printf '%s\n' "$3" | docker run --rm -i -e PGPASSWORD="$2" $CLIENT \
+  printf '%s\n' "$3" | docker run "${HOST_NET[@]}" --rm -i -e PGPASSWORD="$2" $CLIENT \
     psql "host=host.docker.internal port=$PROXY user=$1 dbname=app sslmode=disable" 2>&1 || true
 }
 expect() { # expect <description> <needle> <output>
@@ -484,7 +500,9 @@ expect "ariodb reaches the database over TLS" "ssl|t" "$(agent_ssl $E2E_AGENT_TO
 echo "credentials"
 expect "secrets are listed by name" "pg-readonly" "$($BIN "${CFG[@]}" secret list)"
 grep -q 'ro-local-test-only' "$WORK/journal/secrets.json" && fail "secret stored in plaintext" || pass "secrets are encrypted at rest"
-[ "$(stat -f %Lp "$WORK/journal")" = "700" ] && pass "state directory is 0700" || fail "state directory mode is $(stat -f %Lp "$WORK/journal")"
+# GNU stat (Linux) takes -c; BSD stat (macOS) takes -f.
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+[ "$(mode_of "$WORK/journal")" = "700" ] && pass "state directory is 0700" || fail "state directory mode is $(mode_of "$WORK/journal")"
 expect "bot logs in with a token from the store" "(1 row)" "$(agent support-bot $E2E_BOT_TOKEN "SELECT 1")"
 expect "bot's queries run as its own database login" "ariodb_ro" "$(agent support-bot $E2E_BOT_TOKEN "SELECT current_user")"
 expect "agent's queries run as the default login" "ariodb_gw" "$(agent coding-agent $E2E_AGENT_TOKEN "SELECT current_user")"
@@ -500,7 +518,7 @@ expect "bulk write rolled back"         "the limit is 500"       "$(agent coding
 expect "trigger side effect rolled back" "order_log"             "$(agent coding-agent $T "UPDATE orders SET status='audited' WHERE id = 5")"
 # Two writes of 300 rows straight after each other on one connection: Postgres
 # still holds the first one's counts, which must not count against the second.
-BACK_TO_BACK=$(docker run --rm -e PGPASSWORD="$T" $CLIENT psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=disable" \
+BACK_TO_BACK=$(docker run "${HOST_NET[@]}" --rm -e PGPASSWORD="$T" $CLIENT psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=disable" \
   -c "UPDATE orders SET status = status WHERE id <= 300" -c "UPDATE orders SET status = status WHERE id > 300 AND id <= 600" 2>&1 || true)
 expect "back-to-back writes are each measured alone" "UPDATE 300
 UPDATE 300" "$BACK_TO_BACK"
@@ -574,7 +592,7 @@ ID=$(wait_for_pending); $BIN "${CFG[@]}" deny "$ID" --note "not during the freez
 expect "denied statement is refused with the note" "not during the freeze" "$(cat "$OUT")"
 expect "approval timeout refuses" "no decision from 'ops-quick' within 3 seconds" "$(agent coding-agent $T "SELECT /*ask-quick*/ 1 FROM orders")"
 # An agent that leaves while its statement waits must not have it run later.
-docker run -d --name ariodb-leaver${E2E_NAME:+-$E2E_NAME} -e PGPASSWORD=$T $CLIENT \
+docker run "${HOST_NET[@]}" -d --name ariodb-leaver${E2E_NAME:+-$E2E_NAME} -e PGPASSWORD=$T $CLIENT \
   psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=disable" \
   -c "UPDATE orders SET status = 'left-behind' WHERE id = 77 /*ask-dashboard*/" >/dev/null
 ID=$(wait_for_pending)
@@ -825,6 +843,23 @@ expect "config is shown with passwords masked" 'ariodb_gw:***@' "$(api $D/api/co
 expect "explain through the API" '"rule":"no-file-functions"' "$(api -X POST -d '{"agent":"coding-agent","sql":"SELECT pg_read_file(1)"}' $D/api/explain)"
 expect "audit chain verified through the API" '"ok":true' "$(api $D/api/audit/verify)"
 expect "overview counts pending approvals" '"pending_approvals":0' "$(api $D/api/overview)"
+# Who decided is recorded with each decision. Print the deciders of the
+# newest decision whose statement contains the text.
+decided_by() {
+  api -G --data-urlencode "q=$1" --data-urlencode "limit=1" "$D/api/decisions" |
+    python3 -c 'import json,sys; d=json.load(sys.stdin)["decisions"][0]; print(d["outcome"], json.dumps(d["decided_by"]))'
+}
+expect "decisions name the model that approved them" 'allowed ["model:anthropic/claude-opus-5-5"]' "$(decided_by "/*ask-model*/ count(*) FROM orders")"
+expect "  and the model that refused them" 'refused ["model:anthropic/claude-opus-5-5"]' "$(decided_by "/*ask-model*/ 'deny-me'")"
+expect "  and the person who approved in the dashboard" 'allowed ["dashboard:root"]' "$(decided_by "/*ask-dashboard*/ count(*) + 2")"
+expect "  or in Slack" 'allowed ["slack:pat"]' "$(decided_by "/*ask-slack*/ count(*) + 4")"
+expect "  or by a signed link" 'allowed ["webhook"]' "$(decided_by "'no-answer' FROM orders")"
+expect "  and a model that never answered under fail-open as ariodb's" 'allowed ["ariodb:failed-open:model:openai/gpt-6-astra"]' "$(decided_by "'unavailable-503' <> ''")"
+expect "  and nobody for statements no rule held" 'allowed []' "$(decided_by "SELECT current_user")"
+expect "decisions filter by who decided" "count(*) + 2" "$(api "$D/api/decisions?decided_by=dashboard:root")"
+BY_MODEL=$(api "$D/api/decisions?decided_by_kind=model&limit=1000")
+expect "  and by the kind of decider" "/*ask-gemini*/" "$BY_MODEL"
+if grep -qF "ask-dashboard" <<<"$BY_MODEL"; then fail "  a person's decision is not a model's"; else pass "  a person's decision is not a model's"; fi
 
 echo "agent work and undo"
 OUT=$(agent coding-agent $T "UPDATE orders SET status='refunded', total=0 WHERE id IN (10,11,12); INSERT INTO customers VALUES (100,'New Co',NULL); INSERT INTO orders (customer_id,status,total) VALUES (100,'paid',9.99); DELETE FROM customers WHERE id = 3")
@@ -869,7 +904,7 @@ SELECT status, total FROM orders WHERE id = :id;
 UPDATE orders SET total = total WHERE id = :id;
 SQL
 for mode in extended prepared; do
-  OUT=$(docker run --rm -v "$WORK:/w" -e PGPASSWORD=$T $CLIENT pgbench -h host.docker.internal -p $PROXY \
+  OUT=$(docker run "${HOST_NET[@]}" --rm -v "$WORK:/w" -e PGPASSWORD=$T $CLIENT pgbench -h host.docker.internal -p $PROXY \
         -U coding-agent -n -M $mode -c 4 -t 50 -f /w/bench.sql app 2>&1 || true)
   expect "pgbench $mode: 200 transactions" "processed: 200/200" "$OUT"
 done
@@ -887,20 +922,76 @@ expect "so nothing ran under an old name" "0" "$(admin -tAc "SELECT count(*) FRO
 echo "audit"
 expect "audit chain intact" "decisions log intact" "$($BIN "${CFG[@]}" audit)"
 
+echo "connection limits"
+# A second ariodb in front of the same database, with room for three
+# connections, two per agent, and 1.5 s to log in.
+cat > "$WORK/limits.toml" <<EOF
+[database]
+url = "postgres://ariodb_gw:gw-local-test-only@127.0.0.1:$PORT/app"
+tls = "require"
+
+[limits]
+max_connections = 3
+max_connections_per_agent = 2
+handshake_timeout_ms = 1500
+
+[proxy]
+listen = "127.0.0.1:$LIMP"
+
+[journal]
+enabled = false
+dir = "$WORK/limits-state"
+
+[dashboard]
+listen = "127.0.0.1:$LIMD"
+public_url = "http://127.0.0.1:$LIMD"
+
+[[agents]]
+name = "coding-agent"
+access = "read_write"
+tables = ["orders", "customers"]
+token_env = "E2E_AGENT_TOKEN"
+
+[[agents]]
+name = "second-agent"
+access = "read_only"
+tables = ["orders"]
+token_env = "E2E_SECOND_TOKEN"
+EOF
+export E2E_SECOND_TOKEN=second-token-local-test-only
+$BIN --config "$WORK/limits.toml" serve >"$WORK/serve-limits.log" 2>&1 &
+LIMITS_PID=$!
+for _ in $(seq 1 100); do port_open $LIMP && port_open $LIMD && break; sleep 0.2; done
+limits() { python3 -I scripts/conn_limits.py "$@" 2>&1 || true; }
+expect "a client that never finishes its startup is cut off after the timeout" "cut off in time" "$(limits slow $LIMP 1500)"
+OUT=$(limits pg $LIMP coding-agent $T second-agent $E2E_SECOND_TOKEN)
+expect "an agent over its own limit is refused with 53300" 'third session for coding-agent: 53300 ariodb: too many connections for agent "coding-agent"' "$OUT"
+expect "a burst over max_connections is refused with 53300" "burst: 5 x 53300 ariodb: sorry, too many clients already" "$OUT"
+expect "  while an open session keeps working" "open session still works: 42" "$OUT"
+expect "  and places are given back when sessions end" "after closing, a new session logs in" "$OUT"
+[ "$(grep -c 'refusing new connections' "$WORK/serve-limits.log")" = 1 ] && pass "the burst is logged once" || { cat "$WORK/serve-limits.log"; fail "the burst should be logged once"; }
+expect "the dashboard answers 503 when full" "HTTP/1.1 503" "$(limits http-full $LIMD 3)"
+kill $LIMITS_PID 2>/dev/null; wait $LIMITS_PID 2>/dev/null || true
+
 echo "TLS"
 kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null || true
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost,DNS:host.docker.internal" \
   -keyout "$WORK/key.pem" -out "$WORK/cert.pem" >/dev/null 2>&1
-sed -i.bak "s|^\[proxy\]$|[proxy]\ntls_cert = \"$WORK/cert.pem\"\ntls_key = \"$WORK/key.pem\"\nrequire_tls = true|" "$WORK/ariodb.toml"
+python3 -I - "$WORK/ariodb.toml" "$WORK" <<'PY'
+import sys
+path, work = sys.argv[1:]
+text = open(path).read().replace("[proxy]\n", f'[proxy]\ntls_cert = "{work}/cert.pem"\ntls_key = "{work}/key.pem"\nrequire_tls = true\n', 1)
+open(path, "w").write(text)
+PY
 $BIN "${CFG[@]}" serve >"$WORK/serve-tls.log" 2>&1 &
 SERVE_PID=$!
 wait_for_proxy
 tls_agent() {
-  docker run --rm -e PGPASSWORD="$T" $CLIENT \
+  docker run "${HOST_NET[@]}" --rm -e PGPASSWORD="$T" $CLIENT \
     psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=$1" -c "$2" 2>&1 || true
 }
-expect "TLS connection works" "SSL connection" "$(docker run --rm -e PGPASSWORD="$T" $CLIENT \
+expect "TLS connection works" "SSL connection" "$(docker run "${HOST_NET[@]}" --rm -e PGPASSWORD="$T" $CLIENT \
   psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=require" -c '\conninfo' 2>&1 || true)"
 expect "queries work over TLS" "(1 row)" "$(tls_agent require "SELECT 1")"
 expect "plaintext refused when TLS required" "requires TLS" "$(tls_agent disable "SELECT 1")"

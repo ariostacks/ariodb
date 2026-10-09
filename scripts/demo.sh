@@ -13,6 +13,18 @@ BIN=./target/debug/ariodb
 PG=ariodb-demo-pg
 DIR=.ariodb-demo
 SERVE_PID=""
+# Client containers reach ariodb on this machine as host.docker.internal.
+# Docker Desktop resolves that name itself. On Linux a client shares the
+# host's network instead, with the name pointing at 127.0.0.1, where ariodb
+# listens: the host-gateway address reaches the host only on its Docker
+# bridge, which listeners on 127.0.0.1 do not accept.
+if [ "$(uname -s)" = Linux ]; then
+  HOST_NET=(--network host --add-host=host.docker.internal:127.0.0.1)
+else
+  HOST_NET=(--add-host=host.docker.internal:host-gateway)
+fi
+# Whether something listens on a local port (bash's /dev/tcp, so no nc).
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 rm -rf "$DIR"; mkdir -p "$DIR"; chmod 700 "$DIR"
 trap 'kill $SERVE_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true' EXIT
 
@@ -80,11 +92,11 @@ printf 'demo-dashboard-password\n' | $BIN --config "$DIR/ariodb.toml" dashboard-
 export ARIODB_JOURNAL_URL=postgres://postgres:demo-admin-pw@127.0.0.1:55440/app
 $BIN --config "$DIR/ariodb.toml" serve &
 SERVE_PID=$!
-until nc -z 127.0.0.1 6543 2>/dev/null; do sleep 0.2; done
+until port_open 6543; do sleep 0.2; done
 
 # A little agent activity so the dashboard has something to show.
 A="host=host.docker.internal port=6543 user=coding-agent dbname=app sslmode=disable"
-run() { docker run --rm -e PGPASSWORD=$DEMO_AGENT_TOKEN postgres:16 psql "$A" -c "$1" >/dev/null 2>&1 || true; }
+run() { docker run "${HOST_NET[@]}" --rm -e PGPASSWORD=$DEMO_AGENT_TOKEN postgres:16 psql "$A" -c "$1" >/dev/null 2>&1 || true; }
 run "SELECT count(*) FROM orders"
 run "UPDATE orders SET status = 'refunded' WHERE id IN (5, 6, 7)"
 run "DELETE FROM customers WHERE id = 9"
@@ -92,7 +104,7 @@ run "DELETE FROM orders"
 run "UPDATE orders SET status = 'void' WHERE id < 600"
 run "SELECT pg_read_file('/etc/passwd')"
 run "SELECT * FROM secrets"
-( docker run --rm -e PGPASSWORD=$DEMO_AGENT_TOKEN postgres:16 psql "$A" -c "SELECT name, email FROM customers LIMIT 3" >/dev/null 2>&1 || true ) &
+( docker run "${HOST_NET[@]}" --rm -e PGPASSWORD=$DEMO_AGENT_TOKEN postgres:16 psql "$A" -c "SELECT name, email FROM customers LIMIT 3" >/dev/null 2>&1 || true ) &
 
 echo
 echo "ariodb demo is running."

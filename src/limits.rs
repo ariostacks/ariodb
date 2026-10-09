@@ -139,8 +139,8 @@ impl Limiter {
         }
     }
 
-    /// Log the first refusal of a burst, with how many the last burst
-    /// refused after it was logged. `what` is only called to log.
+    /// Log the first refusal (or accept error) of a burst, with how many
+    /// more the previous burst had. `what` is only called to log.
     fn note_refusal(&self, key: &str, what: impl FnOnce() -> String) {
         let mut bursts = self.bursts.lock().expect("bursts lock");
         let burst = bursts.entry(key.to_string()).or_default();
@@ -153,11 +153,11 @@ impl Limiter {
         }
         let before = match burst.unlogged {
             0 => String::new(),
-            n => format!(" (the previous burst refused {n} more)"),
+            n => format!(" ({n} more in the previous burst)"),
         };
         burst.unlogged = 0;
         eprintln!(
-            "ariodb: {}: {}; further refusals are not logged until {} s pass without one{before}",
+            "ariodb: {}: {}; not logged again until {} s pass without one{before}",
             self.name,
             what(),
             BURST_GAP.as_secs()

@@ -691,8 +691,10 @@ summary such as `ariodb: reads yes; checked writes yes; undo yes`.
   function-call protocol; messages up to 1 MiB.
 - `statement_timeout_ms` is a default agents can change unless a rule
   stops them.
-- No connection pooling, connection limits or handshake timeouts; put the
-  listener behind network controls.
+- No connection pooling. Connections are bounded by `[limits]
+  max_connections`, `max_connections_per_agent` and `handshake_timeout_ms`
+  (see [configuration](configuration.md#limits)); put the listener behind
+  network controls too.
 - Undo needs PostgreSQL 14 or later with logical replication.
 
 ## Next

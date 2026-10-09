@@ -370,8 +370,10 @@ conn = pymysql.connect(host="ariodb.internal", port=3307, user="coding-agent",
   database. Read tables in other databases by naming them in full
   (`reporting.daily`), if the agent's list allows them.
 - **The version** agents see is the real server's.
-- **Ten seconds to log in.** A client that has not finished the handshake
-  by then is disconnected.
+- **Time to log in.** A client that has not finished the handshake within
+  `[limits] handshake_timeout_ms` (ten seconds by default) is disconnected.
+  Over `max_connections`, a client gets error 1040 in place of the
+  handshake; an agent over `max_connections_per_agent` gets error 1203.
 - **Connection ids are ariodb's own.** The id in the handshake (what the
   `mysql` client prints as "Your MySQL connection id is ...") is ariodb's,
   and `KILL` takes that id. `SELECT CONNECTION_ID()` returns the server's
@@ -1156,8 +1158,9 @@ summary such as `ariodb: MySQL: reads yes; checked writes yes; undo yes`
   without a primary key, or values the binlog does not carry in full, and
   needs the binlog kept for as long as ariodb might be down.
 - **`ariodb mcp`** speaks to Postgres only.
-- No connection pooling, connection limits or rate limits; put the
-  listener behind network controls.
+- No connection pooling or rate limits; connections are bounded by
+  `[limits]` (see [configuration](configuration.md#limits)). Put the
+  listener behind network controls too.
 
 ## Next
 

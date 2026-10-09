@@ -21,6 +21,8 @@ PROXY=$((6594 + OFF))
 WORK=$(mktemp -d)
 trap 'kill $SERVE_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 SERVE_PID=
+# Whether something listens on a local port (bash's /dev/tcp, so no nc).
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 cargo build -q
 BIN=$PWD/target/debug/ariodb
@@ -85,7 +87,7 @@ ARIODB_JOURNAL_URL=postgres://postgres:sim-local-test-only@127.0.0.1:$PORT/app \
 $BIN --config "$WORK/ariodb.toml" serve >"$WORK/serve.log" 2>&1 &
 SERVE_PID=$!
 for _ in $(seq 1 100); do
-  nc -z 127.0.0.1 $PROXY 2>/dev/null && break
+  port_open $PROXY && break
   kill -0 $SERVE_PID 2>/dev/null || { cat "$WORK/serve.log"; exit 1; }
   sleep 0.2
 done

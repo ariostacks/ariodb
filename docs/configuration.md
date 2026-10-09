@@ -215,7 +215,7 @@ in its own protocol rather than cut off without a word:
 ariodb logs the first refusal of a burst, such as `ariodb: Postgres proxy:
 refusing new connections: 256 are open, the limit ([limits]
 max_connections)`, and no more until 10 seconds pass without one; the next
-burst's line says how many the previous one refused. At most 64 clients
+burst's line says how many more the previous one refused. At most 64 clients
 over the limit are answered at once; beyond that, new connections are
 closed at once. The three connection keys take effect for the next
 connection after a reload; connections already open keep their places.

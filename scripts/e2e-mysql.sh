@@ -30,6 +30,18 @@ trap 'echo "stopped at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 pass() { printf '  \033[32mpass\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
+# Client containers reach ariodb on this machine as host.docker.internal.
+# Docker Desktop resolves that name itself. On Linux a client shares the
+# host's network instead, with the name pointing at 127.0.0.1, where ariodb
+# listens: the host-gateway address reaches the host only on its Docker
+# bridge, which listeners on 127.0.0.1 do not accept.
+if [ "$(uname -s)" = Linux ]; then
+  HOST_NET=(--network host --add-host=host.docker.internal:127.0.0.1)
+else
+  HOST_NET=(--add-host=host.docker.internal:host-gateway)
+fi
+# Whether something listens on a local port (bash's /dev/tcp, so no nc).
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 expect() { if grep -qF -- "$2" <<<"$3"; then pass "$1"; else echo "$3"; fail "$1"; fi; }
 expect_not() { if grep -qF -- "$2" <<<"$3"; then echo "$3"; fail "$1"; else pass "$1"; fi; }
 
@@ -186,7 +198,7 @@ start_ariodb() {
   $BIN "${CFG[@]}" serve >"$WORK/serve.log" 2>&1 &
   SERVE_PID=$!
   for _ in $(seq 1 100); do
-    nc -z 127.0.0.1 $PROXY 2>/dev/null && return 0
+    port_open $PROXY && return 0
     kill -0 $SERVE_PID 2>/dev/null || { cat "$WORK/serve.log"; fail "ariodb exited"; }
     sleep 0.2
   done
@@ -198,7 +210,7 @@ start_ariodb
 agent() { # agent <user> <token> <sql> [client options]
   local user=$1 token=$2 sql=$3; shift 3
   [ $# -eq 0 ] && set -- "${PLAIN[@]}"
-  docker run --rm "$IMAGE" $CLIENT -h host.docker.internal -P $PROXY -u "$user" -p"$token" \
+  docker run "${HOST_NET[@]}" --rm "$IMAGE" $CLIENT -h host.docker.internal -P $PROXY -u "$user" -p"$token" \
     "$@" app -e "$sql" 2>&1 | grep -v 'Using a password' || true
 }
 raw() { python3 -I scripts/mysql_raw.py $PROXY "$@" 2>&1 || true; }
@@ -210,7 +222,7 @@ expect "agent reads with its token (caching_sha2_password)" "1000" "$(agent codi
 expect "wrong token refused" "wrong token" "$(agent coding-agent not-the-token "SELECT 1")"
 expect "unknown agent refused" "unknown agent" "$(agent nobody $T "SELECT 1")"
 expect "agent without MySQL access refused" "no MySQL access" "$(agent pg-only $E2E_PGONLY_TOKEN "SELECT 1")"
-expect "another login database refused" "may only use database 'app'" "$(docker run --rm "$IMAGE" $CLIENT -h host.docker.internal -P $PROXY -u coding-agent -p$T "${PLAIN[@]}" other -e "SELECT 1" 2>&1 || true)"
+expect "another login database refused" "may only use database 'app'" "$(docker run "${HOST_NET[@]}" --rm "$IMAGE" $CLIENT -h host.docker.internal -P $PROXY -u coding-agent -p$T "${PLAIN[@]}" other -e "SELECT 1" 2>&1 || true)"
 expect "mysql_native_password login works too" "ROW 1000" "$(raw coding-agent $T "Q:SELECT COUNT(*) FROM orders")"
 
 echo "reads"
@@ -316,7 +328,7 @@ expect "held statement runs once approved" "1000" "$(cat "$OUT")"
 ID=$(wait_for_pending); $BIN "${CFG[@]}" deny "$ID" --note "not during the freeze" >/dev/null; wait $BG
 expect "denied statement is refused with the note" "not during the freeze" "$(cat "$OUT")"
 # An agent that leaves while its statement waits must not have it run later.
-docker run -d --name "$LEAVER" "$IMAGE" $CLIENT -h host.docker.internal -P $PROXY -u coding-agent -p$T "${PLAIN[@]}" app \
+docker run "${HOST_NET[@]}" -d --name "$LEAVER" "$IMAGE" $CLIENT -h host.docker.internal -P $PROXY -u coding-agent -p$T "${PLAIN[@]}" app \
   -e "UPDATE orders SET status = 'left-behind' WHERE id = 77 AND 'ask-dashboard' <> ''" >/dev/null
 ID=$(wait_for_pending)
 docker rm -f "$LEAVER" >/dev/null
@@ -329,6 +341,41 @@ expect "nothing is left waiting" "nothing waiting for approval" "$($BIN "${CFG[@
 
 echo "decisions log"
 expect "decisions are logged with their engine" "decisions log intact" "$($BIN "${CFG[@]}" audit)"
+# Who decided the approvals of the newest decision with this outcome whose
+# statement has the text.
+decided_by() { # decided_by <outcome> <text>
+  python3 -I - "$WORK/state/ariodb.db" "$1" "$2" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+row = db.execute("SELECT decided_by FROM decisions WHERE outcome = ? AND instr(sql, ?) > 0 ORDER BY id DESC LIMIT 1", sys.argv[2:]).fetchone()
+print(row[0] if row else "no such decision")
+PY
+}
+expect "an approved statement names who approved it" '["cli:' "$(decided_by allowed "SELECT 'ask-dashboard', COUNT(*) FROM orders")"
+expect "a denied one names who denied it" '["cli:' "$(decided_by refused "SET status = 'held' WHERE id = 8")"
+
+echo "connection limits"
+# Room for two connections, for a moment: the config reloads while ariodb runs.
+set_max_connections() { # set_max_connections <n or "">
+  local reloads; reloads=$(grep -c "reloaded" "$WORK/serve.log" || true)
+  python3 -I - "$WORK/ariodb.toml" "$1" <<'PY'
+import re, sys
+path, n = sys.argv[1:]
+s = re.sub(r"max_connections = \d+\n", "", open(path).read())
+if n:
+    s = s.replace("statement_timeout_ms = 5000\n", f"statement_timeout_ms = 5000\nmax_connections = {n}\n", 1)
+open(path, "w").write(s)
+PY
+  for _ in $(seq 1 50); do
+    [ "$(grep -c "reloaded" "$WORK/serve.log" || true)" -gt "$reloads" ] && return 0
+    sleep 0.2
+  done
+  fail "the config was not reloaded"
+}
+set_max_connections 2
+expect "a client over max_connections gets error 1040" "ERROR 1040 (08004): ariodb: too many connections" "$(python3 -I scripts/conn_limits.py mysql-full $PROXY 2 2>&1 || true)"
+set_max_connections ""
+expect "and connections are accepted again once the limit is lifted" "1000" "$(agent coding-agent $T "SELECT COUNT(*) FROM orders")"
 
 echo "TLS"
 kill $SERVE_PID 2>/dev/null || true; wait $SERVE_PID 2>/dev/null || true

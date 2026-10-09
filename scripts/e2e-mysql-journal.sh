@@ -220,12 +220,14 @@ agent() {
 human() {
   timeout 30 docker exec -i -e MYSQL_PWD=human-test-only-pw "$NAME" $CLI -h127.0.0.1 -uhuman --default-character-set=utf8mb4 shop -e "$1"
 }
+# sha256sum on Linux, shasum on macOS.
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
 # Every row of every table, as the server prints it.
 fingerprint() {
   {
     root shop -e "SELECT * FROM customers ORDER BY id; SELECT * FROM orders ORDER BY id; SELECT * FROM items ORDER BY id"
     root shop -e "SELECT *, HEX(data), HEX(bin), HEX(code), HEX(bits), HEX(latin), HEX(ratio), HEX(score), HEX(lsize), HEX(lflags) FROM kinds ORDER BY id"
-  } | shasum | cut -d' ' -f1
+  } | sha256 | cut -d' ' -f1
 }
 # Wait until the journal has recorded what is asked.
 wait_for() { # wait_for <needle> [--all]

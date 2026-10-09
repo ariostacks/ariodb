@@ -644,6 +644,10 @@ Helpers used by the scripts:
 - [`scripts/mock_services.py`](../scripts/mock_services.py): local stand-ins
   for Slack, a webhook receiver and the model providers' APIs, which check
   what ariodb sends.
+- [`scripts/conn_limits.py`](../scripts/conn_limits.py): connection limits
+  from the client side: a client that never finishes its startup, an agent
+  over its own limit, a burst over a full listener, for Postgres, MySQL and
+  HTTP.
 
 The undo simulation brackets every write with a snapshot of the whole
 database, predicts each undo from those snapshots alone, and fails with the
@@ -652,6 +656,11 @@ The same seed always produces the same workload.
 
 `E2E_OFFSET` and `E2E_NAME` shift ports and container names so several
 runs (for example from different worktrees) do not collide.
+
+The scripts run on macOS with Docker Desktop and on Linux. Client
+containers reach ariodb as `host.docker.internal`: Docker Desktop provides
+the name, and on Linux the scripts run clients on the host's network with
+the name pointing at `127.0.0.1`, where ariodb listens.
 
 When you fix a security issue, add a test that fails without the fix, as
 every item in the review in [SECURITY.md](../SECURITY.md) has.

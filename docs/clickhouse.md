@@ -208,7 +208,9 @@ clickhouse-client --secure --host ariodb.internal --port 9001 \
   --user coding-agent --password agent-token-local-test-only --query 'SELECT 1'
 ```
 
-A native client has ten seconds to complete the TLS handshake.
+A client has `[limits] handshake_timeout_ms` (ten seconds by default) to
+complete the TLS handshake and log in; see
+[configuration](configuration.md#limits) for the connection limits.
 
 ### From ariodb to ClickHouse
 

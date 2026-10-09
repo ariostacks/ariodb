@@ -435,8 +435,10 @@ Other limits that matter for sizing:
   refused. Use several smaller statements.
 - `ariodb mcp` returns at most 500 rows per query.
 - Memory grows with concurrent connections and result sizes passing
-  through; there are no connection limits on the listeners, so bound them
-  with network controls (see [the security model](security-model.md)).
+  through. `[limits] max_connections` and `max_connections_per_agent`
+  bound the connections on each listener (see
+  [configuration](configuration.md#limits)); network controls bound who
+  can use them (see [the security model](security-model.md)).
 
 ## High availability
 

@@ -39,8 +39,9 @@ when you press Ctrl-C:
    `secrets`, and a read of customer emails that waits for approval.
 
 The sample statements run through a `postgres:16` container that reaches
-ariodb at `host.docker.internal`, which Docker Desktop provides. On Linux
-without it, they fail quietly; run them yourself instead.
+ariodb at `host.docker.internal`: Docker Desktop provides the name, and on
+Linux the script runs the container on the host's network with the name
+pointing at `127.0.0.1`.
 
 Then connect as the agent and open the dashboard:
 

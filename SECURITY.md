@@ -63,8 +63,12 @@ found and fixed, and how to report a vulnerability.
   are the only control. ClickHouse reads run with `readonly = 2`, which
   still lets a query change most other settings (resource limits, for
   example); ariodb always sets `max_execution_time` itself.
-- **Denial of service.** There are no connection limits or handshake
-  timeouts on the listeners. Put them behind network controls.
+- **Denial of service.** Each listener holds at most `[limits]
+  max_connections` connections, each agent at most
+  `max_connections_per_agent`, and a client has `handshake_timeout_ms` to
+  log in (see [configuration](docs/configuration.md#limits)). Within those
+  limits, clients that never log in can still take a listener's places
+  from agents. Put the listeners behind network controls.
 - **Plugins are trusted code.** A plugin runs as ariodb's user, with that
   user's files and network. It sees the statements it is asked to approve
   or supply facts about, every event it is sent, and (as an audit sink) the
@@ -180,6 +184,7 @@ without the fix.
 | 11 | Low | Model approver (`approvals.rs`) | The decision cache was keyed on approver, agent and SQL only: a changed policy kept old answers, and an outage under fail-open was cached as an allow for the whole window. The cache never shrank. | Keyed on approver, model, policy, agent, database, rule and SQL; only the model's own answers are cached; expired entries are swept. |
 | 12 | Low | Undo (`undo.rs`) | Recorded values were quoted as `'...'`, which is only safe while the server has `standard_conforming_strings` on. | Values containing a backslash are written as `E'...'` with backslashes doubled. |
 | 13 | Low | ClickHouse native (`clickhouse_native.rs`) | Before authentication, each Hello field could make ariodb allocate up to 64 MiB. | Login fields capped at 64 KiB. |
+| 14 | Low | Listeners (`limits.rs`) | No connection limits or handshake timeouts: any number of clients could connect, and slow ones could hold connections open. | `[limits] max_connections` per listener, `max_connections_per_agent` once logged in, and `handshake_timeout_ms` for TLS, startup and login, on every listener; clients over a limit get their protocol's error. |
 
 ### Accepted, with reasons
 
@@ -189,7 +194,7 @@ without the fix.
 | A2 | Medium | Postgres policy | Tables read through views and functions are not on the allow-list (see the threat model). | Parsing cannot see inside functions; database grants are the boundary. |
 | A3 | Medium | Model approver | Prompt injection through SQL text remains possible. | Mitigated (data passed as JSON, instruction to ignore it, structured output, fail-closed by default); do not rely on a model alone. |
 | A4 | Low | Dashboard first run (`dashboard.rs`) | The first password can be set by any request from a loopback address. Behind a reverse proxy on the same host, every request is from loopback. | Set the password with `ariodb dashboard-password` (or before exposing the dashboard). |
-| A5 | Low | Listeners | No connection limits or handshake timeouts; slow clients can hold connections open. | Network controls; agents are authenticated before any database work. |
+| A5 | Low | Listeners | Within `[limits] max_connections`, clients that never log in can take a listener's places from agents until the handshake timeout. | Network controls; agents are authenticated before any database work, refused clients are told so, and refusals are logged. |
 | A6 | Low | Postgres proxy auth | Unknown agent names fail slightly faster than known ones, and token guesses are not rate limited. | Tokens should be long random values, which makes guessing hopeless whatever the rate. |
 | A7 | Low | ClickHouse HTTP | Agents may send their token as a `password` URL parameter, which intermediaries may log. | Supported for client compatibility; prefer Basic auth or `X-ClickHouse-Key`. |
 | A8 | Low | Dashboard login limit | Twenty wrong passwords for a user, from anywhere, lock that user out for 15 minutes; the counts live in memory and reset on restart. | A deliberate trade-off against distributed guessing. |
