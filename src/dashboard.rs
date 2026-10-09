@@ -60,7 +60,7 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/me", get(me))
         .route("/api/approvals", get(list_approvals))
         .route("/api/approvals/{id}", post(decide_approval))
-        .route("/hooks/approvals/{id}", get(hook_decide))
+        .route("/hooks/approvals/{id}", get(hook_confirm).post(hook_decide))
         .route("/slack/actions", post(slack_actions))
         .merge(api)
         .with_state(state)
@@ -252,10 +252,24 @@ async fn setup(
 
 async fn login(
     AxState(state): AxState<Arc<State>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Credentials>,
 ) -> Result<Response, ApiError> {
     same_origin(&headers)?;
+    let now = store::now_ms();
+    let address = format!("address:{}", addr.ip());
+    let user_key = format!("user:{}", body.user);
+    if LOGINS
+        .lock()
+        .expect("login limiter")
+        .blocked(&address, &user_key, now)
+    {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed logins; wait 15 minutes and try again".into(),
+        ));
+    }
     let stored: Option<String> = state.db.with(|c| {
         c.query_row(
             "SELECT password_hash FROM dashboard_users WHERE name = ?1",
@@ -264,22 +278,96 @@ async fn login(
         )
         .optional()
     })?;
-    let ok = stored
-        .as_deref()
-        .and_then(|h| PasswordHash::new(h).ok())
-        .is_some_and(|h| {
-            Argon2::default()
-                .verify_password(body.password.as_bytes(), &h)
-                .is_ok()
-        });
+    // Unknown users are checked against a dummy hash, so the time a wrong
+    // answer takes does not say whether the user exists.
+    let known = stored.is_some();
+    let hash = stored.unwrap_or_else(|| DUMMY_HASH.clone());
+    let verified = PasswordHash::new(&hash).is_ok_and(|h| {
+        Argon2::default()
+            .verify_password(body.password.as_bytes(), &h)
+            .is_ok()
+    });
+    let ok = known && verified;
     if !ok {
+        LOGINS.lock().expect("login limiter").failed(
+            &address,
+            known.then_some(user_key.as_str()),
+            now,
+        );
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "wrong user name or password".into(),
         ));
     }
+    LOGINS
+        .lock()
+        .expect("login limiter")
+        .succeeded(&address, &user_key);
     start_session(&state, &body.user)
+}
+
+/// A hash of a password nobody uses, to verify unknown users against.
+static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    hash_password(&hex::encode(rand::random::<[u8; 16]>())).unwrap_or_default()
+});
+
+static LOGINS: std::sync::LazyLock<std::sync::Mutex<LoginLimiter>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(LoginLimiter::default()));
+
+const LOGIN_WINDOW_MS: i64 = 15 * 60 * 1000;
+/// Failed logins one client address may make in the window.
+const MAX_FAILURES_PER_ADDRESS: u32 = 5;
+/// Failed logins against one user in the window, from anywhere. Higher than
+/// the per-address cap, so one noisy address cannot lock a person out, but
+/// it still bounds guessing spread over many addresses.
+const MAX_FAILURES_PER_USER: u32 = 20;
+/// Past this many tracked keys, expired ones are swept out.
+const MAX_TRACKED: usize = 10_000;
+
+/// Counts failed dashboard logins per client address and per user name.
+/// Argon2 makes each guess slow; this caps how many guesses anyone gets.
+/// Counts live in memory, so a restart clears them.
+#[derive(Default)]
+pub struct LoginLimiter {
+    /// Key to (failures, start of the window in ms).
+    failures: std::collections::HashMap<String, (u32, i64)>,
+}
+
+impl LoginLimiter {
+    fn count(&self, key: &str, now: i64) -> u32 {
+        match self.failures.get(key) {
+            Some((n, start)) if now - start < LOGIN_WINDOW_MS => *n,
+            _ => 0,
+        }
+    }
+
+    /// Should this attempt be refused without checking the password?
+    pub fn blocked(&self, address: &str, user: &str, now: i64) -> bool {
+        self.count(address, now) >= MAX_FAILURES_PER_ADDRESS
+            || self.count(user, now) >= MAX_FAILURES_PER_USER
+    }
+
+    /// Record a failure. `user` is only counted for users that exist, so
+    /// made-up names cannot fill the table.
+    pub fn failed(&mut self, address: &str, user: Option<&str>, now: i64) {
+        if self.failures.len() > MAX_TRACKED {
+            self.failures
+                .retain(|_, (_, start)| now - *start < LOGIN_WINDOW_MS);
+        }
+        for key in std::iter::once(address).chain(user) {
+            let entry = self.failures.entry(key.to_string()).or_insert((0, now));
+            if now - entry.1 >= LOGIN_WINDOW_MS {
+                *entry = (0, now);
+            }
+            entry.0 += 1;
+        }
+    }
+
+    pub fn succeeded(&mut self, address: &str, user: &str) {
+        self.failures.remove(address);
+        self.failures.remove(user);
+    }
 }
 
 fn start_session(state: &State, user: &str) -> Result<Response, ApiError> {
@@ -396,6 +484,54 @@ struct HookQuery {
     token: String,
 }
 
+/// A webhook decision link, opened in a browser. Chat apps and mail
+/// scanners fetch links to preview them, so a GET only shows what would be
+/// decided; the decision itself needs the POST this page's button sends.
+async fn hook_confirm(
+    AxState(state): AxState<Arc<State>>,
+    Path(id): Path<String>,
+    Query(q): Query<HookQuery>,
+) -> Response {
+    let config = state.config();
+    if !matches!(q.verdict.as_str(), "allow" | "deny")
+        || !crate::approvals::verify_link(&config, &id, &q.verdict, &q.token)
+    {
+        return hook_page(
+            StatusCode::FORBIDDEN,
+            "<p>This approval link is not valid.</p>".into(),
+        );
+    }
+    let Ok(Some(a)) = state.db.approval(&id) else {
+        return hook_page(
+            StatusCode::NOT_FOUND,
+            "<p>No such approval request.</p>".into(),
+        );
+    };
+    let action = if q.verdict == "allow" {
+        "Approve"
+    } else {
+        "Deny"
+    };
+    let target = format!(
+        "/hooks/approvals/{}?verdict={}&token={}",
+        html_escape(&id),
+        html_escape(&q.verdict),
+        html_escape(&q.token)
+    );
+    hook_page(
+        StatusCode::OK,
+        format!(
+            "<p>Agent <b>{}</b> wants to run:</p><pre>{}</pre><p>Rule: {} ({}). Status: {}.</p>\
+             <form method=\"post\" action=\"{target}\"><button type=\"submit\">{action} this request</button></form>",
+            html_escape(&a.agent),
+            html_escape(&a.sql),
+            html_escape(&a.rule),
+            html_escape(&a.reason),
+            html_escape(&a.status),
+        ),
+    )
+}
+
 async fn hook_decide(
     AxState(state): AxState<Arc<State>>,
     Path(id): Path<String>,
@@ -405,27 +541,58 @@ async fn hook_decide(
     if !matches!(q.verdict.as_str(), "allow" | "deny")
         || !crate::approvals::verify_link(&config, &id, &q.verdict, &q.token)
     {
-        return (
+        return hook_page(
             StatusCode::FORBIDDEN,
-            Html("<p>This approval link is not valid.</p>"),
-        )
-            .into_response();
+            "<p>This approval link is not valid.</p>".into(),
+        );
     }
     match state.db.decide(&id, q.verdict == "allow", "webhook", None) {
-        Ok(true) => Html(format!(
-            "<p>Recorded: {}.</p>",
-            if q.verdict == "allow" {
-                "approved"
-            } else {
-                "denied"
-            }
-        ))
-        .into_response(),
-        Ok(false) => {
-            Html("<p>This request was already decided or has expired.</p>").into_response()
-        }
+        Ok(true) => hook_page(
+            StatusCode::OK,
+            format!(
+                "<p>Recorded: {}.</p>",
+                if q.verdict == "allow" {
+                    "approved"
+                } else {
+                    "denied"
+                }
+            ),
+        ),
+        Ok(false) => hook_page(
+            StatusCode::OK,
+            "<p>This request was already decided or has expired.</p>".into(),
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+/// The small pages behind webhook links: no scripts, never framed (so the
+/// button cannot be clickjacked), and the token in the URL is not passed on.
+fn hook_page(status: StatusCode, body: String) -> Response {
+    (
+        status,
+        [
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+            ),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        Html(format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>ariodb approval</title>{body}"
+        )),
+    )
+        .into_response()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 async fn slack_actions(
@@ -441,12 +608,13 @@ async fn slack_actions(
             .unwrap_or("")
             .to_string()
     };
-    if !crate::approvals::verify_slack(
+    let signed_by = crate::approvals::verify_slack(
         &config,
         &h("x-slack-request-timestamp"),
         &body,
         &h("x-slack-signature"),
-    ) {
+    );
+    if signed_by.is_empty() {
         return (StatusCode::UNAUTHORIZED, "bad signature").into_response();
     }
     let payload = form_urlencoded::parse(body.as_bytes())
@@ -459,6 +627,16 @@ async fn slack_actions(
     let (Some(kind), Some(id)) = (action["action_id"].as_str(), action["value"].as_str()) else {
         return (StatusCode::BAD_REQUEST, "no action").into_response();
     };
+    // A Slack signature only speaks for requests waiting on that Slack
+    // approver, not for ones meant for the dashboard or another approver.
+    let waiting_on = state.db.approval(id).ok().flatten().map(|a| a.approver);
+    if !waiting_on.is_some_and(|name| signed_by.contains(&name)) {
+        return (
+            StatusCode::FORBIDDEN,
+            "this request is not waiting on a Slack approver",
+        )
+            .into_response();
+    }
     let who = payload["user"]["username"]
         .as_str()
         .or(payload["user"]["id"].as_str())
@@ -474,4 +652,49 @@ async fn slack_actions(
     };
     Json(json!({ "response_type": "in_channel", "replace_original": false, "text": text }))
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_limiter_caps_guesses() {
+        let mut l = LoginLimiter::default();
+        let (addr, user) = ("address:192.0.2.7", "user:root");
+        for _ in 0..MAX_FAILURES_PER_ADDRESS {
+            assert!(!l.blocked(addr, user, 1_000));
+            l.failed(addr, Some(user), 1_000);
+        }
+        // That address is now refused, even with the right password.
+        assert!(l.blocked(addr, user, 2_000));
+        // Another address may still try the same user...
+        assert!(!l.blocked("address:198.51.100.1", user, 2_000));
+        // ...until guesses at that user from anywhere reach their own cap.
+        for i in 0..MAX_FAILURES_PER_USER {
+            l.failed(&format!("address:203.0.113.{i}"), Some(user), 3_000);
+        }
+        assert!(l.blocked("address:198.51.100.1", user, 3_000));
+        // The window passes.
+        assert!(!l.blocked(addr, user, 3_000 + LOGIN_WINDOW_MS));
+        // A success clears the counts for that address and user.
+        l.failed(addr, Some(user), 5_000);
+        l.succeeded(addr, user);
+        assert_eq!(l.count(addr, 5_000) + l.count(user, 5_000), 0);
+    }
+
+    #[test]
+    fn made_up_user_names_are_not_tracked() {
+        let mut l = LoginLimiter::default();
+        l.failed("address:192.0.2.7", None, 1_000);
+        assert_eq!(l.failures.len(), 1);
+    }
+
+    #[test]
+    fn hook_pages_escape_what_they_show() {
+        assert_eq!(
+            html_escape(r#"<script>"x" & 'y'</script>"#),
+            "&lt;script&gt;&quot;x&quot; &amp; &#39;y&#39;&lt;/script&gt;"
+        );
+    }
 }
