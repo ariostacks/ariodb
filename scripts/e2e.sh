@@ -14,11 +14,18 @@ BIN=./target/debug/ariodb
 # so ports and container names do not collide.
 OFF=${E2E_OFFSET:-0}
 PG=ariodb-e2e-pg${E2E_NAME:+-$E2E_NAME}
+# The database under test (any Postgres-compatible image), its superuser,
+# and the image whose psql and pgbench act as the agent.
+PG_IMAGE=${PG_IMAGE:-postgres:16}
+PG_SUPERUSER=${PG_SUPERUSER:-postgres}
+PG_ARGS=${PG_ARGS:--c wal_level=logical}
+CLIENT=${CLIENT_IMAGE:-postgres:16}
 PORT=$((55433 + OFF))
 PROXY=$((6544 + OFF))
 DASH=$((8091 + OFF))
 MOCK=$((8092 + OFF))
 WORK=$(mktemp -d)
+SERVE_PID=""
 trap 'kill $SERVE_PID $MOCK_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 python3 -I "$(dirname "$0")/mock_services.py" $MOCK "$WORK/mock.log" &
 MOCK_PID=$!
@@ -35,15 +42,15 @@ wait_for_proxy() {
 pass() { printf '  \033[32mpass\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 
-admin() { docker exec -i $PG psql -q -v ON_ERROR_STOP=1 -U postgres -d app "$@"; }
+admin() { docker exec -i -e PGPASSWORD=local-test-only-pw $PG psql -q -v ON_ERROR_STOP=1 -U $PG_SUPERUSER -d app "$@"; }
 # Run SQL through the proxy as an agent. Prints psql output, never fails.
 agent() {
-  docker run --rm -e PGPASSWORD="$2" postgres:16 \
+  docker run --rm -e PGPASSWORD="$2" $CLIENT \
     psql "host=host.docker.internal port=$PROXY user=$1 dbname=app sslmode=disable" -c "$3" 2>&1 || true
 }
 # Same, but the SQL is a psql script on stdin (needed for \bind).
 agent_script() {
-  printf '%s\n' "$3" | docker run --rm -i -e PGPASSWORD="$2" postgres:16 \
+  printf '%s\n' "$3" | docker run --rm -i -e PGPASSWORD="$2" $CLIENT \
     psql "host=host.docker.internal port=$PROXY user=$1 dbname=app sslmode=disable" 2>&1 || true
 }
 expect() { # expect <description> <needle> <output>
@@ -56,12 +63,32 @@ fingerprint() {
 echo "starting Postgres"
 docker rm -f $PG >/dev/null 2>&1 || true
 docker run -d --name $PG -e POSTGRES_PASSWORD=local-test-only-pw -e POSTGRES_DB=app \
-  -p 127.0.0.1:$PORT:5432 postgres:16 -c wal_level=logical \
-  -c ssl=on -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem \
-  -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key >/dev/null
-until docker exec $PG psql -U postgres -d app -tAc 'SELECT 1' >/dev/null 2>&1; do sleep 1; done
-sleep 2
-until docker exec $PG psql -U postgres -d app -tAc 'SELECT 1' >/dev/null 2>&1; do sleep 1; done
+  -p 127.0.0.1:$PORT:5432 $PG_IMAGE $PG_ARGS >/dev/null
+# Images often restart once after first-run setup; wait for a steady server.
+ready() {
+  local ok=0
+  for _ in $(seq 1 180); do
+    if docker exec -e PGPASSWORD=local-test-only-pw $PG psql -U $PG_SUPERUSER -d app -tAc 'SELECT 1' >/dev/null 2>&1; then
+      ok=$((ok + 1)); [ $ok -ge 3 ] && return 0
+    else
+      ok=0
+    fi
+    sleep 1
+  done
+  docker logs $PG 2>&1 | tail -20; fail "Postgres did not become ready"
+}
+ready
+# Server TLS with a throwaway certificate, so it works on any image.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+  -keyout "$WORK/pg.key" -out "$WORK/pg.crt" >/dev/null 2>&1
+PGDATA_DIR=$(docker exec -e PGPASSWORD=local-test-only-pw $PG psql -U $PG_SUPERUSER -d app -tAc 'SHOW data_directory')
+docker cp "$WORK/pg.crt" $PG:"$PGDATA_DIR/ariodb-test.crt"
+docker cp "$WORK/pg.key" $PG:"$PGDATA_DIR/ariodb-test.key"
+PG_OWNER=$(docker exec $PG stat -c %U "$PGDATA_DIR")
+docker exec -u 0 $PG sh -c "chown $PG_OWNER '$PGDATA_DIR'/ariodb-test.* && chmod 600 '$PGDATA_DIR'/ariodb-test.key"
+docker exec -e PGPASSWORD=local-test-only-pw $PG psql -q -U $PG_SUPERUSER -d app -c "ALTER SYSTEM SET ssl_cert_file = 'ariodb-test.crt'" \
+  -c "ALTER SYSTEM SET ssl_key_file = 'ariodb-test.key'" -c "ALTER SYSTEM SET ssl = on" -c "SELECT pg_reload_conf()" >/dev/null
+echo "testing $PG_IMAGE: $(docker exec -e PGPASSWORD=local-test-only-pw $PG psql -U $PG_SUPERUSER -d app -tAc 'SELECT version()')"
 
 admin <<'SQL'
 CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL, email text);
@@ -219,9 +246,18 @@ CFG=(--config "$WORK/ariodb.toml")
 printf '%s\n' "$E2E_BOT_TOKEN" | $BIN "${CFG[@]}" secret set bot-token >/dev/null
 printf '%s\n' "postgres://ariodb_ro:ro-local-test-only@127.0.0.1:$PORT/app" | $BIN "${CFG[@]}" secret set pg-readonly >/dev/null
 
+echo "doctor"
+DOC=$($BIN "${CFG[@]}" doctor 2>&1 || true)
+expect "doctor: reads are forced read-only" "yes  reads, forced read-only" "$DOC"
+expect "doctor: writes can be checked" "yes  writes, checked before commit" "$DOC"
+expect "doctor: undo needs setup first" "no   undo of agent sessions: not set up (run ariodb setup)" "$DOC"
+expect "doctor: the credential login is checked too" "credential 'pg-readonly'" "$DOC"
+
 # Setup needs table ownership, so run it as the admin.
-ARIODB_JOURNAL_URL=postgres://postgres:local-test-only-pw@127.0.0.1:$PORT/app $BIN "${CFG[@]}" setup >/dev/null
+ARIODB_JOURNAL_URL=postgres://$PG_SUPERUSER:local-test-only-pw@127.0.0.1:$PORT/app $BIN "${CFG[@]}" setup >/dev/null
 pass "setup"
+DOC=$($BIN "${CFG[@]}" doctor 2>&1) || { echo "$DOC"; fail "doctor passes after setup"; }
+expect "doctor: undo works after setup" "yes  undo of agent sessions" "$DOC"
 
 $BIN "${CFG[@]}" serve >"$WORK/serve.log" 2>&1 &
 SERVE_PID=$!
@@ -315,7 +351,7 @@ ID=$(wait_for_pending); $BIN "${CFG[@]}" deny "$ID" --note "not during the freez
 expect "denied statement is refused with the note" "not during the freeze" "$(cat "$OUT")"
 expect "approval timeout refuses" "no decision from 'ops-quick' within 3 seconds" "$(agent coding-agent $T "SELECT /*ask-quick*/ 1 FROM orders")"
 # An agent that leaves while its statement waits must not have it run later.
-docker run -d --name ariodb-leaver${E2E_NAME:+-$E2E_NAME} -e PGPASSWORD=$T postgres:16 \
+docker run -d --name ariodb-leaver${E2E_NAME:+-$E2E_NAME} -e PGPASSWORD=$T $CLIENT \
   psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=disable" \
   -c "UPDATE orders SET status = 'left-behind' WHERE id = 77 /*ask-dashboard*/" >/dev/null
 ID=$(wait_for_pending)
@@ -324,8 +360,8 @@ sleep 1.5
 expect "a waiting request is withdrawn when the agent disconnects" "the agent disconnected" "$($BIN "${CFG[@]}" approvals --all | grep -A1 "$ID")"
 expect "and can no longer be approved" "is not pending" "$($BIN "${CFG[@]}" approve "$ID" 2>&1 || true)"
 expect "so the statement never ran" "paid" "$(admin -tAc "SELECT status FROM orders WHERE id = 77")"
-OUT=$(python3 -I scripts/pg_cancel.py $PROXY coding-agent $T "SELECT /*ask-dashboard*/ count(*) FROM orders" 1.5 2>&1 || true)
-expect "a cancel request withdraws a waiting statement" "the agent cancelled the statement" "$OUT"
+CANCELLED=$(python3 -I scripts/pg_cancel.py $PROXY coding-agent $T "SELECT /*ask-dashboard*/ count(*) FROM orders" 1.5 2>&1 || true)
+expect "a cancel request withdraws a waiting statement" "the agent cancelled the statement" "$CANCELLED"
 
 D=http://127.0.0.1:$DASH
 JSONH='content-type: application/json'
@@ -479,7 +515,7 @@ SELECT status, total FROM orders WHERE id = :id;
 UPDATE orders SET total = total WHERE id = :id;
 SQL
 for mode in extended prepared; do
-  OUT=$(docker run --rm -v "$WORK:/w" -e PGPASSWORD=$T postgres:16 pgbench -h host.docker.internal -p $PROXY \
+  OUT=$(docker run --rm -v "$WORK:/w" -e PGPASSWORD=$T $CLIENT pgbench -h host.docker.internal -p $PROXY \
         -U coding-agent -n -M $mode -c 4 -t 50 -f /w/bench.sql app 2>&1 || true)
   expect "pgbench $mode: 200 transactions" "processed: 200/200" "$OUT"
 done
@@ -507,10 +543,10 @@ $BIN "${CFG[@]}" serve >"$WORK/serve-tls.log" 2>&1 &
 SERVE_PID=$!
 wait_for_proxy
 tls_agent() {
-  docker run --rm -e PGPASSWORD="$T" postgres:16 \
+  docker run --rm -e PGPASSWORD="$T" $CLIENT \
     psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=$1" -c "$2" 2>&1 || true
 }
-expect "TLS connection works" "SSL connection" "$(docker run --rm -e PGPASSWORD="$T" postgres:16 \
+expect "TLS connection works" "SSL connection" "$(docker run --rm -e PGPASSWORD="$T" $CLIENT \
   psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=require" -c '\conninfo' 2>&1 || true)"
 expect "queries work over TLS" "(1 row)" "$(tls_agent require "SELECT 1")"
 expect "plaintext refused when TLS required" "requires TLS" "$(tls_agent disable "SELECT 1")"

@@ -101,7 +101,7 @@ pub fn read_all(config: &Config) -> Result<Vec<TxnRecord>, String> {
 }
 
 /// The connection the journal uses. It needs the REPLICATION attribute.
-fn journal_url(config: &Config) -> String {
+pub fn journal_url(config: &Config) -> String {
     std::env::var("ARIODB_JOURNAL_URL").unwrap_or_else(|_| config.database_url())
 }
 
@@ -189,6 +189,24 @@ pub async fn setup(config: &Config) -> Result<(), String> {
         ))
         .await
         .map_err(err)?;
+    // Postgres 18 refuses updates and deletes on a table whose full replica
+    // identity includes generated columns the publication leaves out.
+    let version: i32 = client
+        .query_one("SELECT current_setting('server_version_num')", &[])
+        .await
+        .map_err(err)?
+        .get::<_, String>(0)
+        .parse()
+        .unwrap_or(0);
+    if version >= 180000 {
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {} SET (publish_generated_columns = stored)",
+                quote_ident(publication)
+            ))
+            .await
+            .map_err(err)?;
+    }
     println!(
         "ok   publication '{publication}' covers {}",
         tables.join(", ")
@@ -217,22 +235,42 @@ pub async fn setup(config: &Config) -> Result<(), String> {
 }
 
 /// Read changes forever, appending to the journal.
+/// Connection failures are retried; each new error is reported once.
 pub async fn run(config: &Config) -> Result<(), String> {
     fs::create_dir_all(&config.journal.dir).map_err(|e| e.to_string())?;
-    let client = connect(config, &journal_url(config)).await?;
     let path = journal_path(config);
-    let mut relations: HashMap<u32, (String, String, Vec<Column>)> = HashMap::new();
-    println!("ariodb: journal is recording changes to {}", path.display());
-
+    let mut last_error = String::new();
+    let mut report = |e: String| {
+        if e != last_error {
+            eprintln!("ariodb journal: {e}");
+            last_error = e;
+        }
+    };
     loop {
-        match poll_once(&client, config, &path, &mut relations).await {
-            Ok(0) => tokio::time::sleep(Duration::from_millis(500)).await,
-            Ok(_) => {}
+        let client = match connect(config, &journal_url(config)).await {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("ariodb journal: {e}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                report(e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        let mut relations: HashMap<u32, (String, String, Vec<Column>)> = HashMap::new();
+        println!("ariodb: journal is recording changes to {}", path.display());
+        loop {
+            match poll_once(&client, config, &path, &mut relations).await {
+                Ok(0) => tokio::time::sleep(Duration::from_millis(500)).await,
+                Ok(_) => {}
+                Err(e) => {
+                    report(e);
+                    if client.is_closed() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
             }
         }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

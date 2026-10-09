@@ -195,6 +195,24 @@ pub struct Database {
     /// Connect through this tunnel instead of the URL's host and port.
     /// Also used by setup, the journal and undo.
     pub tunnel: Option<String>,
+    /// How a write is judged before commit. See `WriteCheck`.
+    #[serde(default)]
+    pub write_check: WriteCheck,
+}
+
+/// How ariodb learns what a write did before deciding whether to commit it.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteCheck {
+    /// Measure every table the transaction changed, including through
+    /// triggers, cascades and functions (`pg_stat_xact_user_tables`).
+    #[default]
+    Measured,
+    /// Trust the row counts the database reports for each statement. For
+    /// Postgres-compatible databases that cannot measure (CockroachDB,
+    /// YugabyteDB). Changes made by triggers, cascades and functions are
+    /// not seen.
+    Reported,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -439,25 +457,27 @@ impl Config {
                 )?,
                 &self.database.tunnel,
             ),
-            Some(name) => {
-                let cred = self
-                    .credentials
-                    .iter()
-                    .find(|c| &c.name == name)
-                    .ok_or_else(|| format!("credential '{name}' is not defined"))?;
-                let url = match (&cred.url_env, &cred.secret) {
-                    (Some(env), _) => std::env::var(env)
-                        .map_err(|_| format!("credential '{name}': set {env} to its postgres:// URL"))?,
-                    (None, Some(secret)) => self.secret(secret)?.ok_or_else(|| {
-                        format!("credential '{name}': secret '{secret}' is not set (ariodb secret set {secret})")
-                    })?,
-                    (None, None) => return Err(format!("credential '{name}' needs url_env or secret")),
-                };
-                let target =
-                    Target::from_url(&url, cred.tls.or(self.database.tls), cred.ca_file.clone())?;
-                self.through(target, &cred.tunnel)
-            }
+            Some(name) => self.credential_target(name).map(|(target, _)| target),
         }
+    }
+
+    /// A named credential's connection target and URL.
+    pub fn credential_target(&self, name: &str) -> Result<(Target, String), String> {
+        let cred = self
+            .credentials
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| format!("credential '{name}' is not defined"))?;
+        let url = match (&cred.url_env, &cred.secret) {
+            (Some(env), _) => std::env::var(env)
+                .map_err(|_| format!("credential '{name}': set {env} to its postgres:// URL"))?,
+            (None, Some(secret)) => self.secret(secret)?.ok_or_else(|| {
+                format!("credential '{name}': secret '{secret}' is not set (ariodb secret set {secret})")
+            })?,
+            (None, None) => return Err(format!("credential '{name}' needs url_env or secret")),
+        };
+        let target = Target::from_url(&url, cred.tls.or(self.database.tls), cred.ca_file.clone())?;
+        Ok((self.through(target, &cred.tunnel)?, url))
     }
 
     /// The admin connection (setup, journal, undo) uses the default database

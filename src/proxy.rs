@@ -277,18 +277,27 @@ const COMMIT: &str = "__ariodb_commit";
 const ROLLBACK: &str = "__ariodb_rollback";
 
 async fn prepare_internal(session: &mut Session) -> Result<(), String> {
-    let statements = [
+    let mut statements = vec![
         (BEGIN_RO, "BEGIN READ ONLY"),
         (BEGIN_RW, "BEGIN"),
         (TIMEOUT, "SELECT set_config('statement_timeout', $1, true)"),
         (
-            TAG,
-            "SELECT pg_logical_emit_message(true, 'ariodb', $1::text)",
+            EFFECTS,
+            gate::effects_sql(if session.measured {
+                crate::config::WriteCheck::Measured
+            } else {
+                crate::config::WriteCheck::Reported
+            }),
         ),
-        (EFFECTS, gate::EFFECTS_SQL),
         (COMMIT, "COMMIT"),
         (ROLLBACK, "ROLLBACK"),
     ];
+    if session.tagging {
+        statements.push((
+            TAG,
+            "SELECT pg_logical_emit_message(true, 'ariodb', $1::text)",
+        ));
+    }
     let mut out = Vec::new();
     for (name, sql) in statements {
         out.extend_from_slice(&wire::parse_message(name, sql));
@@ -691,7 +700,7 @@ impl Connection {
                 out.extend(internal_op(begin, &[]));
                 let timeout = config.limits.statement_timeout_ms.to_string();
                 out.extend(internal_op(TIMEOUT, &[&timeout]));
-                if plan == Plan::Write && config.journal.enabled {
+                if plan == Plan::Write && self.session.tagging {
                     let tag = serde_json::json!({ "session": self.session.id, "agent": self.session.agent.name }).to_string();
                     out.extend(internal_op(TAG, &[&tag]));
                 }
@@ -732,12 +741,19 @@ impl Connection {
                 status = self.exchange(&tail, Hold::All).await?.status;
             } else {
                 let effects = gate::parse_effects(&outcome.internal_rows);
-                rows = Some(gate::total_rows(&effects));
+                let reported = wire::reported_rows(&send);
+                rows = Some(if self.session.measured {
+                    gate::total_rows(&effects)
+                } else {
+                    reported
+                });
                 let verdict = gate::judge_write(
                     &self.session.state,
                     &self.session.ctx(),
                     &executed,
                     &effects,
+                    reported,
+                    self.session.measured,
                 )
                 .await;
                 let end = if verdict.is_ok() { COMMIT } else { ROLLBACK };

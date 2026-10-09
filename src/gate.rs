@@ -228,20 +228,35 @@ pub async fn check_detailed(
 
 /// Judge a write by what it actually did, against the row limit, the
 /// agent's tables and any after-stage rules. `Err` means roll it back.
+/// `reported` is how many rows the database said the statements changed.
+/// `measured` is false under `write_check = "reported"`, when `effects` is
+/// empty and the reported count is all there is.
 pub async fn judge_write(
     state: &State,
     ctx: &Ctx<'_>,
     statements: &[Statement],
     effects: &[Effect],
+    reported: u64,
+    measured: bool,
 ) -> Result<(), Refusal> {
     let config = state.config();
-    judge_effects(&config, ctx.agent, effects)?;
+    let (rows, tables) = if measured {
+        judge_measurement(effects, reported)?;
+        judge_effects(&config, ctx.agent, effects)?;
+        (
+            effects.iter().map(|e| e.rows).sum(),
+            effects.iter().map(|e| e.table.clone()).collect(),
+        )
+    } else {
+        judge_reported(&config, ctx.agent, reported)?;
+        (reported as i64, write_tables(statements))
+    };
     let facts = EffectFacts {
         agent: ctx.agent,
         statements,
         database: ctx.database,
-        rows: effects.iter().map(|e| e.rows).sum(),
-        tables: effects.iter().map(|e| e.table.clone()).collect(),
+        rows,
+        tables,
     };
     match state.rules().evaluate_effects(&facts) {
         RuleOutcome::Deny { rule, reason } => {
@@ -288,6 +303,55 @@ pub fn parse_effects(rows: &[Vec<Option<String>>]) -> Vec<Effect> {
             Some(Effect { table, rows })
         })
         .collect()
+}
+
+/// Under `write_check = "reported"`: only the row limit can be applied; the
+/// tables were checked from the statements before they ran.
+pub fn judge_reported(config: &Config, agent: &Agent, reported: u64) -> Result<(), Refusal> {
+    let limit = agent
+        .max_rows_per_write
+        .unwrap_or(config.limits.max_rows_per_write);
+    if reported > limit {
+        return Err(Refusal::new(format!(
+            "rolled back: the statement would change {reported} rows (as reported by the database); the limit is {limit}"
+        )));
+    }
+    Ok(())
+}
+
+/// The tables the write statements name.
+pub fn write_tables(statements: &[Statement]) -> Vec<String> {
+    let mut t: Vec<String> = statements
+        .iter()
+        .filter(|s| s.kind != Kind::Read)
+        .flat_map(|s| s.tables.iter().map(|t| crate::classify::normalise_table(t)))
+        .collect();
+    t.sort();
+    t.dedup();
+    t
+}
+
+/// What the hidden effects statement runs: the measurement, or under
+/// `write_check = "reported"` an empty result of the same shape.
+pub fn effects_sql(check: crate::config::WriteCheck) -> &'static str {
+    match check {
+        crate::config::WriteCheck::Measured => EFFECTS_SQL,
+        crate::config::WriteCheck::Reported => "SELECT NULL::text, NULL::bigint WHERE false",
+    }
+}
+
+/// The measurement must account for at least the rows the database itself
+/// reported changing. If it does not, it cannot be trusted (some
+/// Postgres-compatible databases leave `pg_stat_xact_user_tables` empty, and
+/// foreign tables are not counted), so the write is rolled back.
+pub fn judge_measurement(effects: &[Effect], reported: u64) -> Result<(), Refusal> {
+    let measured = total_rows(effects);
+    if reported > measured {
+        return Err(Refusal::new(format!(
+            "rolled back: the database reported {reported} changed rows but ariodb measured {measured}, so this write cannot be checked (run `ariodb doctor`)"
+        )));
+    }
+    Ok(())
 }
 
 /// Judge a write by what it actually did. `Err` means roll it back.
@@ -340,4 +404,45 @@ pub fn tables(statements: &[Statement]) -> Vec<String> {
     t.sort();
     t.dedup();
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn effect(table: &str, rows: i64) -> Effect {
+        Effect {
+            table: table.to_string(),
+            rows,
+        }
+    }
+
+    #[test]
+    fn a_measurement_short_of_the_reported_rows_is_refused() {
+        // CockroachDB: the stats view answers but stays empty.
+        let r = judge_measurement(&[], 5).unwrap_err();
+        assert!(r.message.contains("reported 5 changed rows but ariodb measured 0"), "{}", r.message);
+        assert!(judge_measurement(&[effect("public.orders", 3)], 4).is_err());
+        // Cascades and triggers make the measurement larger, never smaller.
+        assert!(judge_measurement(&[effect("public.orders", 3), effect("public.log", 3)], 3).is_ok());
+        assert!(judge_measurement(&[], 0).is_ok());
+    }
+
+    #[test]
+    fn reported_rows_come_from_write_tags_only() {
+        let c = |tag: &str| {
+            let mut body = tag.as_bytes().to_vec();
+            body.push(0);
+            crate::wire::frame(b'C', &body)
+        };
+        let frames = vec![
+            c("INSERT 0 3"),
+            c("UPDATE 5"),
+            c("DELETE 1"),
+            c("MERGE 2"),
+            c("SELECT 100"),
+            crate::wire::frame(b'D', b"\0\0"),
+        ];
+        assert_eq!(crate::wire::reported_rows(&frames), 11);
+    }
 }

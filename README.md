@@ -150,10 +150,18 @@ url = "postgres://ariodb_gw:not-a-real-password@db.internal:5432/app"
 tls = "verify"                # disable | require | verify; default: disable on localhost, verify elsewhere
 ca_file = "/etc/ariodb/db-ca.pem"
 # tunnel = "cloudsql"         # dial a [[tunnels]] entry instead of the URL's host
+# write_check = "reported"    # only for databases that cannot measure writes; see below
 ```
 
 `url` must start with `postgres://` or `postgresql://` even when the real
 URL comes from `ARIODB_DATABASE_URL` or `secret`.
+
+Postgres 14 to 18 are tested, as are TimescaleDB, Supabase, YugabyteDB and
+CockroachDB; undo needs Postgres 14 or later with logical replication.
+`write_check = "reported"` lets writes through on databases that cannot
+measure them (YugabyteDB, CockroachDB), with a weaker check. See
+[docs/compatibility.md](docs/compatibility.md), and run `ariodb doctor`
+against your own database.
 
 ### `[limits]`
 
@@ -415,6 +423,7 @@ Every command takes `-c, --config <path>` (default `ariodb.toml`).
 | `classify <sql>` | Show how ariodb understands a statement (no config needed) |
 | `explain --agent <name> <sql>` | Show what the policy and before-stage rules would decide, without running it |
 | `setup` | Prepare the database for the journal (run once, as a table owner with `REPLICATION`) |
+| `doctor` | Check what this database supports: reads forced read-only, writes checked before commit, undo. Read-only; exit 1 if a check fails |
 | `serve` | Run the proxy, journal, dashboard, ClickHouse listeners and tunnels |
 | `mcp --agent <name>` | Run an MCP server on stdio for one agent (token in `ARIODB_AGENT_TOKEN`) |
 | `sessions` | List agent sessions that changed data |
@@ -509,6 +518,8 @@ example `./scripts/demo.sh`), then `cd dashboard && npm run dev`; Vite passes
 cargo test                      # unit and property tests (PROPTEST_CASES=100000 for a longer hunt)
 cargo build && ./scripts/e2e.sh # end to end against Postgres in Docker
 ./scripts/e2e-clickhouse.sh     # end to end against ClickHouse in Docker (needs cargo build)
+PG_IMAGE=postgres:18 ./scripts/e2e.sh          # the full suite against another Postgres-compatible image
+./scripts/e2e-compat.sh cockroach              # YugabyteDB (yugabyte) or CockroachDB (cockroach)
 ./scripts/sim-undo.sh           # seeded random agent and human writes, then undo, checked against a model
 SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh   # other seeds, longer runs
 ```
@@ -526,6 +537,9 @@ and `E2E_NAME` keep parallel runs of the scripts apart.
 - **ClickHouse native `INSERT` is refused** (as are external tables): use
   the HTTP interface for inserts. ClickHouse writes cannot be rolled back or
   undone; rules and approvals are the only control.
+- **Undo needs Postgres 14 or later** with logical replication. YugabyteDB
+  and CockroachDB have no undo, and need `write_check = "reported"` for
+  writes (see [docs/compatibility.md](docs/compatibility.md)).
 - **`COPY ... FROM STDIN` is refused**; use `INSERT`. Cursors cannot be read
   (`FETCH` is refused).
 - **No undo for `TRUNCATE` or schema changes**: agents cannot run them.

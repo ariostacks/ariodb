@@ -10,6 +10,7 @@ mod dashboard_api;
 mod dashboard_files;
 mod exec;
 mod gate;
+mod doctor;
 mod journal;
 mod mcp;
 mod pgoutput;
@@ -58,6 +59,8 @@ enum Command {
     Setup,
     /// Run the proxy agents connect to, and the change journal
     Serve,
+    /// Check what this database supports: read-only reads, checked writes, undo
+    Doctor,
     /// Run an MCP server on stdio for one agent
     Mcp {
         /// The agent name from the config file
@@ -188,6 +191,18 @@ async fn main() -> ExitCode {
         }
         Command::Classify { .. } => unreachable!("handled above"),
         Command::Setup => with_tunnels(&config, journal::setup(&config)).await,
+        Command::Doctor => {
+            with_tunnels(&config, async {
+                let report = doctor::run(&config).await;
+                report.print();
+                if report.failed() {
+                    Err("some checks failed".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+        }
         Command::Serve => match make_state(&config, &cli.config) {
             Ok(state) => serve(state).await,
             Err(e) => Err(e),
@@ -342,6 +357,19 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
         }
     });
     let config = state.config();
+    if !config.proxy.listen.is_empty() || config.journal.enabled {
+        // Say once, at startup, which guarantees this database supports.
+        let doctor_config = config.clone();
+        tokio::spawn(async move {
+            let report = doctor::run(&doctor_config).await;
+            for section in &report.sections {
+                for f in section.findings.iter().filter(|f| f.status != doctor::Status::Ok) {
+                    eprintln!("ariodb: {}: {}", section.title, f.text);
+                }
+            }
+            println!("ariodb: {}", report.summary());
+        });
+    }
     if config.journal.enabled {
         let journal_config = config.clone();
         tokio::spawn(async move {

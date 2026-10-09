@@ -43,6 +43,13 @@ pub struct Session {
     pub database: String,
     /// Whether the agent is still connected; see `gate::Liveness`.
     pub live: Arc<gate::Liveness>,
+    /// Whether writes are tagged for the journal. Fixed when the session
+    /// opens, so a database without logical replication works with the
+    /// journal off.
+    pub tagging: bool,
+    /// Whether writes are measured (`write_check = "measured"`). Fixed when
+    /// the session opens, like `tagging`.
+    pub measured: bool,
 }
 
 impl Session {
@@ -58,6 +65,8 @@ impl Session {
             state,
             database: target.database,
             live: Arc::new(gate::Liveness::default()),
+            tagging: config.journal.enabled,
+            measured: config.database.write_check == crate::config::WriteCheck::Measured,
         })
     }
 
@@ -73,7 +82,7 @@ impl Session {
             "; SET LOCAL statement_timeout = {}",
             config.limits.statement_timeout_ms
         ));
-        if plan == Plan::Write && config.journal.enabled {
+        if plan == Plan::Write && self.tagging {
             let tag =
                 serde_json::json!({ "session": self.id, "agent": self.agent.name }).to_string();
             sql.push_str(&format!(
@@ -87,7 +96,11 @@ impl Session {
     pub async fn effects(&mut self) -> Result<Result<Vec<gate::Effect>, DbError>, WireError> {
         Ok(self
             .up
-            .internal(gate::EFFECTS_SQL)
+            .internal(gate::effects_sql(if self.measured {
+                crate::config::WriteCheck::Measured
+            } else {
+                crate::config::WriteCheck::Reported
+            }))
             .await?
             .map(|r| gate::parse_effects(&r.rows)))
     }
@@ -217,8 +230,22 @@ impl Session {
                 return sink.send(wire::error_response(&e.code, &e.message)).await;
             }
         };
-        let rows = gate::total_rows(&effects);
-        if let Err(r) = gate::judge_write(&self.state, &self.ctx(), &statements, &effects).await {
+        let reported = wire::reported_rows(&held);
+        let rows = if self.measured {
+            gate::total_rows(&effects)
+        } else {
+            reported
+        };
+        if let Err(r) = gate::judge_write(
+            &self.state,
+            &self.ctx(),
+            &statements,
+            &effects,
+            reported,
+            self.measured,
+        )
+        .await
+        {
             self.end(false).await?;
             self.audit_rule(
                 sql,

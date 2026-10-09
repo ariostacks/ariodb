@@ -21,6 +21,11 @@ url = "postgres://ariodb_gw:not-a-real-password@localhost:5432/app"
 # ca_file = "/etc/ariodb/db-ca.pem"
 # Reach the database through a [[tunnels]] entry (see below).
 # tunnel = "cloudsql"
+# How writes are judged before commit. "measured" (default) sees every
+# table a write changed, including through triggers and cascades.
+# "reported" trusts the database's row counts: only for databases that
+# cannot measure (YugabyteDB, CockroachDB). `ariodb doctor` tells you which.
+# write_check = "measured"
 
 [limits]
 max_rows_per_write = 500     # a write that changes more rows is rolled back

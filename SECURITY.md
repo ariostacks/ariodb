@@ -123,6 +123,7 @@ without the fix.
 | A6 | Low | Postgres proxy auth | Unknown agent names fail slightly faster than known ones, and token guesses are not rate limited. | Tokens should be long random values, which makes guessing hopeless whatever the rate. |
 | A7 | Low | ClickHouse HTTP | Agents may send their token as a `password` URL parameter, which intermediaries may log. | Supported for client compatibility; prefer Basic auth or `X-ClickHouse-Key`. |
 | A8 | Low | Dashboard login limit | Twenty wrong passwords for a user, from anywhere, lock that user out for 15 minutes; the counts live in memory and reset on restart. | A deliberate trade-off against distributed guessing. |
+| A9 | Medium | `write_check = "reported"` | Writes are judged by the row counts the database reports, so rows and tables changed by triggers, cascades and functions are not seen. | Off by default, for databases that cannot measure writes (YugabyteDB, CockroachDB); `ariodb doctor` and the docs say what it gives up. Database grants are the backstop. |
 
 ### Reviewed with no issue found
 
@@ -131,6 +132,10 @@ without the fix.
 - Cancel requests: ariodb hands out its own random keys and maps them to
   the upstream key, so the database's own keys are never exposed.
 - Frames over 1 MiB are drained and refused; the startup message is capped.
+- The effect measurement is checked against the row counts the database
+  reports for each statement; a measurement that comes up short (as on
+  databases whose `pg_stat_xact_user_tables` stays empty, or for foreign
+  tables) rolls the write back.
 - Writes are held until the effect check passes; a refused write's results
   never reach the agent. COPY FROM STDIN is refused and aborted if it
   slips through.

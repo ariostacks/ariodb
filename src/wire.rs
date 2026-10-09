@@ -287,6 +287,24 @@ pub struct ErrorFields {
     pub message: String,
 }
 
+/// Rows the database says the agent's own writes changed, from the
+/// CommandComplete tags (`INSERT 0 3`, `UPDATE 5`, `DELETE 1`, `MERGE 2`)
+/// among raw frames.
+pub fn reported_rows(frames: &[Bytes]) -> u64 {
+    frames
+        .iter()
+        .filter(|f| f.len() > 5 && f[0] == b'C')
+        .filter_map(|f| {
+            let tag = std::str::from_utf8(&f[5..]).ok()?.trim_end_matches('\0');
+            let mut words = tag.split(' ');
+            match words.next()? {
+                "INSERT" | "UPDATE" | "DELETE" | "MERGE" => words.next_back()?.parse::<u64>().ok(),
+                _ => None,
+            }
+        })
+        .sum()
+}
+
 pub fn parse_error(body: &Bytes) -> ErrorFields {
     let mut b = body.clone();
     let mut code = String::new();
