@@ -32,6 +32,9 @@ admin "CREATE TABLE events (id UInt32, user String, kind String) ENGINE = MergeT
 admin "CREATE TABLE secrets (note String) ENGINE = MergeTree ORDER BY note"
 admin "INSERT INTO events SELECT number, concat('user', toString(number % 10)), 'view' FROM numbers(1000)"
 admin "INSERT INTO secrets VALUES ('not-a-real-secret')"
+admin "CREATE DATABASE hidden"
+admin "CREATE TABLE hidden.events (note String) ENGINE = MergeTree ORDER BY note"
+admin "INSERT INTO hidden.events VALUES ('hidden-not-a-real-secret')"
 
 cat > "$WORK/ariodb.toml" <<EOF
 [database]
@@ -116,6 +119,11 @@ expect "client settings cannot switch off read-only" "1000" "$(curl -s -u analys
 expect "rules apply to ClickHouse" "data hold" "$(ch analyst $A "SELECT count() FROM events WHERE user = 'user7'")"
 expect "schema discovery allowed" "events" "$(ch analyst $A "SELECT name FROM system.tables WHERE database = 'default'")"
 expect "system.query_log is not" "may not use table 'system.query_log'" "$(ch analyst $A "SELECT * FROM system.query_log")"
+expect "comma joins are checked" "may not use table 'secrets'" "$(ch analyst $A "SELECT * FROM events, secrets")"
+expect "IN <table> is checked" "may not use table 'secrets'" "$(ch analyst $A "SELECT count() FROM events WHERE user IN secrets")"
+expect "INSERT with a column list is checked" "may not use table 'secrets'" "$(ch loader $L "INSERT INTO secrets (note) VALUES ('planted')")"
+expect "merge() refused" "allow-list does not see" "$(ch analyst $A "SELECT * FROM merge('default', '^secrets\$')")"
+expect "another database's tables are not the allowed ones" "may not use table 'hidden.events'" "$(curl -s -u analyst:$A "http://127.0.0.1:$PROXY_HTTP/?database=hidden" --data-binary "SELECT * FROM events")"
 expect "loader inserts with data in the body" "" "$(ch loader $L "INSERT INTO events FORMAT CSV" "5001,loaded,import")"
 expect "the insert landed" "1" "$(admin "SELECT count() FROM events WHERE id = 5001")"
 expect "query parameters pass through" "user3" "$(curl -s -u analyst:$A "http://127.0.0.1:$PROXY_HTTP/?param_id=3" --data-binary "SELECT user FROM events WHERE id = {id:UInt32}")"
@@ -132,6 +140,8 @@ expect "clickhouse-client reads through ariodb" "1001" "$(cli analyst $A "SELECT
 expect "several result rows stream back" "user9" "$(cli analyst $A "SELECT DISTINCT user FROM events ORDER BY user")"
 expect "wrong token refused" "wrong token" "$(cli analyst nope "SELECT 1")"
 expect "other tables refused" "may not use table 'secrets'" "$(cli analyst $A "SELECT * FROM secrets")"
+expect "comma joins are checked over native" "may not use table 'secrets'" "$(cli analyst $A "SELECT * FROM events, secrets")"
+expect "the login database scopes table names" "may not use table 'hidden.events'" "$(cli analyst $A "SELECT * FROM events" --database hidden)"
 expect "url() refused over native too" "reaches outside the server" "$(cli analyst $A "SELECT * FROM url('http://169.254.169.254/x', CSV, 'a String')")"
 expect "rules apply over native" "data hold" "$(cli analyst $A "SELECT count() FROM events WHERE user = 'user7'")"
 expect "native inserts refused with a pointer to HTTP" "use ariodb's ClickHouse HTTP interface" "$(cli loader $L "INSERT INTO events VALUES (6000, 'x', 'y')")"
