@@ -405,8 +405,11 @@ pub struct Filter {
 }
 
 /// The deciders of a decision `d`, as a table of `value`s. Old entries
-/// store '' rather than an empty array.
-const DECIDERS_OF_D: &str = "json_each(CASE WHEN d.decided_by = '' THEN '[]' ELSE d.decided_by END)";
+/// store '' rather than an empty array; text that is not JSON (which
+/// `verify` reports as an edit) counts as none rather than failing the
+/// query.
+const DECIDERS_OF_D: &str =
+    "json_each(CASE WHEN json_valid(d.decided_by) THEN d.decided_by ELSE '[]' END)";
 
 /// The SQL condition on a decider (`value`) for a kind of decider. ariodb
 /// itself decides when a request cannot be delivered or the agent leaves.
@@ -526,7 +529,11 @@ pub fn verify(dir: &Path) -> Result<usize, String> {
             ));
         }
         let actual = hex::encode(Sha256::digest(chain_text(d.at_ms, &prev, &d).as_bytes()));
-        if actual != hash {
+        // The deciders are hashed as they read back; text that does not
+        // read back as written (not a list, or written differently) was
+        // put there by hand.
+        let deciders: String = r.get("decided_by").map_err(|e| e.to_string())?;
+        if actual != hash || deciders != deciders_text(&d.decided_by) {
             return Err(format!("chain broken at entry {} (it was edited)", d.id));
         }
         expected_prev = Some(hash);
@@ -734,6 +741,40 @@ mod tests {
         )
         .unwrap();
         assert!(verify(&dir).unwrap_err().contains("edited"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deciders_that_do_not_read_back_as_written_are_an_edit() {
+        let dir = std::env::temp_dir().join(format!("ariodb-audit-m-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = AuditLog::open(&dir, &Settings::default()).unwrap();
+        log.record(&entry("SELECT 1", &[]));
+        let by = vec!["dashboard:root".to_string()];
+        let mut e = entry("SELECT 2", &[]);
+        e.decided_by = &by;
+        log.record(&e);
+        assert_eq!(verify(&dir), Ok(2));
+        let conn = open_conn(&dir).unwrap();
+        // Text that is not a list of deciders reads back as none, which
+        // hashes as an entry without deciders did: the edit must still show,
+        // and the decisions list and its filters must still work.
+        for (id, text) in [(1, "not json"), (1, "[]"), (2, "[\"dashboard:root\"] ")] {
+            let before: String = conn
+                .query_row("SELECT decided_by FROM decisions WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap();
+            conn.execute("UPDATE decisions SET decided_by = ?1 WHERE id = ?2", rusqlite::params![text, id])
+                .unwrap();
+            assert!(verify(&dir).unwrap_err().contains("edited"), "{text}");
+            let by_root = Filter {
+                decided_by: Some("dashboard:root".into()),
+                ..Default::default()
+            };
+            assert!(query(&dir, &by_root).is_ok(), "{text}");
+            conn.execute("UPDATE decisions SET decided_by = ?1 WHERE id = ?2", rusqlite::params![before, id])
+                .unwrap();
+        }
+        assert_eq!(verify(&dir), Ok(2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -896,6 +896,8 @@ expect "prepared write landed" "8|bound" "$(admin -tAc "SELECT id, status FROM o
 expect "prepared destructive refused" "destructive" "$(agent_script coding-agent $T 'DELETE FROM orders \bind \g')"
 expect "prepared bulk write rolled back" "the limit is 500" "$(agent_script coding-agent $T "UPDATE orders SET status = \$1 WHERE id <= 900 \\bind 'x' \\g")"
 expect "prepared bulk write left no trace" "0" "$(admin -tAc "SELECT count(*) FROM orders WHERE status = 'x'")"
+expect "prepared statement a model approves runs" "(1 row)" "$(agent_script coding-agent $T 'SELECT /*ask-model*/ count(*) FROM orders WHERE id > $1 \bind 0 \g')"
+expect "  and its decision names the model" 'allowed ["model:anthropic/claude-opus-5-5"]' "$(decided_by '/*ask-model*/ count(*) FROM orders WHERE id > $1')"
 expect "statement timeout enforced" "statement timeout" "$(agent coding-agent $T "SELECT pg_sleep(8)")"
 
 cat > "$WORK/bench.sql" <<'SQL'

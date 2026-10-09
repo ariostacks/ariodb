@@ -23,8 +23,12 @@ use crate::config::Limits;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
 /// At most this many over-the-limit clients are told so at once, each
@@ -246,10 +250,13 @@ pub async fn accept(listener: &TcpListener, limiter: &Limiter) -> (TcpStream, So
 // HTTP listeners (ClickHouse HTTP and the dashboard).
 
 /// Serve an axum app within the limits: TLS (when given) and each
-/// request's headers must arrive within the handshake timeout, and a
-/// connection over `max_connections` is answered with `refused()` (a 503)
-/// and closed. `limits` gives the current config's limits. Handlers can
-/// extract `ConnectInfo<SocketAddr>`.
+/// request's headers must arrive within the handshake timeout, a request's
+/// body must keep arriving (see `BodyDeadline`), and the client must keep
+/// reading what it is sent (see `WriteDeadline`), so no client, signed in
+/// or not, can hold a place by going slow. A connection over
+/// `max_connections` is answered with `refused()` (a 503) and closed.
+/// `limits` gives the current config's limits. Handlers can extract
+/// `ConnectInfo<SocketAddr>`.
 pub async fn serve_http(
     listener: TcpListener,
     tls: Option<tokio_rustls::TlsAcceptor>,
@@ -274,14 +281,15 @@ pub async fn serve_http(
                 },
                 None => Box::new(socket),
             };
-            let io = hyper_util::rt::TokioIo::new(io);
+            let io = hyper_util::rt::TokioIo::new(WriteDeadline::new(io, timeout));
             let mut http = hyper::server::conn::http1::Builder::new();
             http.timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(timeout);
             match admission {
                 Admission::Admitted(slot) => {
                     let service = hyper::service::service_fn(
-                        move |mut req: hyper::Request<hyper::body::Incoming>| {
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let mut req = req.map(|body| BodyDeadline::new(body, timeout));
                             req.extensions_mut()
                                 .insert(axum::extract::ConnectInfo(addr));
                             tower::ServiceExt::oneshot(app.clone(), req)
@@ -301,6 +309,159 @@ pub async fn serve_http(
                 Admission::Drop => {}
             }
         });
+    }
+}
+
+/// A request body gets the handshake timeout for each `BODY_ALLOWANCE`
+/// bytes of it, counted from when the request arrived.
+const BODY_ALLOWANCE: u64 = 64 << 10;
+
+/// A request body that must keep arriving: `BODY_ALLOWANCE` bytes per
+/// handshake timeout at least, so a client cannot hold its place by
+/// sending a byte now and then. Handlers that read the body see an error
+/// once it falls behind, and the connection is closed.
+struct BodyDeadline {
+    inner: hyper::body::Incoming,
+    timeout: Duration,
+    started: tokio::time::Instant,
+    received: u64,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl BodyDeadline {
+    fn new(inner: hyper::body::Incoming, timeout: Duration) -> BodyDeadline {
+        let started = tokio::time::Instant::now();
+        BodyDeadline {
+            inner,
+            timeout,
+            started,
+            received: 0,
+            deadline: Box::pin(tokio::time::sleep_until(started + timeout)),
+        }
+    }
+}
+
+impl hyper::body::Body for BodyDeadline {
+    type Data = bytes::Bytes;
+    type Error = axum::BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.received += data.len() as u64;
+                    // At most 65536 allowances: about a week at the default.
+                    let allowances = (1 + this.received / BODY_ALLOWANCE).min(1 << 16) as u32;
+                    let deadline = this.started + this.timeout * allowances;
+                    this.deadline.as_mut().reset(deadline);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(other) => Poll::Ready(other.map(|r| r.map_err(Into::into))),
+            Poll::Pending => match this.deadline.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Some(Err(
+                    "the request body arrived too slowly ([limits] handshake_timeout_ms)".into(),
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// A connection whose client must keep reading: a write that cannot go
+/// out for the handshake timeout (the client has stopped reading, and its
+/// buffers are full) fails, and the connection is closed. Reads are not
+/// timed here: while a request waits on the database or an approval, the
+/// client rightly sends nothing.
+struct WriteDeadline<T> {
+    inner: T,
+    timeout: Duration,
+    /// Running while a write waits.
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> WriteDeadline<T> {
+    fn new(inner: T, timeout: Duration) -> WriteDeadline<T> {
+        WriteDeadline {
+            inner,
+            timeout,
+            stalled: None,
+        }
+    }
+
+    /// What a write returned, unless it has waited too long.
+    fn check<R>(&mut self, cx: &mut Context<'_>, polled: Poll<std::io::Result<R>>) -> Poll<std::io::Result<R>> {
+        if polled.is_ready() {
+            self.stalled = None;
+            return polled;
+        }
+        let timeout = self.timeout;
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+        match stalled.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the client stopped reading ([limits] handshake_timeout_ms)",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for WriteDeadline<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.check(cx, polled)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.check(cx, polled)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        self.check(cx, polled)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.check(cx, polled)
     }
 }
 
@@ -457,6 +618,111 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(http_get(addr).await.contains("hello 127.0.0.1"));
+        server.abort();
+    }
+
+    /// Serve `app` with room for one connection and a 300 ms timeout.
+    async fn one_place(app: axum::Router) -> (SocketAddr, Arc<Limiter>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limiter = Limiter::new("test", &limits(1, 1, 300));
+        let refused = || {
+            axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "too many connections",
+            ))
+        };
+        let server = tokio::spawn(serve_http(
+            listener,
+            None,
+            app,
+            limiter.clone(),
+            || limits(1, 1, 300),
+            refused,
+        ));
+        (addr, limiter, server)
+    }
+
+    /// Wait for the listener's place to be taken, then up to two seconds
+    /// for it to be given back.
+    async fn place_given_back(limiter: &Limiter) -> bool {
+        while limiter.open() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for _ in 0..100 {
+            if limiter.open() == 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_request_body_that_stops_arriving_is_cut_off() {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|body: String| async move { format!("got {}", body.len()) }),
+        );
+        let (addr, limiter, server) = one_place(app).await;
+        // The headers arrive in time, the body promised never does: no
+        // client, signed in or not, may hold the place that way.
+        let mut slow = TcpStream::connect(addr).await.unwrap();
+        slow.write_all(b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\nSELECT")
+            .await
+            .unwrap();
+        assert!(place_given_back(&limiter).await, "the slow body still holds the place");
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi")
+            .await
+            .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out).await;
+        assert!(out.contains("got 2"), "{out}");
+        // A body sent in pieces, within its time, is read whole...
+        let post = b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 4\r\nconnection: close\r\n\r\n";
+        let mut steady = TcpStream::connect(addr).await.unwrap();
+        steady.write_all(post).await.unwrap();
+        for b in b"abcd" {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            steady.write_all(&[*b]).await.unwrap();
+        }
+        let mut out = String::new();
+        let _ = steady.read_to_string(&mut out).await;
+        assert!(out.contains("got 4"), "{out}");
+        // ...but a byte now and then, each in time on its own, is too slow.
+        let mut trickle = TcpStream::connect(addr).await.unwrap();
+        trickle.write_all(post).await.unwrap();
+        let started = Instant::now();
+        for b in b"abcd" {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if trickle.write_all(&[*b]).await.is_err() {
+                break;
+            }
+        }
+        let mut out = String::new();
+        let _ = trickle.read_to_string(&mut out).await;
+        assert!(!out.contains("got 4"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_its_answer_is_cut_off() {
+        let big = "x".repeat(32 << 20);
+        let app = axum::Router::new()
+            .route("/big", axum::routing::get(move || async move { big.clone() }))
+            .route("/", axum::routing::get(|| async { "small" }));
+        let (addr, limiter, server) = one_place(app).await;
+        // Asks for a large answer and never reads it.
+        let mut stuck = TcpStream::connect(addr).await.unwrap();
+        stuck
+            .write_all(b"GET /big HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(place_given_back(&limiter).await, "the unread answer still holds the place");
+        assert!(http_get(addr).await.contains("small"));
+        drop(stuck);
         server.abort();
     }
 }
