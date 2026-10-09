@@ -418,4 +418,67 @@ mod tests {
         assert_eq!(fixtures[1].1.expect.verdict, "approve");
         assert_eq!(run(&config, &fixtures).unwrap(), (4, 0));
     }
+
+    #[test]
+    fn mysql_decisions_round_trip_as_fixtures() {
+        let text = CONFIG.replace(
+            "[limits]",
+            "[mysql]\nlisten = \"127.0.0.1:0\"\ndatabase = \"app\"\n\n[limits]",
+        ) + "\n[agents.mysql]\naccess = \"read_only\"\ntables = [\"orders\", \"users\"]\n";
+        let config = Config::from_toml(&text).unwrap();
+        let rules = RuleSet::compile(&config.rules).unwrap();
+        assert_eq!(default_database(&config, "mysql"), "app");
+        let explain = |sql: &str| preview(&config, &rules, "bot", sql, "app", "mysql");
+        assert_eq!(explain("SELECT * FROM app.orders").verdict, "allow");
+        // The rules see the same tables as on Postgres.
+        assert_eq!(explain("SELECT * FROM users").rule, "pii");
+        // The agent's MySQL access, not its Postgres access, decides.
+        let p = explain("UPDATE orders SET a = 1 WHERE id = 1");
+        assert_eq!((p.verdict, p.rule.as_str()), ("deny", "policy"));
+        assert!(p.reason.contains("read only"), "{}", p.reason);
+        assert_eq!(explain("SELECT * FROM other.orders").verdict, "deny");
+        assert_eq!(explain("SHOW PROCESSLIST").verdict, "deny");
+        assert_eq!(explain("SELECT * FROM `unterminated").verdict, "deny");
+        let no_access = preview(&config, &rules, "nobody", "SELECT 1", "app", "mysql");
+        assert_eq!(no_access.verdict, "deny");
+
+        let decision = |sql: &str, outcome: &str, rule: Option<&str>| crate::audit::Decision {
+            id: 1,
+            at_ms: 0,
+            session: "s-0123456789".into(),
+            agent: "bot".into(),
+            sql: sql.into(),
+            kind: "read".into(),
+            tables: vec![],
+            outcome: outcome.into(),
+            rows: None,
+            reason: None,
+            rule: rule.map(str::to_string),
+            latency_ms: None,
+            engine: "mysql".into(),
+            database: "app".into(),
+        };
+        let cases = [
+            decision("SELECT * FROM orders", "allowed", None),
+            decision("SELECT * FROM users", "refused", Some("pii")),
+            decision("DELETE FROM orders", "refused", None),
+            decision("SET NAMES utf8mb4", "allowed", None),
+        ];
+        let fixtures: Vec<(String, Fixture)> = cases
+            .iter()
+            .map(|d| {
+                let value = fixture_for(d, &config).unwrap();
+                assert_eq!(value["action"]["engine"], "mysql");
+                ("x".to_string(), serde_json::from_value(value).unwrap())
+            })
+            .collect();
+        assert_eq!(run(&config, &fixtures).unwrap(), (4, 0));
+
+        // A hand-written fixture without a database runs in [mysql] database.
+        let written: Fixture = serde_json::from_str(
+            r#"{"action":{"agent":"bot","engine":"mysql","sql":{"statement":"SELECT * FROM app.orders"}},"match":{"verdict":"allow"}}"#,
+        )
+        .unwrap();
+        assert_eq!(run(&config, &[("w".to_string(), written)]).unwrap(), (1, 0));
+    }
 }

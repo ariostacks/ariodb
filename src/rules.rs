@@ -10,7 +10,7 @@
 //! | `sql.functions` | list | Functions called, lower case |
 //! | `sql.statement` | string | The statement as sent |
 //! | `sql.database` | string | The database the agent connected to |
-//! | `sql.engine` | string | `postgres` or `clickhouse` |
+//! | `sql.engine` | string | `postgres`, `clickhouse` or `mysql` (MySQL and MariaDB) |
 //! | `agent.name`, `agent.access` | string | Who is asking |
 //! | `effects.rows` | int | Rows actually changed (after-stage rules only) |
 //! | `effects.tables` | list | Tables actually changed, including by triggers (after-stage only) |

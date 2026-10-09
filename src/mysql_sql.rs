@@ -21,8 +21,8 @@
 
 use crate::classify::{Kind, ParseError, Statement};
 use sqlparser::ast::{
-    Expr, ObjectName, ObjectNamePart, ObjectType, Query, Select, SetExpr, Statement as Ast, TableFactor,
-    TableWithJoins, Visit, Visitor,
+    Expr, ObjectName, ObjectNamePart, ObjectType, Query, Select, SetExpr, Statement as Ast,
+    TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -255,11 +255,16 @@ fn blank_comments(sql: &str, lexemes: &[Lexeme]) -> String {
 }
 
 /// Where each string and quoted name starts, as (line, column) counted the
-/// way sqlparser counts them: both from 1, columns in characters.
+/// way sqlparser counts them: both from 1, columns in characters. sqlparser
+/// reads `0x1F` as a hex string, so those count too.
 fn quote_positions(sql: &str, lexemes: &[Lexeme]) -> Vec<(u64, u64)> {
     let mut starts: Vec<usize> = lexemes
         .iter()
-        .filter(|l| matches!(l.tok, Tok::Str(_) | Tok::Name(_)))
+        .filter(|l| match &l.tok {
+            Tok::Str(_) | Tok::Name(_) => true,
+            Tok::Word(w) => w.starts_with("0x"),
+            _ => false,
+        })
         .map(|l| l.start)
         .collect();
     starts.sort();
@@ -329,6 +334,11 @@ fn statement(
     if toks.is_empty() && !runs_comment {
         return Ok(None);
     }
+    if operator_depth(&toks) > MAX_OPERATOR_DEPTH {
+        return Err(ParseError(
+            "this expression is too long for ariodb to check; use IN (...) for long lists".into(),
+        ));
+    }
     let mut judged = if runs_comment {
         Judged::new(
             Kind::Unknown,
@@ -355,6 +365,55 @@ fn statement(
     }))
 }
 
+/// sqlparser reads `a + b + c ...` and `x = 1 OR x = 2 ...` iteratively but
+/// builds a tree as deep as the chain, and walking or dropping that tree
+/// recurses once per level. A few thousand levels would overflow a thread's
+/// stack and take the proxy down, so chains are capped well below that.
+const MAX_OPERATOR_DEPTH: usize = 1000;
+
+/// An upper bound on how deep operator chains could nest a parsed tree:
+/// operators counted since the last comma at each level of parentheses,
+/// summed over the levels open at once.
+fn operator_depth(toks: &[Lexeme]) -> usize {
+    const OPERATOR_WORDS: &[&str] = &[
+        "and", "or", "xor", "not", "div", "mod", "like", "regexp", "rlike", "between", "is", "in",
+        "collate", "member", "sounds", "escape",
+    ];
+    let mut levels = vec![0usize];
+    let (mut open, mut max) = (0usize, 0usize);
+    for t in toks {
+        let operator = match &t.tok {
+            Tok::Punct('(') => {
+                levels.push(0);
+                false
+            }
+            Tok::Punct(')') => {
+                open -= levels.pop().unwrap_or(0);
+                if levels.is_empty() {
+                    levels.push(0);
+                }
+                false
+            }
+            Tok::Punct(',') => {
+                if let Some(top) = levels.last_mut() {
+                    open -= *top;
+                    *top = 0;
+                }
+                false
+            }
+            Tok::Punct(c) => "+-*/%&|^<>=!~".contains(*c),
+            Tok::Word(w) => OPERATOR_WORDS.iter().any(|o| w.eq_ignore_ascii_case(o)),
+            _ => false,
+        };
+        if operator && let Some(top) = levels.last_mut() {
+            *top += 1;
+            open += 1;
+            max = max.max(open);
+        }
+    }
+    max
+}
+
 /// The `i`th token as a lower-case keyword, or "" if it is not a bare word.
 fn word(toks: &[Lexeme], i: usize) -> String {
     match toks.get(i).map(|l| &l.tok) {
@@ -378,11 +437,49 @@ fn text_of<'a>(text: &'a str, toks: &[Lexeme]) -> &'a str {
 /// The command name for a statement starting with `verb`, as MySQL names it.
 fn command_for(verb: &str) -> &'static str {
     const VERBS: &[&str] = &[
-        "SELECT", "INSERT", "REPLACE", "UPDATE", "DELETE", "SHOW", "DESCRIBE", "EXPLAIN",
-        "ANALYZE", "SET", "USE", "KILL", "BEGIN", "START", "COMMIT", "ROLLBACK", "SAVEPOINT",
-        "RELEASE", "XA", "LOCK", "UNLOCK", "CALL", "PREPARE", "EXECUTE", "DEALLOCATE", "DO",
-        "HANDLER", "LOAD", "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "GRANT", "REVOKE",
-        "OPTIMIZE", "REPAIR", "CHECK", "CHECKSUM", "FLUSH", "RESET", "PURGE", "INSTALL",
+        "SELECT",
+        "INSERT",
+        "REPLACE",
+        "UPDATE",
+        "DELETE",
+        "SHOW",
+        "DESCRIBE",
+        "EXPLAIN",
+        "ANALYZE",
+        "SET",
+        "USE",
+        "KILL",
+        "BEGIN",
+        "START",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RELEASE",
+        "XA",
+        "LOCK",
+        "UNLOCK",
+        "CALL",
+        "PREPARE",
+        "EXECUTE",
+        "DEALLOCATE",
+        "DO",
+        "HANDLER",
+        "LOAD",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "TRUNCATE",
+        "RENAME",
+        "GRANT",
+        "REVOKE",
+        "OPTIMIZE",
+        "REPAIR",
+        "CHECK",
+        "CHECKSUM",
+        "FLUSH",
+        "RESET",
+        "PURGE",
+        "INSTALL",
         "UNINSTALL",
     ];
     match verb {
@@ -406,7 +503,13 @@ fn judge(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseError
     let verb = word(toks, 0);
     let command = command_for(&verb);
     let unknown = |reason: &str| Ok(Judged::new(Kind::Unknown, reason, command));
-    let transaction = || Ok(Judged::new(Kind::Transaction, "transaction control", command));
+    let transaction = || {
+        Ok(Judged::new(
+            Kind::Transaction,
+            "transaction control",
+            command,
+        ))
+    };
     match verb.as_str() {
         "select" | "with" | "values" | "insert" | "replace" | "update" | "delete" | "" => {
             parsed(text, toks)
@@ -421,7 +524,9 @@ fn judge(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseError
                 .iter()
                 .all(|t| matches!(t.tok, Tok::Word(_) | Tok::Name(_) | Tok::Punct(',')));
             if !plain {
-                return Err(ParseError("ariodb cannot read the end of this TABLE".into()));
+                return Err(ParseError(
+                    "ariodb cannot read the end of this TABLE".into(),
+                ));
             }
             let mut j = Judged::new(Kind::Read, "select", "SELECT");
             j.tables.push(table);
@@ -429,12 +534,9 @@ fn judge(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseError
         }
         "explain" | "describe" | "desc" => explain(text, toks, depth),
         "analyze" => match word(toks, 1).as_str() {
-            "table" | "tables" | "no_write_to_binlog" | "local" => Ok(ddl(
-                text,
-                toks,
-                Kind::SchemaChange,
-                "maintains tables",
-            )),
+            "table" | "tables" | "no_write_to_binlog" | "local" => {
+                Ok(ddl(text, toks, Kind::SchemaChange, "maintains tables"))
+            }
             // MariaDB's ANALYZE <statement> runs the statement.
             _ => {
                 let mut i = 1;
@@ -460,6 +562,10 @@ fn judge(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseError
             },
             _ => Err(ParseError("USE takes a database name".into())),
         },
+        // KILL is Session with the connection id in `setting`, and the
+        // built-in policy refuses it. The MySQL proxy intercepts KILL before
+        // the policy on purpose: agents' connection ids are the proxy's,
+        // not the server's.
         "kill" => {
             let mut i = 1;
             while matches!(
@@ -499,9 +605,19 @@ fn judge(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseError
         "handler" => unknown("HANDLER reads tables outside the usual checks"),
         "load" => unknown("LOAD reads a file"),
         "drop" => Ok(ddl(text, toks, Kind::Destructive, "drop")),
-        "truncate" => Ok(ddl(text, toks, Kind::Destructive, "TRUNCATE removes every row")),
+        "truncate" => Ok(ddl(
+            text,
+            toks,
+            Kind::Destructive,
+            "TRUNCATE removes every row",
+        )),
         "create" | "alter" | "rename" | "grant" | "revoke" | "optimize" | "repair" | "check"
-        | "checksum" => Ok(ddl(text, toks, Kind::SchemaChange, "changes database objects")),
+        | "checksum" => Ok(ddl(
+            text,
+            toks,
+            Kind::SchemaChange,
+            "changes database objects",
+        )),
         "flush" | "reset" | "purge" | "change" | "stop" | "install" | "uninstall" | "shutdown"
         | "restart" | "clone" | "import" | "binlog" | "cache" | "help" | "get" | "signal"
         | "resignal" | "backup" => Ok(Judged::new(
@@ -509,7 +625,9 @@ fn judge(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseError
             format!("{} statements control the server", verb.to_uppercase()),
             command,
         )),
-        other => Err(ParseError(format!("'{other}' is not a statement ariodb knows"))),
+        other => Err(ParseError(format!(
+            "'{other}' is not a statement ariodb knows"
+        ))),
     }
 }
 
@@ -582,7 +700,9 @@ fn explain(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseErr
     }
     // EXPLAIN t [column]: describes a table.
     let Some((table, next)) = table_at(rest, 0)? else {
-        return Err(ParseError(format!("{command} of something ariodb cannot read")));
+        return Err(ParseError(format!(
+            "{command} of something ariodb cannot read"
+        )));
     };
     let column_ok = match rest.get(next..) {
         Some([]) => true,
@@ -590,7 +710,9 @@ fn explain(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseErr
         _ => false,
     };
     if !column_ok {
-        return Err(ParseError(format!("{command} of something ariodb cannot read")));
+        return Err(ParseError(format!(
+            "{command} of something ariodb cannot read"
+        )));
     }
     let mut j = Judged::new(Kind::Read, "describes a table", command);
     j.tables.push(table);
@@ -825,7 +947,10 @@ impl Names {
     }
 
     fn add_table(&mut self, name: &ObjectName) {
-        match name_parts(name).map_err(|e| e.0).and_then(|p| dotted(&p).map_err(|e| e.0)) {
+        match name_parts(name)
+            .map_err(|e| e.0)
+            .and_then(|p| dotted(&p).map_err(|e| e.0))
+        {
             Ok(n) => self.tables.push(n),
             Err(e) => self.error = Some(e),
         }
@@ -944,16 +1069,20 @@ impl Visitor for Names {
 
     fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
         // Only a reference inside a SELECT can mean a CTE; the target of an
-        // INSERT, UPDATE or DELETE is always reported.
-        let cte = self.selects > 0
+        // INSERT, UPDATE or DELETE is always reported. Unquoted DUAL is no
+        // table at all.
+        let not_table = self.selects > 0
             && match name.0.as_slice() {
-                [ObjectNamePart::Identifier(i)] => self
-                    .scopes
-                    .last()
-                    .is_some_and(|s| s.visible.contains(&i.value)),
+                [ObjectNamePart::Identifier(i)] => {
+                    (i.quote_style.is_none() && i.value.eq_ignore_ascii_case("dual"))
+                        || self
+                            .scopes
+                            .last()
+                            .is_some_and(|s| s.visible.contains(&i.value))
+                }
                 _ => false,
             };
-        if !cte {
+        if !not_table {
             self.add_table(name);
         }
         ControlFlow::Continue(())
@@ -962,7 +1091,9 @@ impl Visitor for Names {
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
         match factor {
             TableFactor::Table {
-                name, args: Some(_), ..
+                name,
+                args: Some(_),
+                ..
             } => self.add_function(name),
             TableFactor::Function { name, .. } => self.add_function(name),
             _ => {}
@@ -1032,7 +1163,9 @@ fn show(text: &str, toks: &[Lexeme]) -> Result<Judged, ParseError> {
         }
         ("columns" | "fields" | "index" | "indexes" | "keys", _) => {
             let Some((table, next)) = table_from(i + 1)? else {
-                return Err(ParseError("SHOW COLUMNS or INDEX needs FROM a table".into()));
+                return Err(ParseError(
+                    "SHOW COLUMNS or INDEX needs FROM a table".into(),
+                ));
             };
             j.tables.push(table);
             i = next;
@@ -1120,6 +1253,12 @@ const SAFE_SQL_MODES: &[&str] = &[
     "time_round_fractional",
 ];
 
+/// Character sets in which every byte below 0x80 is that ASCII character.
+/// In GBK, Big5, SJIS, CP932 and GB18030 a backslash or quote byte can be
+/// the second half of a character, so the server would see a string end
+/// where ariodb does not.
+const SAFE_CHARSETS: &[&str] = &["utf8mb4", "utf8mb3", "utf8", "latin1", "ascii", "binary"];
+
 /// SET. `setting` lists every variable the statement sets, comma separated,
 /// as `name` for the session, `@name` for a user variable and
 /// `global.name` (or `persist.name`, `persist_only.name`) for the server.
@@ -1189,7 +1328,23 @@ fn set(text: &str, toks: &[Lexeme]) -> Result<Judged, ParseError> {
                 let on = matches!(single, Some(Tok::Word(v)) if matches!(v.to_lowercase().as_str(), "1" | "on" | "true"));
                 if !on && j.kind != Kind::Unknown {
                     j.kind = Kind::Transaction;
-                    j.reason = "SET autocommit = 0 starts transactions ariodb does not manage".into();
+                    j.reason =
+                        "SET autocommit = 0 starts transactions ariodb does not manage".into();
+                }
+            }
+            "names" | "character set" | "character_set_client" => {
+                let charset = match value.first().map(|v| &v.tok) {
+                    Some(Tok::Str(c) | Tok::Word(c) | Tok::Name(c)) => c.to_lowercase(),
+                    _ => String::new(),
+                };
+                // NAMES x COLLATE y is fine; DEFAULT means the server's.
+                let rest_ok = value.len() == 1 || (value.len() == 3 && word(value, 1) == "collate");
+                if !SAFE_CHARSETS.contains(&charset.as_str()) || !rest_ok {
+                    j.kind = Kind::Unknown;
+                    j.reason = format!(
+                        "the client character set may only be {}: in others a quote or backslash can hide inside a character",
+                        SAFE_CHARSETS.join(", ")
+                    );
                 }
             }
             "sql_mode" => {
@@ -1210,7 +1365,7 @@ fn set(text: &str, toks: &[Lexeme]) -> Result<Judged, ParseError> {
             }
             _ => {}
         }
-        if single.is_none() {
+        if single.is_none() && !matches!(name.as_str(), "names" | "character set") {
             j = j.with_names(expression(text, value)?);
         }
         names.push(name);
@@ -1344,7 +1499,10 @@ mod tests {
     #[test]
     fn plain_statements() {
         let s = one("SELECT * FROM orders WHERE id = 1");
-        assert_eq!((s.kind, s.command, s.engine), (Kind::Read, "SELECT", "mysql"));
+        assert_eq!(
+            (s.kind, s.command, s.engine),
+            (Kind::Read, "SELECT", "mysql")
+        );
         assert_eq!(s.tables, vec!["orders"]);
         let s = one("INSERT INTO orders (id) VALUES (1)");
         assert_eq!((s.kind, s.command), (Kind::Write, "INSERT"));
@@ -1379,7 +1537,10 @@ mod tests {
         ] {
             assert_eq!(kind_of(sql), Kind::Write, "{sql}");
         }
-        assert_eq!(one("REPLACE INTO orders (id) VALUES (1)").command, "REPLACE");
+        assert_eq!(
+            one("REPLACE INTO orders (id) VALUES (1)").command,
+            "REPLACE"
+        );
         assert_eq!(
             tables("INSERT INTO orders SELECT * FROM staging WHERE id > 3"),
             vec!["orders", "staging"]
@@ -1419,7 +1580,10 @@ mod tests {
         ] {
             assert_eq!(kind_of(sql), Kind::Destructive, "{sql}");
         }
-        assert_eq!(tables("DROP TABLE orders, app.customers"), vec!["app.customers", "orders"]);
+        assert_eq!(
+            tables("DROP TABLE orders, app.customers"),
+            vec!["app.customers", "orders"]
+        );
     }
 
     #[test]
@@ -1561,7 +1725,10 @@ mod tests {
             kind_of("EXPLAIN ANALYZE DELETE FROM orders WHERE id = 1"),
             Kind::Write
         );
-        assert_eq!(kind_of("EXPLAIN ANALYZE DELETE FROM orders"), Kind::Destructive);
+        assert_eq!(
+            kind_of("EXPLAIN ANALYZE DELETE FROM orders"),
+            Kind::Destructive
+        );
         assert_eq!(
             kind_of("EXPLAIN ANALYZE FORMAT=TREE UPDATE orders SET a = 1"),
             Kind::Destructive
@@ -1589,7 +1756,10 @@ mod tests {
 
     #[test]
     fn ctes_hide_tables_only_in_their_scope() {
-        assert_eq!(tables("WITH recent AS (SELECT * FROM orders) SELECT * FROM recent"), vec!["orders"]);
+        assert_eq!(
+            tables("WITH recent AS (SELECT * FROM orders) SELECT * FROM recent"),
+            vec!["orders"]
+        );
         // A CTE that is not recursive cannot see itself: this reads the real table.
         assert_eq!(
             tables("WITH secrets AS (SELECT * FROM secrets) SELECT * FROM secrets"),
@@ -1606,9 +1776,14 @@ mod tests {
             vec!["secrets"]
         );
         // Names differing in case might be different tables.
-        assert_eq!(tables("WITH Secrets AS (SELECT 1) SELECT * FROM secrets"), vec!["secrets"]);
         assert_eq!(
-            tables("WITH RECURSIVE n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 3) SELECT * FROM n"),
+            tables("WITH Secrets AS (SELECT 1) SELECT * FROM secrets"),
+            vec!["secrets"]
+        );
+        assert_eq!(
+            tables(
+                "WITH RECURSIVE n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 3) SELECT * FROM n"
+            ),
             Vec::<String>::new()
         );
         assert_eq!(tables("WITH x AS (SELECT 1) TABLE x"), Vec::<String>::new());
@@ -1634,14 +1809,35 @@ mod tests {
             vec!["orders", "secrets"]
         );
         assert_eq!(
-            tables("SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM db2.secrets s WHERE s.id = orders.id)"),
+            tables(
+                "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM db2.secrets s WHERE s.id = orders.id)"
+            ),
             vec!["db2.secrets", "orders"]
         );
         assert_eq!(
             tables("SELECT * FROM orders o LEFT JOIN (customers c CROSS JOIN secrets) ON 1 = 1"),
             vec!["customers", "orders", "secrets"]
         );
-        assert_eq!(tables("SELECT * FROM orders UNION TABLE secrets"), vec!["orders", "secrets"]);
+        assert_eq!(
+            tables("SELECT * FROM orders UNION TABLE secrets"),
+            vec!["orders", "secrets"]
+        );
+        // Read, or refused as unreadable: never read without the table.
+        for sql in [
+            "SELECT * FROM (TABLE secrets) x",
+            "SELECT * FROM orders WHERE id IN (TABLE secrets)",
+            "INSERT INTO orders TABLE secrets",
+            "UPDATE orders, secrets SET orders.a = secrets.b WHERE orders.id = secrets.id",
+            "SELECT * FROM orders o, LATERAL (SELECT * FROM secrets s WHERE s.id = o.id) x",
+            "VALUES ROW((SELECT max(x) FROM secrets))",
+            "SELECT * FROM orders WHERE a = ANY (SELECT b FROM secrets)",
+            "SELECT * FROM orders o JOIN secrets s USING (id)",
+            "SELECT * FROM orders WHERE (SELECT 1 FROM secrets) = 1 LIMIT 1",
+        ] {
+            if let Ok(stmts) = classify(sql) {
+                assert!(stmts[0].tables.contains(&"secrets".to_string()), "{sql}");
+            }
+        }
         assert_eq!(
             tables("INSERT INTO orders (a) VALUES ((SELECT x FROM secrets LIMIT 1))"),
             vec!["orders", "secrets"]
@@ -1663,7 +1859,8 @@ mod tests {
     // A string literal must never hide a statement or a table.
     #[test]
     fn strings_and_comments_hide_nothing() {
-        let stmts = classify("SELECT 'x; DROP TABLE orders' FROM orders; SELECT \"a;b\" FROM t").unwrap();
+        let stmts =
+            classify("SELECT 'x; DROP TABLE orders' FROM orders; SELECT \"a;b\" FROM t").unwrap();
         assert_eq!(stmts.len(), 2);
         assert_eq!(stmts[0].tables, vec!["orders"]);
         assert_eq!(stmts[1].tables, vec!["t"]);
@@ -1676,7 +1873,10 @@ mod tests {
         assert_eq!(stmts.len(), 2);
         assert_eq!(stmts[1].kind, Kind::Destructive);
         // Double quotes are strings, not names.
-        assert_eq!(kind_of(r#"SELECT "it\"s; DROP TABLE x" FROM t"#), Kind::Read);
+        assert_eq!(
+            kind_of(r#"SELECT "it\"s; DROP TABLE x" FROM t"#),
+            Kind::Read
+        );
         assert!(tables(r#"SELECT "secrets" FROM orders"#) == vec!["orders"]);
 
         // Comments as the server reads them.
@@ -1693,13 +1893,24 @@ mod tests {
         assert_eq!(stmts.len(), 2);
         assert_eq!(stmts[1].kind, Kind::Destructive);
         // Quotes in comments, comment markers in strings.
-        assert_eq!(classify("SELECT 1 /* ' */ ; DELETE FROM t").unwrap().len(), 2);
-        assert_eq!(classify("SELECT '/*' ; DELETE FROM t; SELECT '*/'").unwrap().len(), 3);
+        assert_eq!(
+            classify("SELECT 1 /* ' */ ; DELETE FROM t").unwrap().len(),
+            2
+        );
+        assert_eq!(
+            classify("SELECT '/*' ; DELETE FROM t; SELECT '*/'")
+                .unwrap()
+                .len(),
+            3
+        );
         assert_eq!(classify("SELECT '--' ; DELETE FROM t").unwrap().len(), 2);
         // An executable comment inside a string is just text.
         assert_eq!(kind_of("SELECT '/*! DROP TABLE x */' FROM t"), Kind::Read);
         // Backticks hold names; a quote inside one is part of the name.
-        assert_eq!(tables("SELECT * FROM `it's`, secrets"), vec!["it's", "secrets"]);
+        assert_eq!(
+            tables("SELECT * FROM `it's`, secrets"),
+            vec!["it's", "secrets"]
+        );
         // Prefixed literals.
         assert_eq!(
             tables("SELECT x'41', b'01', N'x', _utf8mb4'y' FROM orders"),
@@ -1714,7 +1925,10 @@ mod tests {
     #[test]
     fn non_ascii_spaces_are_not_spaces() {
         // The server reads U+00A0 as part of a name, so must ariodb.
-        assert!(classify("SELECT 1\u{a0}FROM orders").is_err() || tables("SELECT 1\u{a0}FROM orders").is_empty());
+        assert!(
+            classify("SELECT 1\u{a0}FROM orders").is_err()
+                || tables("SELECT 1\u{a0}FROM orders").is_empty()
+        );
     }
 
     #[test]
@@ -1752,7 +1966,11 @@ mod tests {
             ("SHOW CREATE TABLE secrets", "secrets"),
         ] {
             let s = one(sql);
-            assert_eq!((s.kind, s.tables), (Kind::Read, vec![table.to_string()]), "{sql}");
+            assert_eq!(
+                (s.kind, s.tables),
+                (Kind::Read, vec![table.to_string()]),
+                "{sql}"
+            );
         }
         // A WHERE clause is read like any other expression.
         assert_eq!(
@@ -1790,21 +2008,38 @@ mod tests {
             s.setting.unwrap()
         };
         assert_eq!(setting("SET NAMES utf8mb4"), "names");
-        assert_eq!(setting("SET NAMES 'utf8mb4' COLLATE 'utf8mb4_0900_ai_ci'"), "names");
+        assert_eq!(
+            setting("SET NAMES 'utf8mb4' COLLATE 'utf8mb4_0900_ai_ci'"),
+            "names"
+        );
+        assert_eq!(setting("SET NAMES latin1"), "names");
+        assert_eq!(
+            setting("SET character_set_client = utf8mb4"),
+            "character_set_client"
+        );
         assert_eq!(setting("SET CHARACTER SET utf8mb4"), "character set");
         assert_eq!(setting("SET CHARSET utf8mb4"), "character set");
         assert_eq!(setting("SET time_zone = '+00:00'"), "time_zone");
         assert_eq!(setting("SET @@session.time_zone = 'UTC'"), "time_zone");
         assert_eq!(setting("SET SESSION wait_timeout = 60"), "wait_timeout");
-        assert_eq!(setting("SET LOCAL net_read_timeout = 60"), "net_read_timeout");
-        assert_eq!(setting("SET @@SQL_SELECT_LIMIT = DEFAULT"), "sql_select_limit");
+        assert_eq!(
+            setting("SET LOCAL net_read_timeout = 60"),
+            "net_read_timeout"
+        );
+        assert_eq!(
+            setting("SET @@SQL_SELECT_LIMIT = DEFAULT"),
+            "sql_select_limit"
+        );
         assert_eq!(setting("SET autocommit = 1"), "autocommit");
         assert_eq!(setting("SET @x = 1, @Y := 'two'"), "@x, @y");
         assert_eq!(
             setting("SET character_set_client = utf8mb4, collation_connection = utf8mb4_bin"),
             "character_set_client, collation_connection"
         );
-        assert_eq!(setting("SET sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_DATE'"), "sql_mode");
+        assert_eq!(
+            setting("SET sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_DATE'"),
+            "sql_mode"
+        );
         assert_eq!(setting("SET SESSION sql_mode = ''"), "sql_mode");
         assert_eq!(setting("SET sql_mode = TRADITIONAL"), "sql_mode");
         assert_eq!(
@@ -1815,16 +2050,37 @@ mod tests {
             setting("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ ONLY"),
             "transaction_isolation, transaction_read_only"
         );
-        assert_eq!(setting("SET @@transaction_isolation = 'READ-COMMITTED'"), "transaction_isolation");
+        assert_eq!(
+            setting("SET @@transaction_isolation = 'READ-COMMITTED'"),
+            "transaction_isolation"
+        );
         // Server-wide scopes are named as such, for the policy to refuse.
-        assert_eq!(setting("SET GLOBAL wait_timeout = 1"), "global.wait_timeout");
-        assert_eq!(setting("SET @@global.wait_timeout = 1"), "global.wait_timeout");
-        assert_eq!(setting("SET PERSIST wait_timeout = 1"), "persist.wait_timeout");
-        assert_eq!(setting("SET @@persist_only.wait_timeout = 1"), "persist_only.wait_timeout");
+        assert_eq!(
+            setting("SET GLOBAL wait_timeout = 1"),
+            "global.wait_timeout"
+        );
+        assert_eq!(
+            setting("SET @@global.wait_timeout = 1"),
+            "global.wait_timeout"
+        );
+        assert_eq!(
+            setting("SET PERSIST wait_timeout = 1"),
+            "persist.wait_timeout"
+        );
+        assert_eq!(
+            setting("SET @@persist_only.wait_timeout = 1"),
+            "persist_only.wait_timeout"
+        );
         assert_eq!(setting("SET GLOBAL a = 1, b = 2"), "global.a, global.b");
-        assert_eq!(setting("SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE"), "global.transaction_isolation");
+        assert_eq!(
+            setting("SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            "global.transaction_isolation"
+        );
         assert_eq!(setting("SET PASSWORD = 'local-test-only-pw'"), "password");
-        assert_eq!(setting("SET PASSWORD FOR u = 'local-test-only-pw'"), "password");
+        assert_eq!(
+            setting("SET PASSWORD FOR u = 'local-test-only-pw'"),
+            "password"
+        );
         assert_eq!(setting("SET ROLE ALL"), "role");
         assert_eq!(setting("SET DEFAULT ROLE ALL TO u"), "default role");
         assert_eq!(setting("SET sql_log_bin = 0"), "sql_log_bin");
@@ -1843,6 +2099,14 @@ mod tests {
             "SET sql_mode = DEFAULT",
             "SET sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')",
             "SET @@session.sql_mode = @m",
+            // Character sets whose characters can swallow a backslash.
+            "SET NAMES gbk",
+            "SET NAMES 'sjis'",
+            "SET NAMES DEFAULT",
+            "SET CHARACTER SET big5",
+            "SET character_set_client = cp932",
+            "SET @@character_set_client = @cs",
+            "SET NAMES utf8mb4, character_set_client = gb18030",
         ] {
             assert_eq!(kind_of(sql), Kind::Unknown, "{sql}");
         }
@@ -1851,14 +2115,20 @@ mod tests {
     #[test]
     fn kill_and_use() {
         let s = one("KILL 42");
-        assert_eq!((s.kind, s.command, s.setting.as_deref()), (Kind::Session, "KILL", Some("42")));
+        assert_eq!(
+            (s.kind, s.command, s.setting.as_deref()),
+            (Kind::Session, "KILL", Some("42"))
+        );
         let s = one("KILL QUERY 42");
         assert_eq!(s.setting.as_deref(), Some("42"));
         assert_eq!(one("KILL CONNECTION 7").setting.as_deref(), Some("7"));
         assert_eq!(kind_of("KILL CONNECTION_ID()"), Kind::Unknown);
         assert_eq!(kind_of("KILL USER root"), Kind::Unknown);
         let s = one("USE `App`");
-        assert_eq!((s.kind, s.command, s.setting.as_deref()), (Kind::Session, "USE", Some("App")));
+        assert_eq!(
+            (s.kind, s.command, s.setting.as_deref()),
+            (Kind::Session, "USE", Some("App"))
+        );
         assert!(classify("USE a b").is_err());
     }
 
@@ -1872,10 +2142,59 @@ mod tests {
         assert!(classify("-- nothing\n/* at all */").unwrap().is_empty());
     }
 
+    // Deep trees would overflow the stack when walked or dropped.
+    #[test]
+    fn long_operator_chains_are_refused_not_crashed_on() {
+        assert!(classify(&format!("SELECT {}1 FROM t", "1+".repeat(500))).is_ok());
+        for sql in [
+            format!("SELECT {}1 FROM t", "1+".repeat(100_000)),
+            format!("SELECT * FROM t WHERE {}1", "a = 1 OR ".repeat(100_000)),
+            format!("SELECT {}1{}", "(1+".repeat(100_000), ")".repeat(100_000)),
+            format!("SELECT {}1", "NOT ".repeat(100_000)),
+            format!(
+                "SELECT {}1{}",
+                "(SELECT ".repeat(10_000),
+                ")".repeat(10_000)
+            ),
+        ] {
+            assert!(classify(&sql).is_err());
+        }
+        // Long lists are not chains.
+        let values = vec!["(-1, 'x')"; 5000].join(", ");
+        assert_eq!(
+            kind_of(&format!("INSERT INTO t VALUES {values}")),
+            Kind::Write
+        );
+    }
+
     #[test]
     fn bad_sql_is_an_error() {
         assert!(classify("SELEC * FORM x").is_err());
         assert!(classify("SELECT * FROM").is_err());
+        assert!(classify("FROBNICATE orders").is_err());
+    }
+
+    #[test]
+    fn common_driver_and_agent_queries() {
+        for sql in [
+            "SELECT * FROM orders WHERE id = ?",
+            "SELECT @@version, @@session.autocommit, DATABASE(), CONNECTION_ID()",
+            "SELECT 1 FROM DUAL",
+            "SELECT CAST(x AS CHAR), CONVERT(x USING utf8mb4) FROM orders",
+            "SELECT doc->'$.a', doc->>'$.b' FROM orders",
+            "SELECT GROUP_CONCAT(x ORDER BY x SEPARATOR ',') FROM orders",
+            "SELECT * FROM orders USE INDEX (i) WHERE a = 1 LIMIT 1, 2",
+            "SELECT a, ROW_NUMBER() OVER (PARTITION BY b ORDER BY c) FROM orders",
+            "SELECT 0x1F, 1e5, .5, b'01', x'4F', N'x', 'it''s', \"a\"\"b\"",
+        ] {
+            assert_eq!(kind_of(sql), Kind::Read, "{sql}");
+        }
+        assert_eq!(tables("SELECT 1 FROM DUAL"), Vec::<String>::new());
+        assert_eq!(tables("SELECT 1 FROM `dual`"), vec!["dual"]);
+        assert_eq!(
+            kind_of("INSERT INTO orders (a) VALUES (1) AS new ON DUPLICATE KEY UPDATE a = new.a"),
+            Kind::Write
+        );
     }
 
     #[test]
