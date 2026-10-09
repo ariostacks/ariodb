@@ -1,4 +1,4 @@
-//! The dashboard: a web page and JSON API for people, plus the callback
+//! The dashboard: a web app and JSON API for people, plus the callback
 //! endpoints approvers use (signed webhook links, Slack buttons).
 //!
 //! Security: every management endpoint needs a logged-in session. Sessions
@@ -53,7 +53,7 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
 pub fn router(state: Arc<State>) -> Router {
     let api = crate::dashboard_api::routes();
     Router::new()
-        .route("/", get(index))
+        .route("/", get(crate::dashboard_files::serve))
         .route("/api/setup", post(setup))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
@@ -63,22 +63,9 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/hooks/approvals/{id}", get(hook_decide))
         .route("/slack/actions", post(slack_actions))
         .merge(api)
+        // The app's own pages and files (see dashboard_files.rs).
+        .fallback(crate::dashboard_files::serve)
         .with_state(state)
-}
-
-async fn index() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
-            ),
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        Html(crate::dashboard_ui::PAGE),
-    )
 }
 
 // ---------------------------------------------------------------------------

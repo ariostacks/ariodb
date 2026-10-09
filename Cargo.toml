@@ -20,6 +20,7 @@ postgres-protocol = "0.6.12"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rust-embed = { version = "8.13.0", features = ["debug-embed"] }
 rustls = "0.23.45"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }

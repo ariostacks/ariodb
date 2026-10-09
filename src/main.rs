@@ -7,7 +7,7 @@ mod clickhouse_native;
 mod config;
 mod dashboard;
 mod dashboard_api;
-mod dashboard_ui;
+mod dashboard_files;
 mod exec;
 mod gate;
 mod journal;

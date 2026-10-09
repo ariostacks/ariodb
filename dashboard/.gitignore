@@ -1,0 +1,6 @@
+node_modules
+*.log
+.DS_Store
+*.local
+# dist/ is committed on purpose: it is embedded in the ariodb binary, so
+# `cargo build` works without Node. Rebuild it with scripts/build-dashboard.sh.
