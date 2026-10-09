@@ -114,7 +114,7 @@ What a change needs in the way of tests:
 
 ## Pull requests
 
-1. Fork the repository and branch from `main`.
+1. Fork the repository and branch from its default branch.
 2. Make the change, with tests and documentation.
 3. Run `cargo fmt`, `cargo clippy --all-targets`, `cargo test` and the
    end-to-end suites that cover the change.
@@ -183,8 +183,8 @@ Signed-off-by: Sam Lee <sam@example.com>
 ```
 
 `git commit -s` adds it for you. To sign off commits you have already
-made on your branch, use `git rebase --signoff main` and force-push the
-branch.
+made on your branch, use `git rebase --signoff <base>`, where `<base>` is
+the branch you started from, and force-push the branch.
 
 The maintainer may in future ask contributors to sign a contributor
 licence agreement. If that happens, it will be announced here before it

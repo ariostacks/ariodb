@@ -38,11 +38,15 @@ gets through anyway.
   Postgres-compatible databases (TimescaleDB, Supabase, YugabyteDB,
   CockroachDB), MySQL 8.4 and MariaDB 11.4, and ClickHouse over HTTP and
   the native protocol. Agents use `psql`, `mysql`, `clickhouse-client` or
-  any driver, with TLS on both sides.
-- **Reads its SQL with the database's own grammar.** Postgres statements
-  are parsed with Postgres's own parser, including what hides inside
+  any driver, with TLS between agents and ariodb and from ariodb to the
+  database (except ClickHouse's native port).
+- **Reads the SQL, not just its text.** Postgres statements are parsed
+  with Postgres's own parser, including what hides inside
   `EXPLAIN ANALYZE`, `PREPARE`, `COPY (...)` and data-modifying `WITH`.
-  Anything ariodb cannot see inside is refused.
+  MySQL and MariaDB statements go through a SQL parser cross-checked by a
+  lexer that follows the server's own rules, and ClickHouse statements
+  through a careful tokenizer. Anything ariodb cannot see inside is
+  refused.
 - **Forces reads to be read-only.** Every read runs in a `READ ONLY`
   transaction (on ClickHouse, with `readonly` set), so a read that hides a
   write is refused by the database itself.
@@ -78,7 +82,7 @@ gets through anyway.
   database supports (read-only reads, checked writes, undo) without
   changing anything.
 - **Works as an MCP server.** `ariodb mcp` gives an agent one `query` tool
-  that goes through the same checks.
+  for Postgres that goes through the same checks.
 - **Takes plugins.** Any program that speaks JSON-RPC over stdin and
   stdout can approve statements, supply facts for rules, receive
   notifications or receive the decisions log. Examples in Python and
@@ -140,8 +144,8 @@ and open the dashboard at <http://127.0.0.1:8080> (user `root`, password
 `demo-dashboard-password`). Try:
 
 - `DELETE FROM orders`: refused, because it has no `WHERE`.
-- `UPDATE orders SET status = 'void' WHERE id < 600`: runs, is measured at
-  599 rows, and is rolled back because the demo's limit is 200.
+- `UPDATE orders SET status = 'void' WHERE id < 600`: runs, is measured
+  at hundreds of rows, and is rolled back because the demo's limit is 200.
 - `SELECT name, email FROM customers`: waits until you approve it on the
   dashboard's Approvals page.
 

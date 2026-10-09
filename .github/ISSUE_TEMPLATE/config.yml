@@ -14,5 +14,5 @@ blank_issues_enabled: false
 #     url: https://github.com/OWNER/REPO/security/advisories/new
 #     about: Report security problems privately, never in a public issue. See SECURITY.md.
 #   - name: Documentation
-#     url: https://github.com/OWNER/REPO/blob/main/docs/README.md
+#     url: https://github.com/OWNER/REPO/blob/HEAD/docs/README.md
 #     about: Installation, configuration, every command, troubleshooting and the security model.

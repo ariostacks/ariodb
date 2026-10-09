@@ -423,8 +423,7 @@ how to set up Slack and webhooks, is in [approvals](approvals.md).
 |---|---|---|---|
 | `name` | string | required | Unique; rules list it in `approve`. |
 | `type` | string | required | `dashboard`, `slack`, `webhook`, `llm`, `plugin`, or one of the [chat, paging and email channels](#chat-paging-and-email-channels): `discord`, `telegram`, `teams`, `google_chat`, `mattermost`, `pagerduty`, `opsgenie`, `email`. |
-| `timeout_seconds` | integer | `[approvals] timeout_seconds` | How long to wait for this approver. Applies to `dashboard`, `slack`, `webhook` and `plugin`. A model approver (`llm`) is not bounded by it; see [model approvers](#llm-a-model). |
-
+| `timeout_seconds` | integer | `[approvals] timeout_seconds` | How long to wait for this approver. Applies to `dashboard`, `slack`, `webhook`, the chat, paging and email channels, and `plugin`. A model approver (`llm`) is not bounded by it; see [model approvers](#llm-a-model). |
 | `groups` | list of strings | `[]` | `dashboard` and `webhook` only, with single sign-on: only members of these groups may decide this approver's requests. A `webhook` approver with `groups` needs `[dashboard] approval_links = "sign_in"`. See [approvals](approvals.md#single-sign-on-and-approver-groups). |
 
 ### `dashboard`

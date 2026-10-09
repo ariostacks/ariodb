@@ -18,7 +18,7 @@ ariodb is young, and fixes go into the latest release only.
 |---|---|
 | Latest 0.x release | Yes |
 | Older releases | No: upgrade to the latest |
-| Unreleased commits on `main` | Best effort |
+| Unreleased commits on the default branch | Best effort |
 
 ## Reporting a vulnerability
 

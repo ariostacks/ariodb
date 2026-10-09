@@ -122,8 +122,8 @@ llm_fail_mode = "closed"      # closed (default) | open; only for model approver
 llm_cache_seconds = 300       # default 300; reuse a model's answer to the same question
 ```
 
-`timeout_seconds` bounds people (dashboard, Slack, webhook) and plugin
-approvers; an approver's own `timeout_seconds` overrides it. The two `llm_`
+`timeout_seconds` bounds people (dashboard, Slack, webhook, and the chat,
+paging and email channels) and plugin approvers; an approver's own `timeout_seconds` overrides it. The two `llm_`
 settings apply only to model approvers and are explained under
 [model approvers](#failures-retries-and-the-fail-mode). Every key, with its
 type and default, is in [configuration](configuration.md#approvals).

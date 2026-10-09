@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for the suggestion. Please check the [documentation](../blob/main/docs/README.md) and existing issues first; ariodb may already do this, or it may be planned.
+        Thank you for the suggestion. Please check the [documentation](../blob/HEAD/docs/README.md) and existing issues first; ariodb may already do this, or it may be planned.
   - type: textarea
     id: problem
     attributes:

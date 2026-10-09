@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Please check the [documentation](../blob/main/docs/README.md) first, especially [troubleshooting](../blob/main/docs/troubleshooting.md). Remove every password, token and secret from anything you paste.
+        Please check the [documentation](../blob/HEAD/docs/README.md) first, especially [troubleshooting](../blob/HEAD/docs/troubleshooting.md). Remove every password, token and secret from anything you paste.
   - type: textarea
     id: question
     attributes:

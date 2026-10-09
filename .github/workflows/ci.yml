@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, master]
   schedule:
     # Weekly, Monday 03:00 UTC: everything, including single sign-on, and
     # against whatever the database images' tags point at by then.
