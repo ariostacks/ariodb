@@ -529,8 +529,10 @@ fn decision_link(config: &crate::config::Config, key: &str, id: &str, verdict: &
 
 /// The secret-store entry holding the key that signs the channels' decision
 /// links (webhooks sign theirs with their own HMAC secret). Deleting it
-/// invalidates every link already sent.
-const LINK_KEY: &str = "approval-link-key";
+/// invalidates every link already sent. The dot keeps it out of reach of
+/// the dashboard, which only stores names of letters, digits, `-` and `_`:
+/// whoever chose this key could sign links of their own.
+const LINK_KEY: &str = "ariodb.approval-link-key";
 static LINK_KEY_LOCK: Mutex<()> = Mutex::new(());
 
 /// The link-signing key, made on first use.

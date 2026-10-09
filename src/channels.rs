@@ -31,6 +31,8 @@ pub struct Notice<'a> {
 const TITLE: &str = "ariodb approval needed";
 /// Said wherever the links appear, so nobody expects a click to decide.
 const CONFIRM: &str = "Each link opens a page that asks you to confirm.";
+/// Said before a statement too long to show in full.
+const SHORTENED: &str = "shortened here (the confirmation page shows all of it)";
 
 /// Post a request to the approver's channel.
 pub async fn notify(
@@ -279,11 +281,13 @@ pub fn discord(n: &Notice<'_>) -> Value {
     // so shorten the SQL until the whole message fits.
     let mut max_sql = 1200;
     let content = loop {
+        let (sql, shortened) = shown_sql(n.sql, max_sql);
         let content = format!(
-            "**{TITLE}**: {}\nAgent {} wants to run:\n{}\nRule: {}. Expires in {} s. {CONFIRM}",
+            "**{TITLE}**: {}\nAgent {}{}\n{}\nRule: {}. Expires in {} s. {CONFIRM}",
             md_text(n.reason),
             md_text(n.agent),
-            md_code_block(&truncate(n.sql, max_sql)),
+            wants_to_run(shortened),
+            md_code_block(&sql),
             md_text(n.rule),
             n.expires_in_seconds
         );
@@ -308,11 +312,13 @@ pub fn discord(n: &Notice<'_>) -> Value {
 
 /// Telegram: HTML parse mode, with an inline keyboard of URL buttons.
 pub fn telegram(n: &Notice<'_>, chat_id: Value) -> Value {
+    let (sql, shortened) = shown_sql(n.sql, 3000);
     let text = format!(
-        "<b>{TITLE}</b>: {}\nAgent <b>{}</b> wants to run:\n<pre><code class=\"language-sql\">{}</code></pre>\nRule: {}. Expires in {} s. {CONFIRM}",
+        "<b>{TITLE}</b>: {}\nAgent <b>{}</b>{}\n<pre><code class=\"language-sql\">{}</code></pre>\nRule: {}. Expires in {} s. {CONFIRM}",
         html_escape(n.reason),
         html_escape(n.agent),
-        html_escape(&truncate(n.sql, 3000)),
+        wants_to_run(shortened),
+        html_escape(&sql),
         html_escape(n.rule),
         n.expires_in_seconds
     );
@@ -344,6 +350,7 @@ pub fn teams(n: &Notice<'_>) -> Value {
         }
         action
     };
+    let (sql, shortened) = shown_sql(n.sql, 2500);
     let card = json!({
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
@@ -355,9 +362,9 @@ pub fn teams(n: &Notice<'_>) -> Value {
             rich(vec![
                 run("Agent "),
                 json!({ "type": "TextRun", "text": n.agent, "weight": "Bolder" }),
-                run(" wants to run:"),
+                run(&wants_to_run(shortened)),
             ]),
-            rich(vec![json!({ "type": "TextRun", "text": truncate(n.sql, 2500), "fontType": "Monospace" })]),
+            rich(vec![json!({ "type": "TextRun", "text": sql, "fontType": "Monospace" })]),
             rich(vec![run(&format!(
                 "Rule: {}. Expires in {} s. {CONFIRM}",
                 n.rule, n.expires_in_seconds
@@ -385,6 +392,7 @@ pub fn google_chat(n: &Notice<'_>) -> Value {
     let paragraph = |text: String| json!({ "textParagraph": { "text": text } });
     let button =
         |text: &str, url: &str| json!({ "text": text, "onClick": { "openLink": { "url": url } } });
+    let (sql, shortened) = shown_sql(n.sql, 2500);
     json!({
         "text": TITLE,
         "cardsV2": [{
@@ -393,8 +401,8 @@ pub fn google_chat(n: &Notice<'_>) -> Value {
                 "header": { "title": TITLE },
                 "sections": [{ "widgets": [
                     paragraph(html_escape(n.reason)),
-                    paragraph(format!("Agent <b>{}</b> wants to run:", html_escape(n.agent))),
-                    paragraph(format!("<pre><code>{}</code></pre>", html_escape(&truncate(n.sql, 2500)))),
+                    paragraph(format!("Agent <b>{}</b>{}", html_escape(n.agent), wants_to_run(shortened))),
+                    paragraph(format!("<pre><code>{}</code></pre>", html_escape(&sql))),
                     paragraph(format!(
                         "Rule: {}. Expires in {} s. {CONFIRM}",
                         html_escape(n.rule),
@@ -415,11 +423,13 @@ pub fn google_chat(n: &Notice<'_>) -> Value {
 /// code block. Message attachments' buttons call back to a server, so plain
 /// links are what works without a public endpoint.
 pub fn mattermost(n: &Notice<'_>, channel: Option<&str>) -> Value {
+    let (sql, shortened) = shown_sql(n.sql, 2500);
     let text = format!(
-        "#### {TITLE}\n{}\nAgent {} wants to run:\n{}\nRule: {}. Expires in {} s.\n\n[Approve]({}) · [Deny]({}) · [Open in the dashboard]({})\n{CONFIRM}",
+        "#### {TITLE}\n{}\nAgent {}{}\n{}\nRule: {}. Expires in {} s.\n\n[Approve]({}) · [Deny]({}) · [Open in the dashboard]({})\n{CONFIRM}",
         md_text(n.reason),
         md_text(n.agent),
-        md_code_block(&truncate(n.sql, 2500)),
+        wants_to_run(shortened),
+        md_code_block(&sql),
         md_text(n.rule),
         n.expires_in_seconds,
         n.approve_url,
@@ -437,7 +447,8 @@ pub fn mattermost(n: &Notice<'_>, channel: Option<&str>) -> Value {
 /// so the incident can be resolved once the request is decided. The SQL
 /// goes in the details, never the summary.
 pub fn pagerduty_trigger(n: &Notice<'_>, routing_key: &str) -> Value {
-    json!({
+    let (sql, shortened) = shown_sql(n.sql, 4000);
+    let mut event = json!({
         "routing_key": routing_key,
         "event_action": "trigger",
         "dedup_key": n.id,
@@ -451,7 +462,7 @@ pub fn pagerduty_trigger(n: &Notice<'_>, routing_key: &str) -> Value {
                 "agent": n.agent,
                 "rule": n.rule,
                 "reason": n.reason,
-                "sql": truncate(n.sql, 4000),
+                "sql": sql,
                 "expires_in_seconds": n.expires_in_seconds,
                 "how_to_decide": CONFIRM,
             },
@@ -463,7 +474,12 @@ pub fn pagerduty_trigger(n: &Notice<'_>, routing_key: &str) -> Value {
         ],
         "client": "ariodb",
         "client_url": n.dashboard_url,
-    })
+    });
+    if shortened {
+        event["payload"]["custom_details"]["note"] =
+            json!(format!("The statement is {SHORTENED}."));
+    }
+    event
 }
 
 /// Opsgenie: an alert whose alias is the approval id, so it can be closed
@@ -496,15 +512,17 @@ pub fn email(n: &Notice<'_>) -> (String, String, String) {
             html_escape(url)
         )
     };
+    let (sql, shortened) = shown_sql(n.sql, 20_000);
     let html = format!(
         "<!doctype html><html><body style=\"font-family:sans-serif\">\
-         <h3>{TITLE}</h3><p>{}</p><p>Agent <b>{}</b> wants to run:</p>\
+         <h3>{TITLE}</h3><p>{}</p><p>Agent <b>{}</b>{}</p>\
          <pre style=\"background:#f4f4f4;padding:8px;white-space:pre-wrap\">{}</pre>\
          <p>Rule: {}. The request expires in {} seconds.</p>\
          <p>{}{}<a href=\"{}\">Open in the dashboard</a></p><p>{CONFIRM}</p></body></html>",
         html_escape(n.reason),
         html_escape(n.agent),
-        html_escape(&truncate(n.sql, 20_000)),
+        wants_to_run(shortened),
+        html_escape(&sql),
         html_escape(n.rule),
         n.expires_in_seconds,
         link("Approve", &n.approve_url, "#15803d"),
@@ -523,17 +541,23 @@ fn plain_text(n: &Notice<'_>, max_sql: usize) -> String {
     let breaks = [
         '\n', '\r', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}',
     ];
-    let quoted = truncate(n.sql, max_sql)
+    let (sql, shortened) = shown_sql(n.sql, max_sql);
+    let quoted = sql
         .replace("\r\n", "\n")
         .split(breaks)
         .map(|l| format!("| {l}"))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "{TITLE}: {}\n\nAgent {} wants to run the statement below (rule {}).\n\nApprove: {}\nDeny: {}\nDashboard: {}\n\n{CONFIRM} The request expires in {} seconds.\n\nStatement:\n{quoted}\n",
+        "{TITLE}: {}\n\nAgent {} wants to run the statement below (rule {}).{}\n\nApprove: {}\nDeny: {}\nDashboard: {}\n\n{CONFIRM} The request expires in {} seconds.\n\nStatement:\n{quoted}\n",
         one_line(n.reason),
         one_line(n.agent),
         one_line(n.rule),
+        if shortened {
+            format!(" The statement is {SHORTENED}.")
+        } else {
+            String::new()
+        },
         n.approve_url,
         n.deny_url,
         n.dashboard_url,
@@ -583,6 +607,42 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// The statement as a message shows it, and whether it had to be shortened.
+/// Characters that reorder or hide text (bidirectional controls and
+/// zero-width characters) are written out as `<U+202E>` and the like, so
+/// the approver reads the statement that would run.
+fn shown_sql(sql: &str, max: usize) -> (String, bool) {
+    let mut shown = String::with_capacity(sql.len());
+    for c in sql.chars() {
+        if matches!(
+            c,
+            '\u{ad}'
+                | '\u{61c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        ) {
+            shown.push_str(&format!("<U+{:04X}>", c as u32));
+        } else {
+            shown.push(c);
+        }
+    }
+    let shortened = shown.chars().count() > max;
+    (truncate(&shown, max), shortened)
+}
+
+/// How a message introduces the statement.
+fn wants_to_run(shortened: bool) -> String {
+    if shortened {
+        format!(" wants to run this statement, {SHORTENED}:")
+    } else {
+        " wants to run:".to_string()
+    }
 }
 
 fn one_line(s: &str) -> String {
@@ -944,6 +1004,75 @@ mod tests {
         assert!(text.contains("| Approve: https://evil.example/approve"));
         assert!(!html.contains("<b>bold") && !html.contains("<a href=\"https://evil"));
         assert!(html.contains(&format!("href=\"{}\"", html_escape(&n.approve_url))));
+    }
+
+    /// Every message a channel would be sent for this request, as text.
+    fn every_message(n: &Notice<'_>) -> Vec<(&'static str, String)> {
+        let (_, text, html) = email(n);
+        vec![
+            ("discord", discord(n).to_string()),
+            ("telegram", telegram(n, json!(1)).to_string()),
+            ("teams", teams(n).to_string()),
+            ("google_chat", google_chat(n).to_string()),
+            ("mattermost", mattermost(n, None).to_string()),
+            (
+                "pagerduty",
+                pagerduty_trigger(n, "not-a-real-routing-key").to_string(),
+            ),
+            ("opsgenie", opsgenie_alert(n).to_string()),
+            ("email text", text),
+            ("email html", html),
+        ]
+    }
+
+    #[test]
+    fn characters_that_reorder_or_hide_text_are_shown() {
+        // Bidirectional overrides can make the statement read differently
+        // from what runs ("Trojan Source"); zero-width characters hide.
+        let sql =
+            "UPDATE t SET a = 1 /* \u{202E} } \u{2066}x\u{2069} */ WHERE id = 1\u{200B}\u{FEFF}";
+        let n = Notice { sql, ..notice() };
+        for (channel, message) in every_message(&n) {
+            for hidden in ['\u{202E}', '\u{2066}', '\u{2069}', '\u{FEFF}'] {
+                assert!(!message.contains(hidden), "{channel} carries {hidden:?}");
+            }
+            assert!(message.contains("U+202E"), "{channel} hides the override");
+            assert!(
+                message.contains("U+200B"),
+                "{channel} hides a zero-width space"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shortened_statement_says_so_before_it() {
+        // Padding can push the end of a statement past what a message shows;
+        // the approver is told before the statement, not only by an ellipsis.
+        let sql = format!(
+            "UPDATE t SET a = 1 WHERE id = 1{}; DELETE FROM t",
+            " ".repeat(30_000)
+        );
+        let n = Notice {
+            sql: &sql,
+            ..notice()
+        };
+        for (channel, message) in every_message(&n) {
+            let told = message
+                .find(SHORTENED)
+                .unwrap_or_else(|| panic!("{channel} does not say"));
+            let statement = message.find("UPDATE t").expect("statement");
+            assert!(
+                told < statement,
+                "{channel} says so only after the statement"
+            );
+            assert!(!message.contains("DELETE"), "{channel} was not shortened");
+        }
+        for (channel, message) in every_message(&notice()) {
+            assert!(
+                !message.contains(SHORTENED),
+                "{channel} says a short statement was shortened"
+            );
+        }
     }
 
     #[test]

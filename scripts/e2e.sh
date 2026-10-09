@@ -640,13 +640,31 @@ expect "email: text and HTML parts" '"type": "multipart/alternative"' "$(mock_en
 for _ in $(seq 1 25); do [ "$(grep -c '"closed"' "$WORK/mock.log")" -ge 2 ] && break; sleep 0.2; done
 expect "pagerduty: the incident is resolved once decided" '"resolved": "a-' "$(grep '"resolved"' "$WORK/mock.log" | tail -1)"
 expect "opsgenie: the alert is closed once decided" '"note": "ariodb: denied by webhook' "$(grep '"closed"' "$WORK/mock.log" | tail -1)"
-expect "the link key lives in the secret store" "approval-link-key" "$($BIN "${CFG[@]}" secret list)"
+expect "the link key lives in the secret store" "ariodb.approval-link-key" "$($BIN "${CFG[@]}" secret list)"
 sed -e 's|^url_secret = "gchat-webhook"|url = "https://chat.example.test/hook"|' "$WORK/ariodb.toml" > "$WORK/plain-url.toml"
 expect "a webhook URL in the config file is refused at load" "the URL itself is the credential" \
   "$($BIN --config "$WORK/plain-url.toml" check 2>&1 || true)"
 sed -e 's|^smtp_host = "127.0.0.1"|smtp_host = "smtp.example.test"|' "$WORK/ariodb.toml" > "$WORK/plain-smtp.toml"
 expect "unencrypted SMTP to another machine is refused at load" "only allowed for a mail server on this machine" \
   "$($BIN --config "$WORK/plain-smtp.toml" check 2>&1 || true)"
+# Links that are not the channel's own. A dashboard user may store secrets
+# but must not be able to choose the link key, or they could sign links
+# that pass for a channel's (and keep doing so after losing their login).
+sign_link() { python3 -I -c 'import hashlib, hmac, sys; print(hmac.new(sys.argv[1].encode(), sys.argv[2].encode(), hashlib.sha256).hexdigest())' "$1" "$2"; }
+(agent coding-agent $T "SELECT /*ask-channel:discord*/ count(*) * 3 FROM orders" > "$OUT") & BG=$!
+ID=$(wait_for_pending)
+curl -s -o /dev/null -b "$WORK/cj" -X POST -H "x-ariodb-csrf: $CSRF" -H "$JSONH" -d '{"value":"chosen-by-a-dashboard-user"}' $D/api/secrets/approval-link-key
+expect "the dashboard cannot set the link key" "secret names use" \
+  "$(curl -s -b "$WORK/cj" -X POST -H "x-ariodb-csrf: $CSRF" -H "$JSONH" -d '{"value":"chosen-by-a-dashboard-user"}' $D/api/secrets/ariodb.approval-link-key)"
+expect "a link signed with a key a dashboard user chose is not valid" "not valid" \
+  "$(curl -s -X POST "$D/hooks/approvals/$ID?verdict=allow&token=$(sign_link chosen-by-a-dashboard-user "$ID:allow")")"
+expect "nor one signed with the webhook approver's key" "not valid" \
+  "$(curl -s -X POST "$D/hooks/approvals/$ID?verdict=allow&token=$(sign_link "$E2E_HOOK_KEY" "$ID:allow")")"
+LINK=$(channel_link discord "$ID" deny)
+expect "nor a Deny link's token used to approve" "not valid" "$(curl -s -X POST "${LINK/verdict=deny/verdict=allow}")"
+expect "so the request is still pending" "pending" "$($BIN "${CFG[@]}" approvals | grep "$ID")"
+expect "and its own Deny link still decides it" "Recorded: denied" "$(curl -s -X POST "$LINK")"
+wait $BG
 
 (agent coding-agent $T "SELECT /*ask-slack*/ count(*) + 4 FROM orders" > "$OUT") & BG=$!
 ID=$(wait_for_pending)

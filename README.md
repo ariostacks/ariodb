@@ -432,8 +432,9 @@ to = ["dba-oncall@example.com", "Sam Lee <sam@example.com>"]
   credential too: a plain `url` is refused for these types. Errors never
   include the URL or the token, so neither reaches the agent.
 - **Links** are signed with a key ariodb makes on first use and keeps in
-  the secret store as `approval-link-key`. Deleting it (`ariodb secret
-  delete approval-link-key`) invalidates every link already sent. Set
+  the secret store as `ariodb.approval-link-key`, a name the dashboard
+  cannot set. Deleting it (`ariodb secret delete ariodb.approval-link-key`)
+  invalidates every link already sent. Set
   `[dashboard] public_url` to the address approvers' browsers use; some
   services (Telegram among them) refuse buttons that point at `localhost`.
 - **Escaping**: the statement is put in a code block it cannot close
@@ -442,7 +443,11 @@ to = ["dba-oncall@example.com", "Sam Lee <sam@example.com>"]
   (Teams), or kept in the details, out of the summary (PagerDuty). In
   plain text (Opsgenie, email) the links come first and every line of the
   statement is marked with `| `, so it cannot pass for them. Mentions such
-  as `@here` and `<!channel>` are broken up.
+  as `@here` and `<!channel>` are broken up. Characters that reorder or
+  hide text (bidirectional overrides, zero-width spaces) are written out as
+  `<U+202E>` and the like. A statement too long for the channel is
+  shortened, and the message says so before it; the confirmation page
+  shows it in full.
 - **Failure**: as for Slack and webhooks, a channel that cannot be reached
   or that turns the message away refuses the statement, and the request is
   recorded as denied by `ariodb` with the reason. Resolving the PagerDuty
