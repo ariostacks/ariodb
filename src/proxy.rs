@@ -273,22 +273,22 @@ const BEGIN_RW: &str = "__ariodb_begin_rw";
 const TIMEOUT: &str = "__ariodb_timeout";
 const TAG: &str = "__ariodb_tag";
 const EFFECTS: &str = "__ariodb_effects";
+const EFFECTS_BASE: &str = "__ariodb_effects_base";
 const COMMIT: &str = "__ariodb_commit";
 const ROLLBACK: &str = "__ariodb_rollback";
 
 async fn prepare_internal(session: &mut Session) -> Result<(), String> {
+    let check = if session.measured {
+        crate::config::WriteCheck::Measured
+    } else {
+        crate::config::WriteCheck::Reported
+    };
     let mut statements = vec![
         (BEGIN_RO, "BEGIN READ ONLY"),
         (BEGIN_RW, "BEGIN"),
         (TIMEOUT, "SELECT set_config('statement_timeout', $1, true)"),
-        (
-            EFFECTS,
-            gate::effects_sql(if session.measured {
-                crate::config::WriteCheck::Measured
-            } else {
-                crate::config::WriteCheck::Reported
-            }),
-        ),
+        (EFFECTS_BASE, gate::effects_base_sql(check)),
+        (EFFECTS, gate::effects_sql(check)),
         (COMMIT, "COMMIT"),
         (ROLLBACK, "ROLLBACK"),
     ];
@@ -704,6 +704,9 @@ impl Connection {
                     let tag = serde_json::json!({ "session": self.session.id, "agent": self.session.agent.name }).to_string();
                     out.extend(internal_op(TAG, &[&tag]));
                 }
+                if plan == Plan::Write {
+                    out.extend(internal_op(EFFECTS_BASE, &[]));
+                }
             }
             out.push(Out::Client(f));
         }
@@ -740,7 +743,7 @@ impl Connection {
                 let tail = end_with(ROLLBACK);
                 status = self.exchange(&tail, Hold::All).await?.status;
             } else {
-                let effects = gate::parse_effects(&outcome.internal_rows);
+                let effects = gate::effects_since(&outcome.internal_rows);
                 let reported = wire::reported_rows(&send);
                 rows = Some(if self.session.measured {
                     gate::total_rows(&effects)

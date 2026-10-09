@@ -193,7 +193,6 @@ const SAFE_SETTINGS: &[&str] = &[
     "bytea_output",
     "client_min_messages",
     "lock_timeout",
-    "statement_timeout",
     "standard_conforming_strings",
 ];
 
@@ -289,9 +288,29 @@ const MYSQL_CATALOGUE: &[&str] = &[
     "columns_extensions",
 ];
 
-/// The engine's own catalogue. Agents may read it to discover the schema.
-/// On Postgres, unqualified `pg_*` names resolve to the catalogue first,
-/// because Postgres always searches `pg_catalog` before other schemas.
+/// Postgres catalogue relations that describe the schema, which read-only
+/// agents may read to discover it. Left out on purpose: statistics views
+/// (`pg_stats` holds sample values from every table the gateway can read),
+/// activity and lock views (other sessions' statements), replication,
+/// subscription, authentication and file views, and `pg_sequences`
+/// (current sequence values).
+const PG_CATALOGUE: &[&str] = &[
+    "pg_aggregate", "pg_am", "pg_amop", "pg_amproc", "pg_attrdef", "pg_attribute",
+    "pg_auth_members", "pg_available_extension_versions", "pg_available_extensions",
+    "pg_cast", "pg_class", "pg_collation", "pg_constraint", "pg_conversion", "pg_cursors",
+    "pg_database", "pg_default_acl", "pg_depend", "pg_description", "pg_enum",
+    "pg_extension", "pg_index", "pg_indexes", "pg_inherits", "pg_language", "pg_matviews",
+    "pg_namespace", "pg_opclass", "pg_operator", "pg_opfamily", "pg_partitioned_table",
+    "pg_policies", "pg_policy", "pg_prepared_statements", "pg_proc", "pg_range",
+    "pg_rewrite", "pg_roles", "pg_rules", "pg_sequence", "pg_settings", "pg_shdescription",
+    "pg_statistic_ext", "pg_tables", "pg_tablespace", "pg_timezone_abbrevs",
+    "pg_timezone_names", "pg_transform", "pg_trigger", "pg_ts_config", "pg_ts_config_map",
+    "pg_ts_dict", "pg_ts_parser", "pg_ts_template", "pg_type", "pg_user", "pg_views",
+];
+
+/// The engine's own catalogue. Agents may read the parts that describe the
+/// schema. On Postgres, unqualified catalogue names resolve to `pg_catalog`
+/// first, because Postgres searches it before other schemas.
 fn is_catalog(engine: &str, table: &str) -> bool {
     if engine == "mysql" {
         return table
@@ -305,9 +324,11 @@ fn is_catalog(engine: &str, table: &str) -> bool {
             "system.tables" | "system.columns" | "system.databases" | "system.functions"
         ) || table.starts_with("information_schema.");
     }
-    table.starts_with("pg_catalog.")
-        || table.starts_with("information_schema.")
-        || (table.starts_with("pg_") && !table.contains('.'))
+    if table.starts_with("information_schema.") {
+        return true;
+    }
+    let name = table.strip_prefix("pg_catalog.").unwrap_or(table);
+    !name.contains('.') && PG_CATALOGUE.contains(&name)
 }
 
 #[cfg(test)]
@@ -332,6 +353,50 @@ mod tests {
     fn decide_sql(access: Access, sql: &str) -> Decision {
         let stmt = classify(sql).unwrap().remove(0);
         decide(&agent(access), &stmt)
+    }
+
+    #[test]
+    fn the_statement_timeout_cannot_be_lifted() {
+        assert!(matches!(
+            decide_sql(Access::ReadWrite, "SET statement_timeout = 0"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            decide_sql(Access::ReadOnly, "SET lock_timeout = '1s'"),
+            Decision::Allow(Mode::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn only_schema_parts_of_the_catalogue_are_readable() {
+        for sql in [
+            "SELECT relname FROM pg_class",
+            "SELECT * FROM pg_catalog.pg_attribute",
+            "SELECT * FROM information_schema.columns",
+            "SELECT typname FROM pg_type",
+        ] {
+            assert_eq!(decide_sql(Access::ReadOnly, sql), Decision::Allow(Mode::ReadOnly), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM pg_stats",
+            "SELECT query FROM pg_stat_activity",
+            "SELECT * FROM pg_catalog.pg_stat_activity",
+            "SELECT * FROM pg_statistic",
+            "SELECT * FROM pg_locks",
+            "SELECT * FROM pg_subscription",
+            "SELECT last_value FROM pg_sequences",
+            // A user table that only looks like the catalogue.
+            "SELECT * FROM pg_secret_notes",
+            "SELECT * FROM public.pg_class",
+        ] {
+            assert!(matches!(decide_sql(Access::ReadOnly, sql), Decision::Deny(_)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn rules_see_catalogue_functions_without_their_schema() {
+        let stmt = classify("SELECT pg_catalog.pg_read_file('/etc/passwd')").unwrap().remove(0);
+        assert_eq!(stmt.functions, vec!["pg_read_file".to_string()]);
     }
 
     #[test]

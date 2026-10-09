@@ -303,6 +303,41 @@ pub struct Effect {
 pub const EFFECTS_SQL: &str = "SELECT schemaname || '.' || relname, (n_tup_ins + n_tup_upd + n_tup_del)::bigint \
      FROM pg_stat_xact_user_tables WHERE n_tup_ins + n_tup_upd + n_tup_del > 0 ORDER BY 1";
 
+/// The same counts taken when a write transaction begins, marked `base:`.
+/// Postgres keeps counts from earlier transactions on the same connection
+/// in these views until it flushes them (at most once a second), so a
+/// write's own effect is the final counts minus these.
+pub const EFFECTS_BASE_SQL: &str = "SELECT 'base:' || schemaname || '.' || relname, (n_tup_ins + n_tup_upd + n_tup_del)::bigint \
+     FROM pg_stat_xact_user_tables WHERE n_tup_ins + n_tup_upd + n_tup_del > 0";
+
+/// The effects of this transaction alone: final counts minus the `base:`
+/// counts taken at its start. Both kinds of row may be mixed in `rows`.
+pub fn effects_since(rows: &[Vec<Option<String>>]) -> Vec<Effect> {
+    let (base, now): (Vec<_>, Vec<_>) = rows.iter().cloned().partition(|r| {
+        r.first()
+            .and_then(|c| c.as_deref())
+            .is_some_and(|t| t.starts_with("base:"))
+    });
+    let base: Vec<Vec<Option<String>>> = base
+        .into_iter()
+        .map(|mut r| {
+            if let Some(Some(t)) = r.first_mut() {
+                *t = t.trim_start_matches("base:").to_string();
+            }
+            r
+        })
+        .collect();
+    let before = parse_effects(&base);
+    parse_effects(&now)
+        .into_iter()
+        .filter_map(|mut e| {
+            let earlier: i64 = before.iter().filter(|b| b.table == e.table).map(|b| b.rows).sum();
+            e.rows -= earlier;
+            (e.rows > 0).then_some(e)
+        })
+        .collect()
+}
+
 pub fn parse_effects(rows: &[Vec<Option<String>>]) -> Vec<Effect> {
     rows.iter()
         .filter_map(|r| {
@@ -344,6 +379,14 @@ pub fn write_tables(statements: &[Statement]) -> Vec<String> {
 pub fn effects_sql(check: crate::config::WriteCheck) -> &'static str {
     match check {
         crate::config::WriteCheck::Measured => EFFECTS_SQL,
+        crate::config::WriteCheck::Reported => "SELECT NULL::text, NULL::bigint WHERE false",
+    }
+}
+
+/// The baseline taken when a write begins, or nothing under `reported`.
+pub fn effects_base_sql(check: crate::config::WriteCheck) -> &'static str {
+    match check {
+        crate::config::WriteCheck::Measured => EFFECTS_BASE_SQL,
         crate::config::WriteCheck::Reported => "SELECT NULL::text, NULL::bigint WHERE false",
     }
 }
@@ -423,6 +466,20 @@ mod tests {
             table: table.to_string(),
             rows,
         }
+    }
+
+    #[test]
+    fn earlier_transactions_counts_are_taken_off() {
+        let row = |t: &str, n: &str| vec![Some(t.to_string()), Some(n.to_string())];
+        let effects = effects_since(&[
+            row("base:public.orders", "2"),
+            row("base:public.log", "5"),
+            row("public.orders", "3"),
+            row("public.log", "5"),
+            row("public.customers", "1"),
+        ]);
+        let got: Vec<(String, i64)> = effects.into_iter().map(|e| (e.table, e.rows)).collect();
+        assert_eq!(got, vec![("orders".to_string(), 1), ("customers".to_string(), 1)]);
     }
 
     #[test]

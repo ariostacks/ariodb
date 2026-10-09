@@ -317,7 +317,7 @@ pub async fn admin_client(target: &Target, url: &str) -> Result<tokio_postgres::
         Ok(client)
     } else {
         config.ssl_mode(tokio_postgres::config::SslMode::Require);
-        let tls = tls::postgres_connector(target_tls)?;
+        let tls = tls::postgres_connector(target_tls, target.ca_file.as_deref())?;
         let (client, connection) = config.connect(tls).await.map_err(err)?;
         tokio::spawn(async move {
             let _ = connection.await;

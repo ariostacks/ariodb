@@ -81,8 +81,9 @@ pub async fn connect(
 /// A connector for tokio-postgres, used by the journal, setup and undo.
 pub fn postgres_connector(
     mode: TlsMode,
+    ca_file: Option<&str>,
 ) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
-    let config = client_config(mode, None)?;
+    let config = client_config(mode, ca_file)?;
     Ok(tokio_postgres_rustls::MakeRustlsConnect::new(
         (*config).clone(),
     ))

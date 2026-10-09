@@ -487,16 +487,21 @@ impl Config {
 
     /// The real database URL. `ARIODB_DATABASE_URL` wins over the config file,
     /// so the password never needs to live in the file.
-    pub fn database_url(&self) -> String {
+    /// A named secret that cannot be read is an error: falling back to `url`
+    /// could quietly connect as a different login.
+    pub fn database_url(&self) -> Result<String, String> {
         if let Ok(url) = std::env::var("ARIODB_DATABASE_URL") {
-            return url;
+            return Ok(url);
         }
-        if let Some(name) = &self.database.secret
-            && let Ok(Some(url)) = self.secret(name)
-        {
-            return url;
+        if let Some(name) = &self.database.secret {
+            return match self.secret(name)? {
+                Some(url) => Ok(url),
+                None => Err(format!(
+                    "[database] secret '{name}' is not set (ariodb secret set {name})"
+                )),
+            };
         }
-        self.database.url.clone()
+        Ok(self.database.url.clone())
     }
 
     /// Read a value from the encrypted secret store.
@@ -626,7 +631,7 @@ impl Config {
         match &agent.credential {
             None => self.through(
                 Target::from_url(
-                    &self.database_url(),
+                    &self.database_url()?,
                     self.database.tls,
                     self.database.ca_file.clone(),
                 )?,

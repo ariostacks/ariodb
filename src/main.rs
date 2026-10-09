@@ -659,7 +659,10 @@ fn print_summary(config: &Config) {
     };
     println!(
         "database      {}{}",
-        config::redact_url(&config.database_url()),
+        config
+            .database_url()
+            .map(|u| config::redact_url(&u))
+            .unwrap_or_else(|e| format!("({e})")),
         via(&config.database.tunnel)
     );
     for c in config.credentials.iter().filter(|c| c.tunnel.is_some()) {

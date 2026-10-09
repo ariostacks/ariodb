@@ -50,6 +50,8 @@ pub struct Session {
     /// Whether writes are measured (`write_check = "measured"`). Fixed when
     /// the session opens, like `tagging`.
     pub measured: bool,
+    /// Counts at the start of the current write, taken off its measurement.
+    pub baseline: Vec<Vec<Option<String>>>,
 }
 
 impl Session {
@@ -67,6 +69,7 @@ impl Session {
             live: Arc::new(gate::Liveness::default()),
             tagging: config.journal.enabled,
             measured: config.database.write_check == crate::config::WriteCheck::Measured,
+            baseline: Vec::new(),
         })
     }
 
@@ -90,19 +93,30 @@ impl Session {
                 tag.replace('\'', "''")
             ));
         }
-        Ok(self.up.internal(&sql).await?.map(|_| ()))
+        if let Err(e) = self.up.internal(&sql).await? {
+            return Ok(Err(e));
+        }
+        self.baseline.clear();
+        if plan == Plan::Write && self.measured {
+            match self.up.internal(gate::EFFECTS_BASE_SQL).await? {
+                Ok(r) => self.baseline = r.rows,
+                Err(e) => return Ok(Err(e)),
+            }
+        }
+        Ok(Ok(()))
     }
 
     pub async fn effects(&mut self) -> Result<Result<Vec<gate::Effect>, DbError>, WireError> {
-        Ok(self
-            .up
-            .internal(gate::effects_sql(if self.measured {
-                crate::config::WriteCheck::Measured
-            } else {
-                crate::config::WriteCheck::Reported
-            }))
-            .await?
-            .map(|r| gate::parse_effects(&r.rows)))
+        let check = if self.measured {
+            crate::config::WriteCheck::Measured
+        } else {
+            crate::config::WriteCheck::Reported
+        };
+        Ok(self.up.internal(gate::effects_sql(check)).await?.map(|r| {
+            let mut rows = self.baseline.clone();
+            rows.extend(r.rows);
+            gate::effects_since(&rows)
+        }))
     }
 
     pub async fn end(&mut self, commit: bool) -> Result<(), WireError> {

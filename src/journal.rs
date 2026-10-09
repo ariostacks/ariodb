@@ -97,12 +97,18 @@ pub fn read_all(config: &Config) -> Result<Vec<TxnRecord>, String> {
         out.push(record);
     }
     out.sort_by_key(|r| r.lsn);
+    // A crash after a line reaches disk but before the slot advances means
+    // the transaction is read and written again. Keep the first copy.
+    out.dedup_by(|b, a| a.lsn == b.lsn && a.xid == b.xid);
     Ok(out)
 }
 
 /// The connection the journal uses. It needs the REPLICATION attribute.
-pub fn journal_url(config: &Config) -> String {
-    std::env::var("ARIODB_JOURNAL_URL").unwrap_or_else(|_| config.database_url())
+pub fn journal_url(config: &Config) -> Result<String, String> {
+    match std::env::var("ARIODB_JOURNAL_URL") {
+        Ok(url) => Ok(url),
+        Err(_) => config.database_url(),
+    }
 }
 
 async fn connect(config: &Config, url: &str) -> Result<Client, String> {
@@ -113,7 +119,7 @@ async fn connect(config: &Config, url: &str) -> Result<Client, String> {
 /// Prepare the database: full before-images on protected tables, a
 /// publication listing them, and a replication slot. Safe to run again.
 pub async fn setup(config: &Config) -> Result<(), String> {
-    let client = connect(config, &journal_url(config)).await?;
+    let client = connect(config, &journal_url(config)?).await?;
     let err = |e: tokio_postgres::Error| {
         e.as_db_error()
             .map(|d| d.message().to_string())
@@ -247,7 +253,11 @@ pub async fn run(config: &Config) -> Result<(), String> {
         }
     };
     loop {
-        let client = match connect(config, &journal_url(config)).await {
+        let connected = match journal_url(config) {
+            Ok(url) => connect(config, &url).await,
+            Err(e) => Err(e),
+        };
+        let client = match connected {
             Ok(c) => c,
             Err(e) => {
                 report(e);

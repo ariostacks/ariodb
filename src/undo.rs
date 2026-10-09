@@ -97,7 +97,10 @@ pub struct Plan {
 }
 
 pub async fn connect(config: &Config) -> Result<Client, String> {
-    let url = std::env::var("ARIODB_ADMIN_URL").unwrap_or_else(|_| config.database_url());
+    let url = match std::env::var("ARIODB_ADMIN_URL") {
+        Ok(url) => url,
+        Err(_) => config.database_url()?,
+    };
     let target = config.admin_target(&url)?;
     crate::upstream::admin_client(&target, &url).await
 }

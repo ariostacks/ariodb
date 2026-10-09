@@ -110,7 +110,7 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
     let mut functions: Vec<String> = parsed
         .functions()
         .iter()
-        .map(|f| f.to_lowercase())
+        .map(|f| normalise_function(f))
         .collect();
     // The parser's table and function lists stop at PREPARE and DECLARE
     // CURSOR, so a table or function named only in there would pass the
@@ -122,7 +122,7 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
             .map_err(|e| ParseError(format!("cannot read the wrapped query: {e}")))?;
         let inner = pg_query::parse(&text).map_err(|e| ParseError(e.to_string()))?;
         tables.extend(inner.tables().iter().map(|t| normalise_table(t)));
-        functions.extend(inner.functions().iter().map(|f| f.to_lowercase()));
+        functions.extend(inner.functions().iter().map(|f| normalise_function(f)));
     }
     tables.sort();
     tables.dedup();
@@ -170,6 +170,18 @@ fn command_of(node: &Node) -> &'static str {
 pub fn normalise_table(name: &str) -> String {
     let lower = name.to_lowercase();
     match lower.strip_prefix("public.") {
+        // `public.pg_x` must not become `pg_x`, which names the catalogue.
+        Some(rest) if !rest.starts_with("pg_") => rest.to_string(),
+        _ => lower,
+    }
+}
+
+/// Function names as rules see them: lower case, and without `pg_catalog.`,
+/// which names the same built-in function (`pg_catalog.pg_read_file` is
+/// `pg_read_file`).
+pub fn normalise_function(name: &str) -> String {
+    let lower = name.to_lowercase();
+    match lower.strip_prefix("pg_catalog.") {
         Some(rest) => rest.to_string(),
         None => lower,
     }

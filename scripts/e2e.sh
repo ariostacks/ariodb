@@ -339,8 +339,21 @@ wait_for_proxy
 BEFORE=$(fingerprint)
 
 T=$E2E_AGENT_TOKEN
+# Whether ariodb's connection for an agent uses TLS, seen from the database
+# while the agent's statement runs (agents may not read pg_stat_ssl).
+agent_ssl() {
+  (agent coding-agent "$1" "SELECT pg_sleep(3)" >/dev/null) &
+  local bg=$! out=""
+  for _ in $(seq 1 30); do
+    out=$(admin -tAc "SELECT 'ssl', s.ssl FROM pg_stat_ssl s JOIN pg_stat_activity a USING (pid) WHERE a.application_name = 'ariodb:coding-agent' AND a.query LIKE '%pg_sleep%'")
+    [ -n "$out" ] && break
+    sleep 0.2
+  done
+  wait $bg
+  echo "$out"
+}
 echo "database TLS"
-expect "ariodb reaches the database over TLS" "| t" "$(agent coding-agent $E2E_AGENT_TOKEN "SELECT 'ssl', ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")"
+expect "ariodb reaches the database over TLS" "ssl|t" "$(agent_ssl $E2E_AGENT_TOKEN)"
 
 echo "credentials"
 expect "secrets are listed by name" "pg-readonly" "$($BIN "${CFG[@]}" secret list)"
@@ -359,6 +372,12 @@ expect "drop refused"                   "destructive"            "$(agent coding
 expect "other tables refused"           "may not use table"      "$(agent coding-agent $T "SELECT * FROM secrets")"
 expect "bulk write rolled back"         "the limit is 500"       "$(agent coding-agent $T "UPDATE orders SET status='void' WHERE id <= 800")"
 expect "trigger side effect rolled back" "order_log"             "$(agent coding-agent $T "UPDATE orders SET status='audited' WHERE id = 5")"
+# Two writes of 300 rows straight after each other on one connection: Postgres
+# still holds the first one's counts, which must not count against the second.
+BACK_TO_BACK=$(docker run --rm -e PGPASSWORD="$T" $CLIENT psql "host=host.docker.internal port=$PROXY user=coding-agent dbname=app sslmode=disable" \
+  -c "UPDATE orders SET status = status WHERE id <= 300" -c "UPDATE orders SET status = status WHERE id > 300 AND id <= 600" 2>&1 || true)
+expect "back-to-back writes are each measured alone" "UPDATE 300
+UPDATE 300" "$BACK_TO_BACK"
 expect "BEGIN refused"                  "own transaction"        "$(agent coding-agent $T "BEGIN")"
 expect "SQL run by query_to_xml refused" "never allowed"         "$(agent coding-agent $T "SELECT query_to_xml('SELECT * FROM secrets', true, false, '')")"
 expect "set_config refused"             "never allowed"          "$(agent coding-agent $T "SELECT set_config('search_path', 'pg_temp', false)")"
@@ -746,8 +765,7 @@ SERVE_PID=$!
 wait_for_proxy
 expect "serve waited for the tunnel" "tunnel 'pg' is ready" "$(cat "$WORK/serve-tunnel.log")"
 expect "an agent query works through the tunnel" "ariodb_gw" "$(agent coding-agent $T "SELECT current_user")"
-expect "TLS from the URL is kept through the tunnel" "| t" \
-  "$(agent coding-agent $T "SELECT 'ssl', ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")"
+expect "TLS from the URL is kept through the tunnel" "ssl|t" "$(agent_ssl $T)"
 expect "tunnel output is logged with its name" "tunnel pg: forwarding a connection" "$(cat "$WORK/serve-tunnel.log")"
 forwarder_pid() { sed -n 's/^tunnel pg: forwarder pid \([0-9]*\) .*/\1/p' "$WORK/serve-tunnel.log" | tail -1; }
 FWD=$(forwarder_pid)

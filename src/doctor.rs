@@ -191,8 +191,8 @@ async fn run_postgres(config: &Config, sections: &mut Vec<Section>) -> Guarantee
     let mut logins: Vec<Login> = vec![(
         "default login".to_string(),
         config
-            .admin_target(&config.database_url())
-            .map(|t| (t, config.database_url())),
+            .database_url()
+            .and_then(|url| config.admin_target(&url).map(|t| (t, url))),
     )];
     let mut used: Vec<&str> = config
         .agents
@@ -255,17 +255,25 @@ async fn run_postgres(config: &Config, sections: &mut Vec<Section>) -> Guarantee
 
     let undo = if config.journal.enabled {
         let mut checks = Checks { findings: vec![] };
-        let url = crate::journal::journal_url(config);
-        let title = match config.admin_target(&url) {
-            Ok(t) => format!("journal: {}@{}/{}", t.user, t.describe(), t.database),
-            Err(_) => "journal".to_string(),
-        };
-        let work = check_journal(config, &url, &mut checks);
-        let undo = match tokio::time::timeout(Duration::from_secs(30), work).await {
-            Ok(r) => r,
-            Err(_) => {
-                checks.fail("the checks took longer than 30 seconds");
-                Err("the journal checks timed out".to_string())
+        let (title, undo) = match crate::journal::journal_url(config) {
+            Err(e) => {
+                checks.fail(e.clone());
+                ("journal".to_string(), Err(e))
+            }
+            Ok(url) => {
+                let title = match config.admin_target(&url) {
+                    Ok(t) => format!("journal: {}@{}/{}", t.user, t.describe(), t.database),
+                    Err(_) => "journal".to_string(),
+                };
+                let work = check_journal(config, &url, &mut checks);
+                let undo = match tokio::time::timeout(Duration::from_secs(30), work).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        checks.fail("the checks took longer than 30 seconds");
+                        Err("the journal checks timed out".to_string())
+                    }
+                };
+                (title, undo)
             }
         };
         sections.push(Section {

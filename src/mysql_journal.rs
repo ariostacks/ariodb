@@ -124,6 +124,9 @@ pub fn read_all(config: &Config) -> Result<Vec<TxnRecord>, String> {
         out.push(record);
     }
     out.sort_by_key(|r| r.lsn);
+    // A crash after a line reaches disk but before the position is saved
+    // means the transaction is read and written again. Keep the first copy.
+    out.dedup_by(|b, a| a.lsn == b.lsn && a.xid == b.xid);
     Ok(out)
 }
 
