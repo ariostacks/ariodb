@@ -120,6 +120,20 @@ Cedar policies, approval holds in Slack or Teams, column masking, guards for
 provider control-plane APIs, and deterministic simulation testing. See the
 roadmap in the design document.
 
+## Dashboard front end
+
+The dashboard is a React app (Vite, Tailwind CSS and shadcn/ui) in
+`dashboard/`. Its built files in `dashboard/dist` are committed and embedded
+in the binary, so `cargo build` needs no Node. After changing the front end:
+
+```bash
+./scripts/build-dashboard.sh   # npm ci and build into dashboard/dist
+```
+
+For live reloading, run ariodb with its dashboard on 127.0.0.1:8080 (for
+example `./scripts/demo.sh`), then `cd dashboard && npm run dev`; Vite passes
+`/api` through to ariodb.
+
 ## Testing
 
 ```bash
