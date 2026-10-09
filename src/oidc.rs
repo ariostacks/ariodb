@@ -26,8 +26,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// `[dashboard.oidc]`.
+/// `[dashboard.oidc]`. Unknown keys are refused, so a misspelt
+/// `password_login` cannot leave passwords on unnoticed.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// The provider's issuer URL; `/.well-known/openid-configuration` is
     /// read from under it.
@@ -389,6 +391,9 @@ pub struct Identity {
     pub email: Option<String>,
     pub email_verified: Option<bool>,
     pub groups: Vec<String>,
+    /// Whether the token had the groups claim at all. Some providers leave
+    /// it out for someone in no group; others when no mapper adds it.
+    pub groups_claimed: bool,
 }
 
 pub fn identity(
@@ -416,12 +421,7 @@ pub fn identity(
             .map(clean)
             .collect(),
         Some(Value::String(one)) => vec![clean(one)],
-        _ => {
-            return Err(format!(
-                "the ID token has no '{}' claim, so ariodb cannot tell your role; the provider must put groups in the ID token",
-                o.groups_claim
-            ));
-        }
+        _ => Vec::new(),
     };
     let trusted_email = email.clone().filter(|_| email_verified != Some(false));
     let name = trusted_email
@@ -432,6 +432,7 @@ pub fn identity(
         name,
         email,
         email_verified,
+        groups_claimed: groups_value.is_some(),
         groups,
     })
 }
@@ -461,8 +462,16 @@ pub fn admit(o: &OidcConfig, who: &Identity) -> Result<Role, String> {
         }
     }
     o.role_for(&who.groups).ok_or_else(|| {
+        let hint = if who.groups_claimed {
+            String::new()
+        } else {
+            format!(
+                " (the ID token has no '{}' claim: the provider must put groups in it)",
+                o.groups_claim
+            )
+        };
         format!(
-            "{} is not in any group that may use this dashboard",
+            "{} is not in any group that may use this dashboard{hint}",
             who.name
         )
     })
@@ -1191,7 +1200,11 @@ viewer_groups = ["ariodb-viewers"]
         let o = config();
         let mut c = claims();
         c.as_object_mut().unwrap().remove("groups");
-        assert!(identity(&o, &map(c)).unwrap_err().contains("no 'groups' claim"));
+        let who = identity(&o, &map(c)).unwrap();
+        assert!(who.groups.is_empty());
+        let refused = admit(&o, &who).unwrap_err();
+        assert!(refused.contains("not in any group"), "{refused}");
+        assert!(refused.contains("no 'groups' claim"), "{refused}");
         let who = identity(&o, &map(with(|c| c["groups"] = json!(["everyone"])))).unwrap();
         assert!(admit(&o, &who).unwrap_err().contains("not in any group"));
         let who = identity(&o, &map(claims())).unwrap();
@@ -1275,6 +1288,11 @@ admin_groups = ["ariodb-admins"]
         assert!(load("http://localhost.evil.example", "/auth/callback").is_err());
         assert!(load("http://127.evil.example", "/auth/callback").is_err());
         assert!(load("http://127.0.0.1@evil.example", "/auth/callback").is_err());
+        let typo = base
+            .replace("ISSUER", "https://login.example.test")
+            .replace("PATH", "/cb")
+            + "pasword_login = \"off\"\n";
+        assert!(Config::from_toml(&typo).is_err());
         for path in ["/api/callback", "/", "auth", "/approvals", "/auth/login"] {
             assert!(load("https://login.example.test", path).is_err(), "{path}");
         }
