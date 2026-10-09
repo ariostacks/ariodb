@@ -14,6 +14,8 @@ mod journal;
 mod mcp;
 mod pgoutput;
 mod policy;
+#[cfg(test)]
+mod proptests;
 mod proxy;
 mod rules;
 mod secrets;
