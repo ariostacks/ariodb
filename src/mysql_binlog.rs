@@ -23,8 +23,11 @@
 //! | `BINARY`, `VARBINARY`, `BLOB`, spatial types, and text in any other character set | `\x` and the stored bytes in lowercase hex |
 //!
 //! NULL is recorded as JSON `null`. A value the binlog does not carry in
-//! full (a partial JSON update, or JSON holding MySQL-only scalar types) is
-//! recorded as `{"unchanged": true}`; undo refuses rows that need one.
+//! full (a partial JSON update, JSON holding MySQL-only scalar types, or a
+//! negative `TIME(1)` or `TIME(2)` value with a fraction, which mysql_common
+//! misreads) is recorded as `{"unchanged": true}`; undo refuses rows that
+//! need one. ENUM and SET members are names whatever the column's character
+//! set.
 
 use crate::journal::{Cell, Change, Op};
 use mysql_async::Value;
@@ -139,8 +142,11 @@ pub fn shape(tme: &TableMapEvent<'_>, info: &[InfoColumn]) -> TableShape {
             Some(ColumnType::MYSQL_TYPE_SET) => sets.next().unwrap_or_default(),
             _ => Vec::new(),
         };
-        if members.is_empty()
-            && let Some(c) = found
+        // The binlog gives member names in the column's character set,
+        // which only reads as text for utf8; information_schema's are utf8.
+        if let Some(c) = found
+            && (members.is_empty() || c.charset.as_deref().is_some_and(|cs| !is_utf8(cs)))
+            && matches!(c.data_type.as_str(), "enum" | "set")
         {
             members = members_of(&c.column_type);
         }
@@ -240,8 +246,31 @@ pub fn changes(
             .collect(),
         None => vec![true; count],
     };
+    // mysql_common 0.37 overflows on negative TIME(1) and TIME(2) values
+    // with a fraction: a panic in debug builds, a wrong value in release
+    // ones (which `encode` detects). A panic must not stop the journal, so
+    // the change is recorded without values, which undo refuses.
+    let rows = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        event.rows(tme).collect::<Vec<_>>()
+    })) {
+        Ok(rows) => rows,
+        Err(_) => {
+            eprintln!(
+                "ariodb: MySQL journal: cannot decode a change to {}.{}; it is recorded without values, so undo will refuse it",
+                shape.schema, shape.table
+            );
+            return Ok(vec![Change {
+                schema: shape.schema.clone(),
+                table: shape.table.clone(),
+                op,
+                columns,
+                old: None,
+                new: None,
+            }]);
+        }
+    };
     let mut out = Vec::new();
-    for row in event.rows(tme) {
+    for row in rows {
         let (before, after) = row.map_err(|e| {
             format!(
                 "cannot decode a change to {}.{}: {e}",
@@ -408,6 +437,15 @@ pub fn encode(
                 }
                 (_, Value::Time(neg, days, h, m, s, us)) => {
                     let fsp = if ty == MYSQL_TYPE_TIME2 { fsp } else { 0 };
+                    // mysql_common misreads negative TIME(1) and TIME(2)
+                    // values with a fraction (see `changes`); every value it
+                    // reads that way is negative with a fraction, or has
+                    // more than a second of microseconds.
+                    if *us > 999_999
+                        || (ty == MYSQL_TYPE_TIME2 && matches!(fsp, 1 | 2) && *neg && *us != 0)
+                    {
+                        return Some(unrecorded());
+                    }
                     let hours = *days as u64 * 24 + *h as u64;
                     format!(
                         "{}{hours:02}:{m:02}:{s:02}{}",
@@ -635,6 +673,70 @@ mod tests {
                 &c
             ),
             "01:02:03.4"
+        );
+    }
+
+    /// What mysql_common 0.37 makes of a negative TIME(1) or TIME(2) value
+    /// with a fraction, in a release build: its u32 fraction wraps.
+    fn misread_time2(stored_int: i64, stored_frac: u8) -> Value {
+        let (mut int, mut frac) = (stored_int, stored_frac as u32);
+        if int < 0 && frac > 0 {
+            int += 1;
+            frac = frac.wrapping_sub(0x100);
+        }
+        let mut packed = ((int as u64) << 24) as i64 + (frac as i64) * 10_000;
+        // mysql_common's time_from_packed, which it does not export.
+        let neg = packed < 0;
+        packed = packed.abs();
+        let hms = packed >> 24;
+        let h = ((hms >> 12) as u32) % (1 << 10);
+        Value::Time(
+            neg,
+            h / 24,
+            (h % 24) as u8,
+            ((hms >> 6) as u32 % (1 << 6)) as u8,
+            (hms as u32 % (1 << 6)) as u8,
+            (packed % (1 << 24)) as u32,
+        )
+    }
+
+    #[test]
+    fn misread_negative_times_are_not_recorded() {
+        use ColumnType::*;
+        let c = col(Text::Utf8, false);
+        let unrecorded = Some(Cell::Unchanged { unchanged: true });
+        // -01:00:00.50 and -700:00:00.50 as TIME(2) stores them.
+        for (int, frac) in [(-4097, 206), (-(700 << 12) - 1, 206)] {
+            let v = misread_time2(int, frac);
+            assert_eq!(
+                encode(&BinlogValue::Value(v.clone()), MYSQL_TYPE_TIME2, &[2], &c),
+                unrecorded,
+                "{v:?}"
+            );
+        }
+        // Values it reads correctly are kept: positive, or without a fraction.
+        assert_eq!(
+            enc(
+                Value::Time(false, 0, 1, 0, 0, 500_000),
+                MYSQL_TYPE_TIME2,
+                &[2],
+                &c
+            ),
+            "01:00:00.50"
+        );
+        assert_eq!(
+            enc(Value::Time(true, 0, 1, 0, 0, 0), MYSQL_TYPE_TIME2, &[2], &c),
+            "-01:00:00.00"
+        );
+        // TIME(3) and finer are read correctly, negative or not.
+        assert_eq!(
+            enc(
+                Value::Time(true, 0, 0, 0, 1, 500_000),
+                MYSQL_TYPE_TIME2,
+                &[3],
+                &c
+            ),
+            "-00:00:01.500"
         );
     }
 

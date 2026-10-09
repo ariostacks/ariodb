@@ -208,7 +208,9 @@ pub async fn plan(
                 continue;
             }
             let Some(values) = change.new.as_ref().or(change.old.as_ref()) else {
-                blocked.push(format!("{table}: a change without values"));
+                blocked.push(format!(
+                    "{table}: a change the journal could not decode (see ariodb's log)"
+                ));
                 continue;
             };
             let key = (table, key_of(change, values, &info.primary_key));
@@ -702,20 +704,29 @@ fn is_string_type(data_type: &str) -> bool {
 
 /// Values recorded as hex: binary data, and text in a character set other
 /// than utf8. They are sent as hex too, since a server may refuse bytes that
-/// are not valid in the connection's character set.
+/// are not valid in the connection's character set. ENUM and SET values are
+/// member names in any character set.
 fn is_hex(col: &Column) -> bool {
-    is_bytes_type(&col.data_type) || (is_string_type(&col.data_type) && col.other_charset.is_some())
+    is_bytes_type(&col.data_type)
+        || (is_string_type(&col.data_type) && col.other_charset.is_some() && !is_members(col))
+}
+
+fn is_members(col: &Column) -> bool {
+    matches!(col.data_type.as_str(), "enum" | "set")
 }
 
 /// The placeholder for a value written to `col`.
 fn write_expr(col: &Column) -> String {
     if col.data_type == "json" {
         "CAST(? AS JSON)".to_string()
-    } else if let (Some(cs), false) = (&col.other_charset, is_bytes_type(&col.data_type)) {
-        // The recorded bytes are already in the column's character set.
-        format!("CONVERT(UNHEX(?) USING {})", safe_word(cs))
     } else if is_hex(col) {
-        "UNHEX(?)".to_string()
+        match &col.other_charset {
+            // The recorded bytes are already in the column's character set.
+            Some(cs) if !is_bytes_type(&col.data_type) => {
+                format!("CONVERT(UNHEX(?) USING {})", safe_word(cs))
+            }
+            _ => "UNHEX(?)".to_string(),
+        }
     } else if matches!(col.data_type.as_str(), "decimal" | "numeric") {
         decimal_cast(col)
     } else {
@@ -747,6 +758,9 @@ fn same_expr(col: &Column) -> String {
         format!("{c} <=> CAST(? AS JSON)")
     } else if is_hex(col) {
         format!("CAST({c} AS BINARY) <=> UNHEX(?)")
+    } else if is_members(col) {
+        // Member names were recorded as utf8, whatever the column's set.
+        format!("CAST(CONVERT({c} USING utf8mb4) AS BINARY) <=> CAST(? AS BINARY)")
     } else if is_string_type(&col.data_type) {
         format!("CAST({c} AS BINARY) <=> CAST(? AS BINARY)")
     } else if matches!(col.data_type.as_str(), "decimal" | "numeric") {
@@ -1190,6 +1204,18 @@ mod tests {
         assert_eq!(write_expr(&latin), "CONVERT(UNHEX(?) USING latin1)");
         assert_eq!(same_expr(&latin), "CAST(`l` AS BINARY) <=> UNHEX(?)");
         assert_eq!(write_expr(&col("b", "varbinary")), "UNHEX(?)");
+        // ENUM and SET were recorded as member names, even in latin1.
+        let mut size = col("size", "enum");
+        size.other_charset = Some("latin1".into());
+        assert_eq!(
+            param(&size, &t("large")).unwrap(),
+            Value::Bytes(b"large".to_vec())
+        );
+        assert_eq!(write_expr(&size), "?");
+        assert_eq!(
+            same_expr(&size),
+            "CAST(CONVERT(`size` USING utf8mb4) AS BINARY) <=> CAST(? AS BINARY)"
+        );
     }
 
     #[test]

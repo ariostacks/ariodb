@@ -55,6 +55,29 @@ fn position_path(config: &Config) -> PathBuf {
 pub struct Position {
     pub file: String,
     pub pos: u64,
+    /// Added to every record's lsn, so lsns keep growing when the binlog
+    /// starts again from a lower file number (RESET BINARY LOGS, or another
+    /// server after a failover) and the journal is restarted from there.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub base: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Where a journal with no saved position starts: the server's position
+/// now, with a base that puts it after everything already recorded.
+async fn fresh_position(config: &Config, conn: &mut Conn) -> Result<Position, String> {
+    let mut p = server_position(conn).await?;
+    let last = read_all(config)?.last().map(|r| r.lsn).unwrap_or(0);
+    p.base = next_base(last, mysql_binlog::lsn(&p.file, p.pos));
+    Ok(p)
+}
+
+/// The base that makes `raw` (a binlog position's lsn) come after `last`.
+fn next_base(last: u64, raw: u64) -> u64 {
+    if last >= raw { last - raw + 1 } else { 0 }
 }
 
 pub fn load_position(config: &Config) -> Result<Option<Position>, String> {
@@ -234,7 +257,7 @@ pub async fn server_position(conn: &mut Conn) -> Result<Position, String> {
                 let file: Option<String> = row.get(0);
                 let pos: Option<u64> = row.get(1);
                 if let (Some(file), Some(pos)) = (file, pos) {
-                    return Ok(Position { file, pos });
+                    return Ok(Position { file, pos, base: 0 });
                 }
                 last = "the binlog is off".to_string();
             }
@@ -342,7 +365,14 @@ pub async fn binlog_findings(config: &Config, conn: &mut Conn) -> Vec<Finding> {
                 .to_string(),
         );
     }
-    if vars.get("server_id").and_then(|s| s.parse::<u32>().ok()) == Some(config.mysql.server_id) {
+    if config.mysql.server_id == 0 {
+        push(
+            Status::Fail,
+            "[mysql] server_id is 0, which servers treat as a one-off read that ends at the binlog's end; pick a number no server or replica uses".to_string(),
+        );
+    } else if vars.get("server_id").and_then(|s| s.parse::<u32>().ok())
+        == Some(config.mysql.server_id)
+    {
         push(
             Status::Fail,
             format!(
@@ -444,7 +474,7 @@ pub async fn setup(config: &Config) -> Result<(), String> {
     match load_position(config)? {
         Some(p) => println!("ok   the journal continues from {}:{}", p.file, p.pos),
         None => {
-            let p = server_position(&mut conn).await?;
+            let p = fresh_position(config, &mut conn).await?;
             save_position(config, &p)?;
             println!(
                 "ok   the journal will record changes from {}:{}",
@@ -523,6 +553,9 @@ fn report(last_error: &mut String, e: String) {
 struct Open {
     session: Option<(String, String)>,
     changes: Vec<Change>,
+    /// A rows event has been read: a tag row after this is not the
+    /// gateway's, which always writes it first.
+    rows_seen: bool,
 }
 
 struct Reader<'a> {
@@ -535,6 +568,8 @@ struct Reader<'a> {
     shapes: HashMap<u64, TableShape>,
     file: String,
     pos: u64,
+    /// The saved position's base, added to every lsn.
+    base: u64,
     saved: Position,
     saved_at: Instant,
     /// The position of the newest recorded transaction, so one repeated
@@ -562,7 +597,9 @@ impl<'a> Reader<'a> {
             saved: Position {
                 file: String::new(),
                 pos: 0,
+                base: 0,
             },
+            base: 0,
             saved_at: Instant::now(),
             last_lsn: 0,
             open: None,
@@ -579,13 +616,14 @@ impl<'a> Reader<'a> {
         let start = match load_position(self.config)? {
             Some(p) => p,
             None => {
-                let p = server_position(&mut lookup).await?;
+                let p = fresh_position(self.config, &mut lookup).await?;
                 save_position(self.config, &p)?;
                 p
             }
         };
         self.file = start.file.clone();
         self.pos = start.pos;
+        self.base = start.base;
         self.saved = start.clone();
 
         let mut conn = connect(self.config).await?;
@@ -626,7 +664,11 @@ impl<'a> Reader<'a> {
                 Ok(None) => return Err("the MySQL server ended the binlog stream".to_string()),
                 Ok(Some(Err(e))) => {
                     let m = message(&e);
-                    return Err(if code(&e) == Some(1236) {
+                    // 1236 also means another reader took this server id;
+                    // only a purged file calls for starting again.
+                    let purged =
+                        m.contains("purged") || m.contains("Could not find first log file");
+                    return Err(if code(&e) == Some(1236) && purged {
                         format!(
                             "cannot read the binlog from {}:{}: {m}. If that file was purged, changes since were lost; move {} aside to start from now",
                             self.saved.file,
@@ -746,8 +788,16 @@ impl<'a> Reader<'a> {
                 );
                 let is_tag = db == self.tag.0 && table == self.tag.1;
                 let open = self.open.get_or_insert_with(Open::default);
+                let first = !std::mem::replace(&mut open.rows_seen, true);
                 // Rows are kept for protected tables, and for every table in
-                // a transaction an agent tagged (the tag comes first).
+                // a transaction an agent tagged (the tag comes first). Only
+                // the transaction's first row can be a tag: an agent allowed
+                // to write the tag table could otherwise add a row naming
+                // another session and have its changes recorded as that
+                // session's.
+                if is_tag && !first {
+                    return Ok(());
+                }
                 if !is_tag && open.session.is_none() && !self.protected.covers(&db, &table) {
                     return Ok(());
                 }
@@ -767,8 +817,8 @@ impl<'a> Reader<'a> {
                             .unwrap_or(fallback)
                     };
                     let (si, ai) = (col("session", 1), col("agent", 2));
-                    for c in changes
-                        .iter()
+                    if let Some(c) = changes
+                        .first()
                         .filter(|c| c.op == crate::journal::Op::Insert)
                     {
                         let text = |i: usize| match c.new.as_ref().and_then(|v| v.get(i)) {
@@ -792,7 +842,7 @@ impl<'a> Reader<'a> {
         let Some(open) = self.open.take() else {
             return Ok(());
         };
-        let lsn = mysql_binlog::lsn(&self.file, self.pos);
+        let lsn = self.base + mysql_binlog::lsn(&self.file, self.pos);
         if !open.changes.is_empty() && lsn > self.last_lsn {
             let (session, agent) = match open.session {
                 Some((s, a)) => (Some(s), Some(a)),
@@ -827,6 +877,7 @@ impl<'a> Reader<'a> {
         let p = Position {
             file: self.file.clone(),
             pos: self.pos,
+            base: self.base,
         };
         if p != self.saved {
             save_position(self.config, &p)?;
@@ -1070,7 +1121,6 @@ async fn doctor_checks(config: &Config, findings: &mut Vec<Finding>) -> Result<(
     }
 
     // Read the binlog the way the journal does, without waiting for more.
-    // Another server id, so a running journal is not disconnected.
     if undo.is_ok() {
         let start = match saved {
             Some(p) => Ok(p),
@@ -1117,10 +1167,11 @@ async fn doctor_checks(config: &Config, findings: &mut Vec<Finding>) -> Result<(
 /// Open a non-blocking binlog dump at `p` and read a few events.
 async fn read_some(config: &Config, p: &Position) -> Result<(), String> {
     let conn = connect(config).await?;
-    let id = config.mysql.server_id.wrapping_add(1).max(1);
+    // Server id 0, as mysqlbinlog uses: a server disconnects any replica
+    // already reading with the id a new reader gives, and 0 is nobody's.
     let mut stream = conn
         .get_binlog_stream(
-            BinlogStreamRequest::new(id)
+            BinlogStreamRequest::new(0)
                 .with_filename(p.file.as_bytes())
                 .with_pos(p.pos)
                 .with_non_blocking(),
@@ -1196,6 +1247,21 @@ tables = ["customers"]
             tag_table(&config("tag_table = \"tags\"")),
             ("shop".into(), "tags".into())
         );
+    }
+
+    #[test]
+    fn lsns_keep_growing_when_the_binlog_starts_again() {
+        let old = mysql_binlog::lsn("binlog.000120", 9_000);
+        let raw = mysql_binlog::lsn("binlog.000001", 158);
+        let base = next_base(old, raw);
+        assert!(base + raw > old);
+        assert!(base + mysql_binlog::lsn("binlog.000001", 900) > base + raw);
+        // A server further on than the journal needs no base.
+        assert_eq!(next_base(raw, old), 0);
+        // Saved positions from before the base existed still load.
+        let p: Position = serde_json::from_str(r#"{"file":"binlog.000001","pos":4}"#).unwrap();
+        assert_eq!(p.base, 0);
+        assert!(!serde_json::to_string(&p).unwrap().contains("base"));
     }
 
     #[test]

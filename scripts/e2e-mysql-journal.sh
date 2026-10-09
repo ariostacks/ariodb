@@ -106,8 +106,14 @@ CREATE TABLE kinds (
   bits BIT(10),
   note VARCHAR(40),
   latin VARCHAR(20) CHARACTER SET latin1,
-  maybe INT NULL
+  maybe INT NULL,
+  lsize ENUM('small','große') CHARACTER SET latin1,
+  lflags SET('a','ü') CHARACTER SET latin1,
+  span6 TIME(6)
 );
+-- mysql_common misreads negative TIME(2) values with a fraction.
+CREATE TABLE clock (id INT PRIMARY KEY, span TIME(2));
+INSERT INTO clock VALUES (1, '-01:00:00.50');
 CREATE TABLE notes (
   id INT PRIMARY KEY,
   customer_id INT NOT NULL,
@@ -121,9 +127,9 @@ INSERT INTO items (id, qty, price) VALUES (1, 2, 3.50), (2, 5, 1.10);
 INSERT INTO kinds VALUES
   (1, '{"a": [1, 2.5, "x"], "b": {"c": null}}', 12345678901234567890.0123456789, '2026-10-09 08:07:06.123456',
    '2026-10-09 08:07:06.500', X'00FF10', X'01020304', 'ab', 'it''s large', 'a,c', 0.1, 1e-300, 18446744073709551615, 255,
-   '-838:59:59.00', '2026-02-28', 2026, b'1010101010', 'Grüße, 世界 😀 \\ \'q\' \t', 'café', NULL),
+   '-838:59:59.00', '2026-02-28', 2026, b'1010101010', 'Grüße, 世界 😀 \\ \'q\' \t', 'café', NULL, 'große', 'a,ü', '-00:00:01.000001'),
   (2, '[]', -0.0000000001, '1000-01-01 00:00:00', '1970-01-01 00:00:01.000', '', X'00000000', '', 'small', '', -3.4e38, -0.0,
-   0, 0, '00:00:00.01', '0000-00-00', 0, b'0', '', '', 7);
+   0, 0, '00:00:00.01', '0000-00-00', 0, b'0', '', '', 7, 'small', '', '-12:34:56.5');
 SQL
 root -e "CREATE USER 'ariodb'@'%' IDENTIFIED BY 'gateway-test-only-pw';
   CREATE USER 'ariodb_journal'@'%' IDENTIFIED BY 'journal-test-only-pw';
@@ -165,7 +171,7 @@ token_env = "E2E_AGENT_TOKEN"
 
 [agents.mysql]
 access = "read_write"
-tables = ["customers", "orders", "items", "kinds", "notes"]
+tables = ["customers", "orders", "items", "kinds", "notes", "clock"]
 EOF
 export E2E_MYSQL_PASSWORD=gateway-test-only-pw E2E_MYSQL_JOURNAL_PASSWORD=journal-test-only-pw
 export E2E_AGENT_TOKEN=agent-token-test-only
@@ -216,7 +222,7 @@ human() {
 fingerprint() {
   {
     root shop -e "SELECT * FROM customers ORDER BY id; SELECT * FROM orders ORDER BY id; SELECT * FROM items ORDER BY id"
-    root shop -e "SELECT *, HEX(data), HEX(bin), HEX(code), HEX(bits), HEX(latin), HEX(ratio), HEX(score) FROM kinds ORDER BY id"
+    root shop -e "SELECT *, HEX(data), HEX(bin), HEX(code), HEX(bits), HEX(latin), HEX(ratio), HEX(score), HEX(lsize), HEX(lflags) FROM kinds ORDER BY id"
   } | shasum | cut -d' ' -f1
 }
 # Wait until the journal has recorded what is asked.
@@ -243,7 +249,7 @@ agent $S1 "INSERT INTO customers VALUES (100, 'New Co');
   INSERT INTO orders (customer_id, status, total) VALUES (100, 'paid', 9.99);
   UPDATE kinds SET doc = JSON_OBJECT('z', 1), amount = 1, happened = NOW(6), stamp = NULL, data = X'DEAD', bin = X'FF000000', code = 'xy',
     size = 'small', flags = 'b', ratio = 2.5, score = 3, big = 1, tiny = 1, span = '01:00:00', day = '2000-01-01', yr = 1999,
-    bits = b'1', note = 'changed', latin = 'plain', maybe = 1 WHERE id = 1;
+    bits = b'1', note = 'changed', latin = 'plain', maybe = 1, lsize = 'small', lflags = 'a', span6 = '00:00:00' WHERE id = 1;
   DELETE FROM kinds WHERE id = 2;
   UPDATE items SET qty = qty + 10 WHERE id IN (1, 2)"
 agent $S1 "UPDATE orders SET status = 'refunded', total = 0 WHERE id IN (1, 2);
@@ -337,6 +343,31 @@ OUT=$(ario undo --session $S8 --apply || true)
 expect "undo refuses a step that would cascade into rows the session never touched" "would also change 1 other rows" "$OUT"
 expect "and changes nothing" "human note" "$(root shop -e "SELECT body FROM notes WHERE id = 2")"
 
+echo "tags"
+S9=s-0000001209
+agent $S9 "UPDATE orders SET status = 'tagged' WHERE id = 3;
+  INSERT INTO ariodb.session_tags (session, agent) VALUES ('s-00000000ff', 'someone-else')"
+wait_for $S9
+SESSIONS=$(ario sessions)
+refute "a tag row after the first does not take the transaction over" "s-00000000ff" "$SESSIONS"
+expect "the change stays with the session that made it" "orders" "$(grep -F $S9 <<<"$SESSIONS")"
+
+echo "values the driver misreads"
+S10=s-000000130a
+agent $S10 "UPDATE clock SET span = '00:00:01' WHERE id = 1"
+wait_for $S10
+expect "undo refuses a row whose old value was not recorded" "cannot undo: shop.clock" "$(ario undo --session $S10 || true)"
+S12=s-000000140c
+agent $S12 "UPDATE orders SET status = 'after clock' WHERE id = 3"
+wait_for $S12
+pass "the journal goes on after a value it cannot read"
+
+echo "doctor beside a running journal"
+sed 's/^server_id = 4242$/server_id = 4241/' "$WORK/ariodb.toml" > "$WORK/other-id.toml"
+timeout 60 $BIN --config "$WORK/other-id.toml" doctor >/dev/null 2>&1 || true
+sleep 1
+refute "doctor's binlog read does not disconnect a replica using the next server id" "server_id" "$(cat "$WORK/serve.log")"
+
 echo "restart"
 wait_journal
 kill "$SERVE_PID"; wait "$SERVE_PID" 2>/dev/null || true; SERVE_PID=""
@@ -349,5 +380,21 @@ wait_for $S6
 pass "changes made while the journal was down are recorded on restart"
 [ "$(wc -l < "$WORK/state/mysql-journal.jsonl")" -eq $((LINES + 1)) ] && pass "and nothing is recorded twice" || fail "journal lines repeated"
 refute "the journal reports no errors" "MySQL journal:" "$(cat "$WORK/serve.log")"
+
+echo "a binlog that starts again"
+kill "$SERVE_PID"; wait "$SERVE_PID" 2>/dev/null || true; SERVE_PID=""
+case "$IMAGE" in
+  mariadb*) root -e "RESET MASTER" ;;
+  *) root -e "RESET BINARY LOGS AND GTIDS" ;;
+esac
+# What the journal's error says to do when its binlog is gone.
+mv "$WORK/state/mysql-binlog-position.json" "$WORK/position.aside"
+$BIN "${CFG[@]}" serve >"$WORK/serve.log" 2>&1 &
+SERVE_PID=$!
+S11=s-000000150b
+agent $S11 "UPDATE items SET price = 1.23 WHERE id = 2"
+wait_for $S11
+pass "changes after the binlog starts again from file 1 are recorded"
+expect "and undone" "restore shop.items row (2)" "$(ario undo --session $S11)"
 
 echo "all MySQL journal checks passed on $IMAGE"
