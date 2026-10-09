@@ -1012,6 +1012,25 @@ mod tests {
         assert_eq!(Sha1::digest(&recovered).as_slice(), stored.as_slice());
     }
 
+    #[test]
+    fn rsa_password_decrypts_to_the_password_xor_nonce() {
+        use aws_lc_rs::encoding::AsDer;
+        use aws_lc_rs::rsa::{KeySize, OAEP_SHA1_MGF1SHA1, OaepPrivateDecryptingKey, PrivateDecryptingKey};
+        use base64::Engine;
+        let private = PrivateDecryptingKey::generate(KeySize::Rsa2048).unwrap();
+        let der = private.public_key().as_der().unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+        let pem = format!("-----BEGIN PUBLIC KEY-----\n{b64}\n-----END PUBLIC KEY-----\n");
+        let nonce = b"abcdefghijklmnopqrst";
+        let secret = rsa_encrypt_password(b"gw-local-test-only", nonce, pem.as_bytes()).unwrap();
+        let key = OaepPrivateDecryptingKey::new(private).unwrap();
+        let mut out = vec![0u8; key.min_output_size()];
+        let plain = key.decrypt(&OAEP_SHA1_MGF1SHA1, &secret, &mut out, None).unwrap();
+        let unmasked: Vec<u8> = plain.iter().enumerate().map(|(i, b)| b ^ nonce[i % 20]).collect();
+        assert_eq!(unmasked, b"gw-local-test-only\0");
+        assert!(rsa_encrypt_password(b"x", nonce, b"not a key").is_err());
+    }
+
     #[tokio::test]
     async fn long_packets_are_joined_and_oversized_ones_skipped() {
         let mut wire = Vec::new();

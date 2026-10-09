@@ -606,6 +606,33 @@ fn print_summary(config: &Config) {
     if let Some(t) = &config.clickhouse.tunnel {
         println!("clickhouse    through tunnel '{t}'");
     }
+    if !config.mysql.listen.is_empty() {
+        let m = &config.mysql;
+        let tls = match config.mysql_tls_mode() {
+            tls::TlsMode::Disable => "no TLS",
+            tls::TlsMode::Require => "TLS, certificate not checked",
+            tls::TlsMode::Verify => "TLS, certificate checked",
+        };
+        println!(
+            "mysql         agents on {} -> {} as {} ({tls}), database {}{}",
+            m.listen,
+            m.addr,
+            m.user,
+            m.database,
+            via(&m.tunnel)
+        );
+        let agents_tls = match (&m.tls_cert, m.require_tls) {
+            (Some(_), true) => "agents must use TLS",
+            (Some(_), false) => "agents may use TLS",
+            _ => "agents connect without TLS",
+        };
+        let journal = if m.journal {
+            format!("writes tagged in {}", m.tag_table)
+        } else {
+            "journal off".to_string()
+        };
+        println!("              {agents_tls}; {journal}");
+    }
     println!(
         "row limit     {} rows per write",
         config.limits.max_rows_per_write
@@ -659,5 +686,12 @@ fn print_summary(config: &Config) {
             token,
             agent.tables.join(", ")
         );
+        if let Some(m) = &agent.mysql {
+            let access = match m.access {
+                Access::ReadOnly => "read only",
+                Access::ReadWrite => "read and write",
+            };
+            println!("  mysql                {access:<15} {:<10} {}", "", m.tables.join(", "));
+        }
     }
 }
