@@ -71,14 +71,71 @@ Add more users on the Settings page, or with
 `ariodb dashboard-password --user <name>`. User names use letters, digits
 and `-`, `_`, `.` and `@`.
 
-Every signed-in user can do everything the dashboard offers: decide
-approvals, undo sessions, add users and reset passwords, store secrets,
-and (with `config_writes = true`) change the policy. Give accounts only to
-people you would trust with all of that. There is no way to remove a user
-from the dashboard yet; reset their password to something nobody knows to
-lock them out.
+Every user has a role, and each role may do everything the one before it
+may:
 
-<!-- TODO: single sign-on (OIDC) and dashboard roles will be documented here once merged: sign-in through an identity provider, role mapping, and which pages and actions each role may use. -->
+| Role | May |
+|---|---|
+| viewer | Read every page except config: approvals, decisions, sessions and undo plans, rules, plugins |
+| approver | Also decide approvals (within an approver's `groups`, if it sets them) |
+| admin | Also read and edit the config, block requests like a decision, undo sessions, manage local users and secrets |
+
+Pages and buttons a role may not use are hidden, and the server refuses
+them anyway: roles are checked on every API request.
+
+Local users: `root` is always an admin, and users from before roles
+existed are admins. New users added from the Settings page are viewers
+unless given another role; new users added with
+`ariodb dashboard-password --user <name>` are admins unless `--role viewer`
+or `--role approver` says otherwise, and `--role` on an existing user
+changes their role. Admins can change roles and remove users on the
+Settings page; `root` cannot be removed (set a new password instead).
+
+## Single sign-on and roles
+
+With `[dashboard.oidc]`, people sign in with any OpenID Connect provider
+(Keycloak, Okta, Microsoft Entra ID and others) and get a role from their
+groups. The keys are in [configuration](configuration.md#dashboardoidc).
+
+```toml
+[dashboard.oidc]
+issuer = "https://login.example.com/realms/ops"   # https; http only for localhost
+provider_name = "Keycloak"    # the sign-in button says "Sign in with Keycloak"
+client_id = "ariodb"
+client_secret_env = "ARIODB_OIDC_CLIENT_SECRET"   # or client_secret_secret; neither for a public client
+redirect_path = "/auth/callback"   # default; register <public_url><redirect_path> with the provider
+groups_claim = "groups"       # default; a dotted name reaches inside objects, e.g. "realm_access.roles"
+admin_groups = ["ariodb-admins"]
+approver_groups = ["ariodb-approvers", "dba"]
+viewer_groups = ["engineering"]
+allowed_email_domains = ["example.com"]   # optional; needs email_verified = true in the ID token
+password_login = "break_glass"   # default: local passwords still work, offered below the button; "off"
+logout_at_provider = false    # true: signing out also ends the provider's session
+```
+
+- Each person gets the highest role any of their groups maps to; someone
+  in none of the groups is refused. A signed-in person's role follows the
+  current config, so removing a group from `admin_groups` takes effect at
+  once. Groups themselves are read from the ID token at sign-in, so
+  someone removed from a group at the provider keeps that role until their
+  session ends (12 hours) or they sign out.
+- The provider must put the groups in the ID token under `groups_claim`
+  (Keycloak: a group membership mapper; Okta: a groups claim; Microsoft
+  Entra ID: `groups` in the token configuration). If it has no `groups`
+  scope, set `scopes` without it.
+- A provider that does not send `email_verified` (Microsoft Entra ID, for
+  one) cannot be limited by `allowed_email_domains`; limit it by groups
+  instead.
+- Local passwords stay for break-glass use unless `password_login =
+  "off"`, and the first-run password page is switched off.
+- Decisions by people who signed in this way are recorded as
+  `sso:<email>` when the email is verified, otherwise by user name or
+  subject.
+- Approval links need a signed-in approver by default under single
+  sign-on; see [approvals](approvals.md#single-sign-on-and-approver-groups).
+
+How sign-in is checked (PKCE, `state`, `nonce`, token signatures and
+claims) is in the [security model](security-model.md#dashboard-sign-in-and-roles).
 
 ## The pages
 

@@ -512,11 +512,14 @@ model](security-model.md).
 
 ## Dashboard and secrets
 
-### `ariodb dashboard-password [--user <USER>]`
+### `ariodb dashboard-password [--user <USER>] [--role <ROLE>]`
 
 Set a dashboard password, read from stdin (at least 12 characters). The
 default user is `root`; any other name creates or updates that user.
-Setting a password ends that user's existing sessions.
+Setting a password ends that user's existing sessions. `--role` is
+`viewer`, `approver` or `admin`: new users are admins unless it says
+otherwise, and on an existing user it changes their role. `root` is always
+an admin. See [dashboard roles](dashboard.md#users).
 
 ```bash
 printf '%s\n' 'not-a-real-password-123' | ariodb dashboard-password

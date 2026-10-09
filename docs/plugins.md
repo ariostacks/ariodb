@@ -281,7 +281,7 @@ first, up to 100 entries or about 4 MiB of statements at a time:
 
 `outcome` is `allowed`, `refused`, `rolled_back` or `failed`. `prev` and
 `hash` are the entry's links in the decisions log's hash chain, so a sink
-can check the chain itself (see SECURITY.md, A1). Answer with the `id` of
+can check the chain itself (see the [security model](security-model.md#accepted-with-reasons), A1). Answer with the `id` of
 the last entry stored durably:
 
 ```json

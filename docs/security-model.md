@@ -82,9 +82,11 @@ database's own permissions sit behind ariodb as the last line.
 - **Nothing held for approval runs early.** A statement held for approval
   does not reach the database until every approver has allowed it; a deny,
   a timeout or a failure refuses it.
-- **Dashboard changes need a person.** Every change needs a logged-in
-  user, a CSRF token and a same-origin request, and passwords cannot be
-  guessed at speed.
+- **Dashboard changes need a person with the right role.** Every change
+  needs a logged-in user whose role allows it, a CSRF token and a
+  same-origin request, and passwords cannot be guessed at speed. Roles are
+  checked by the server on every endpoint, not only hidden in the app (see
+  [dashboard sign-in and roles](#dashboard-sign-in-and-roles)).
 - **Agents never hold database credentials.** Agents authenticate to
   ariodb with their own tokens; database passwords stay with ariodb (but
   see [the MCP caveat](#what-ariodb-does-not-protect-against)).
@@ -176,15 +178,66 @@ database's own permissions sit behind ariodb as the last line.
   approvers to save people time, not as the only check on high-risk rules,
   and keep `llm_fail_mode = "closed"`. See
   [approvals.md](approvals.md#limits-of-model-approvers).
-- **Who may decide an approval.** Any signed-in dashboard user, anyone who
-  can run `ariodb approve` against the state directory, and anyone holding
-  a webhook decision link can decide a pending request. The approver type
-  says where a request is announced, not who may answer it. Slack buttons
-  are the exception: a Slack signature only decides requests waiting on
-  that Slack approver.
-- **All dashboard users are equal.** Every signed-in user can decide
-  approvals, undo sessions, add users, store secrets and, with
-  `config_writes = true`, change the policy.
+- **Who may decide an approval.** Any signed-in dashboard user with the
+  approver or admin role (within an approver's `groups`, if it sets them),
+  anyone who can run `ariodb approve` against the state directory, and,
+  with `approval_links = "signed"` (the default without single sign-on),
+  anyone holding a decision link can decide a pending request. The
+  approver type says where a request is announced, not who may answer it.
+  Slack buttons are the exception: a Slack signature only decides requests
+  waiting on that Slack approver.
+- **Admins can change everything.** A dashboard admin can undo sessions,
+  manage users and secrets and, with `config_writes = true`, change the
+  policy. Give the admin role only to people trusted with all of that.
+
+### Dashboard sign-in and roles
+
+With `[dashboard.oidc]`, people sign in with an OpenID Connect provider:
+
+- The authorisation code flow with PKCE (S256), a random `state` and a
+  random `nonce` per sign-in. The pending sign-in is bound to the browser
+  that started it by an `HttpOnly` cookie, used once, and forgotten after
+  ten minutes, so a callback link sent to someone else, replayed, or with
+  a changed `state` is refused.
+- The ID token must be signed with RSA, RSA-PSS, ECDSA or EdDSA by a key
+  from the provider's published key set, for that key's algorithm: `none`,
+  HMAC (including HMAC keyed with a public key) and a key of the wrong
+  type are refused. The issuer must be the one the discovery document
+  names (which must match the configured issuer), the audience must
+  include the client ID (and `azp` must be the client ID when present or
+  when there are several audiences), `exp`, `nbf` and `iat` are checked
+  with a minute's leeway, and the nonce must be this sign-in's. Keys are
+  cached for an hour and fetched again when a token names an unknown key
+  ID (at most every ten seconds), so the provider can rotate keys.
+- The issuer and every address in its discovery document must be
+  `https://` except on localhost; redirects are not followed when ariodb
+  talks to the provider.
+- The role (viewer, approver, admin) comes from the groups in the ID token
+  and the current config on every request. No mapped group means no
+  access; a config change that takes a group away ends that role at once.
+  `allowed_email_domains` needs a verified email: `email_verified` must be
+  true in the ID token, and a token without the claim does not count. A
+  person is recorded as `sso:<email>` only when the email is verified;
+  otherwise by user name or subject.
+- Local passwords stay for break-glass use (`password_login =
+  "break_glass"`) or are switched off (`"off"`), which also ends existing
+  password sessions. Under single sign-on the first-run password page is
+  off (accepted risk A4 does not apply).
+- `[[approvers]]` of type `dashboard` or `webhook` may set `groups`; only
+  members of those groups may then decide their requests, in the
+  dashboard or through a link. A webhook approver with `groups` needs
+  `approval_links = "sign_in"`, since a link followed without signing in
+  has nobody whose groups could be checked.
+- Approval links (`approval_links = "sign_in"`, the default under single
+  sign-on) need a signed-in approver as well as the signed link, and the
+  form on the confirmation page carries the session's CSRF token. The
+  person, not the link, is recorded as the decider. A link opened from a
+  chat app or email arrives without the `SameSite=Strict` session cookie,
+  so the page reloads itself once as a same-site navigation (a meta
+  refresh; the page has no script) before asking anyone to sign in.
+
+Local users have roles too (see [dashboard](dashboard.md#users)), checked
+the same way on every request.
 
 ### Where agent data is stored and sent
 
@@ -246,6 +299,8 @@ without the fix.
 | A7 | Low | ClickHouse HTTP | Agents may send their token as a `password` URL parameter, which intermediaries may log. | Supported for client compatibility; prefer Basic auth or `X-ClickHouse-Key`. |
 | A8 | Low | Dashboard login limit | Twenty wrong passwords for a user, from anywhere, lock that user out for 15 minutes; the counts live in memory and reset on restart. Behind a reverse proxy, all clients share the proxy's address, so five wrong passwords from anyone block sign-in from everyone. | A deliberate trade-off against distributed guessing. Keep the dashboard off untrusted networks. |
 | A9 | Medium | `write_check = "reported"` | Writes are judged by the row counts the database reports, so rows and tables changed by triggers, cascades and functions are not seen. | Off by default, for databases that cannot measure writes (YugabyteDB, CockroachDB); `ariodb doctor` and [compatibility.md](compatibility.md) say what it gives up. Database grants are the backstop. |
+| A10 | Low | Dashboard single sign-on ([`oidc.rs`](../src/oidc.rs)) | Groups are read from the ID token at sign-in. Someone removed from a group at the provider keeps that group's role until their session ends (12 hours) or they sign out. Pending sign-ins live in memory, so a restart makes people start again. | A role mapping changed in the config applies at once, so take the group out of the mapping when someone must lose access before their session ends. |
+| A11 | Low | Approval links with `approval_links = "signed"` | Without single sign-on (or with links set to `signed`), anyone holding a link can decide its request, and the decision is recorded as `webhook`. | Links are signed per request and verdict and only decide on POST (finding 7). Set `approval_links = "sign_in"` to tie each decision to a person. |
 
 ### Reviewed with no issue found
 
@@ -320,8 +375,16 @@ Dashboard:
       webhook users need it, expose only `/slack/actions` and
       `/hooks/approvals/` (see
       [dashboard.md](dashboard.md#exposing-only-the-callbacks)).
-- [ ] Dashboard accounts only for people trusted with every action it
+- [ ] Each person given the lowest role that lets them do their job;
+      admin only for people trusted with every action the dashboard
       offers.
+- [ ] With single sign-on: only the groups that need each role are
+      mapped; approvers' `groups` kept narrow for high-risk rules; the
+      break-glass `root` password kept offline (or
+      `password_login = "off"`); the client secret in `client_secret_env`
+      or `client_secret_secret`.
+- [ ] `approval_links = "sign_in"` wherever decisions must be tied to a
+      person.
 - [ ] `config_writes = false` unless people are meant to edit policy from
       the dashboard.
 

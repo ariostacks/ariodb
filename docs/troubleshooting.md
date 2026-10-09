@@ -361,13 +361,10 @@ passed through from ClickHouse.
 | `Code: 210. DB::Exception: ariodb: cannot reach ClickHouse: ... (ARIODB)` | ariodb cannot reach `http_url`. | Check the address, TLS (`accept_invalid_certificate` for a private CA), and any tunnel. |
 | `Code: 1000. DB::Exception: ariodb: ARIODB_CLICKHOUSE_PASSWORD is not set. (ARIODB)` | The password variable is missing where `serve` runs. Also `secret '...' is not set`. | Set it, or use `password_secret`. |
 | `Code: 1000. ... bad clickhouse.http_url: ...` | The URL does not parse. | Fix `http_url`. |
-| `native-protocol INSERTs are not supported; use ariodb's ClickHouse HTTP interface` | Inserts through `clickhouse-client` on the native port are refused. | Insert through the HTTP listener. |
 | `external tables are not supported through ariodb` | `clickhouse-client --external` and similar. | Not supported. |
 | `client protocol too old: settings must be sent as strings` / `ariodb speaks the not-chunked protocol only` | An old or unusual native client. | Use a current `clickhouse-client`, or the HTTP interface. |
 | `cannot reach ClickHouse at 127.0.0.1:9000: Connection refused (os error 111)` in the log | `native_addr` is wrong or ClickHouse is down. | Check `native_addr`; ariodb connects to it without TLS. |
 | Clients hang or fail with TLS errors after setting `tls_cert` | Both listeners now accept TLS only. | Use `https://` and `clickhouse-client --secure`. |
-
-<!-- TODO: remove the native INSERT refusal above once ClickHouse native INSERT is merged. -->
 
 ## Config changes that do not take effect
 

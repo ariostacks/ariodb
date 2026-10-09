@@ -626,6 +626,7 @@ MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql.sh           # the same against Mar
 ./scripts/e2e-mysql-journal.sh         # MySQL setup, doctor, the binlog journal and undo
 MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql-journal.sh
 ./scripts/e2e-plugins.sh               # the example plugin, and a broken one
+./scripts/e2e-sso.sh                   # dashboard single sign-on against Keycloak
 ./scripts/sim-undo.sh                  # seeded random agent and human writes, then undo
 SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh
 ```
@@ -654,7 +655,7 @@ The same seed always produces the same workload.
 runs (for example from different worktrees) do not collide.
 
 When you fix a security issue, add a test that fails without the fix, as
-every item in the review in [SECURITY.md](../SECURITY.md) has.
+every item in the [security review](security-model.md#review-of-october-2026) has.
 
 ## Next
 

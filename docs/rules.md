@@ -115,10 +115,11 @@ really changed and which tables, including through triggers and cascades
 overrides a `deny`. Its only use is to make an exception to an `approve`
 rule (see the [cookbook](#make-an-exception-to-an-approval-rule)).
 
-<!-- TODO: list the further approver channels here once they are merged. -->
 Approvers are named in `[[approvers]]`: a person in the dashboard or with
-`ariodb approve`, Slack, a webhook, a model judging against a written
-policy, or a plugin. See [approvals](approvals.md).
+`ariodb approve`, Slack, a webhook, a chat, paging or email channel
+(Discord, Telegram, Teams, Google Chat, Mattermost, PagerDuty, Opsgenie,
+email), a model judging against a written policy, or a plugin. See
+[approvals](approvals.md).
 
 ## How rules combine
 
@@ -206,8 +207,7 @@ with tables, grants and column privileges.
 |---|---|---|
 | `agent.name` | string | The agent's name from `[[agents]]`. |
 | `agent.access` | string | `read_only` or `read_write`. For a ClickHouse statement, the agent's `[agents.clickhouse]` access; for a MySQL statement, its `[agents.mysql]` access. |
-
-<!-- TODO: document agent.credential once that fact is merged. -->
+| `agent.credential` | string | The [`[[credentials]]`](configuration.md#credentials) login the agent's Postgres queries run as, or `""` for `[database]`. |
 
 ### Effects (`effects`)
 

@@ -178,10 +178,10 @@ After stage judges a write after it ran but before it commits, from what it
 actually did (`effects.rows`, `effects.tables`).
 
 **Approval.** A statement held by a rule until every listed approver
-allows it: a person in the dashboard or the CLI, Slack, a webhook, a model
-judging against a written policy, or a [plugin](plugins.md).
-
-<!-- TODO: approver channels beyond dashboard, Slack, webhook, model and plugin, once merged. -->
+allows it: a person in the dashboard or the CLI, Slack, a webhook, a chat,
+paging or email channel (Discord, Telegram, Teams, Google Chat,
+Mattermost, PagerDuty, Opsgenie, email), a model judging against a
+written policy, or a [plugin](plugins.md).
 
 **Session.** One agent connection to the Postgres proxy (or one run of the
 MCP server), with an id such as `s-3f9c2a71d0`. Every write in it is tagged
@@ -234,7 +234,7 @@ with mode `0700`.
   behind network controls and use long random tokens.
 
 The full threat model, with accepted risks, is in the
-[security model](security-model.md) and [SECURITY.md](../SECURITY.md).
+[security model](security-model.md).
 
 ## Next
 

@@ -10,10 +10,10 @@ you only want to try ariodb on your laptop, the
 
 **To build:**
 
-- **Rust**, through [rustup](https://rustup.rs). The crate uses the 2024
-  edition and let chains, so you need Rust 1.88 or later. `Cargo.toml` does
-  not pin a `rust-version`; ariodb is built and tested on current stable
-  Rust, and that is what we recommend.
+- **Rust**, through [rustup](https://rustup.rs). You need Rust 1.89 or
+  later (the `rust-version` in `Cargo.toml`); ariodb is built and tested
+  on current stable Rust, and that is what we recommend. The repository's
+  `rust-toolchain.toml` selects stable, with rustfmt and clippy, for you.
 - **A C compiler and libclang.** ariodb parses SQL with Postgres's own
   parser (`libpg_query`, through the `pg_query` crate), which is compiled
   from C and bound with bindgen. SQLite and the TLS library (aws-lc) are
