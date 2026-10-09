@@ -159,6 +159,20 @@ pub fn validate(config: &Config) -> Result<(), String> {
         }
         return Ok(());
     };
+    // A link followed without signing in has nobody whose groups could be
+    // checked, so it would let anyone holding it decide. Every approver
+    // with groups other than the dashboard's own is decided through links.
+    if !config.dashboard.links_need_sign_in()
+        && let Some(a) = config
+            .approvers
+            .iter()
+            .find(|a| !a.groups.is_empty() && a.kind != crate::approvals::ApproverKind::Dashboard)
+    {
+        return Err(format!(
+            "approver '{}' sets groups, which its approval links can only check with [dashboard] approval_links = \"sign_in\"",
+            a.name
+        ));
+    }
     if !o.issuer.starts_with("https://") && !is_loopback_url(&o.issuer) {
         return Err(
             "dashboard.oidc.issuer must be an https:// URL (http:// only for localhost)".into(),
@@ -388,6 +402,7 @@ pub struct Identity {
     /// The name shown and recorded as the decider: a verified email, the
     /// preferred user name, or the subject.
     pub name: String,
+    /// As sent; see `verified_email` for the one to rely on.
     pub email: Option<String>,
     pub email_verified: Option<bool>,
     pub groups: Vec<String>,
@@ -409,7 +424,12 @@ pub fn identity(
     };
     let subject = text("sub").ok_or("the ID token has no subject")?;
     let email = text("email");
-    let email_verified = claims.get("email_verified").and_then(Value::as_bool);
+    // A boolean, though some providers send it as a string.
+    let email_verified = match claims.get("email_verified") {
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::String(s)) => s.parse().ok(),
+        _ => None,
+    };
     let mut groups_value = claims.get(o.groups_claim.split('.').next().unwrap_or(""));
     for part in o.groups_claim.split('.').skip(1) {
         groups_value = groups_value.and_then(|v| v.get(part));
@@ -423,7 +443,7 @@ pub fn identity(
         Some(Value::String(one)) => vec![clean(one)],
         _ => Vec::new(),
     };
-    let trusted_email = email.clone().filter(|_| email_verified != Some(false));
+    let trusted_email = email.clone().filter(|_| email_verified == Some(true));
     let name = trusted_email
         .or_else(|| text("preferred_username"))
         .unwrap_or_else(|| subject.clone());
@@ -435,6 +455,18 @@ pub fn identity(
         groups_claimed: groups_value.is_some(),
         groups,
     })
+}
+
+impl Identity {
+    /// The email, if the provider says it has verified it. A token without
+    /// `email_verified` says nothing either way (Microsoft Entra ID, for one,
+    /// sends an email without promising it was verified), so it is not
+    /// trusted.
+    pub fn verified_email(&self) -> Option<&str> {
+        self.email
+            .as_deref()
+            .filter(|_| self.email_verified == Some(true))
+    }
 }
 
 /// Text from the provider, without control characters, kept short.
@@ -459,9 +491,7 @@ pub fn email_allowed(o: &OidcConfig, email: Option<&str>) -> bool {
 pub fn admit(o: &OidcConfig, who: &Identity) -> Result<Role, String> {
     if !o.allowed_email_domains.is_empty() {
         let email = who
-            .email
-            .as_deref()
-            .filter(|_| who.email_verified != Some(false))
+            .verified_email()
             .ok_or("this dashboard needs a verified email address, and the provider sent none")?;
         if !email_allowed(o, Some(email)) {
             return Err(format!(
@@ -538,15 +568,38 @@ async fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String
     resp.json().await.map_err(|e| format!("{url}: {e}"))
 }
 
-async fn fetch(o: &OidcConfig) -> Result<Provider, String> {
-    let issuer = o.issuer.trim_end_matches('/');
-    let meta: Metadata = get_json(&format!("{issuer}/.well-known/openid-configuration")).await?;
-    if meta.issuer.trim_end_matches('/') != issuer {
+/// A discovery document fit to use: for the configured issuer, and with
+/// every address https (http only on this machine), since codes, tokens
+/// and signing keys travel through them.
+fn check_metadata(meta: &Metadata, issuer: &str) -> Result<(), String> {
+    if meta.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
         return Err(format!(
             "the provider calls itself {}, not {issuer}",
             meta.issuer
         ));
     }
+    for (what, url) in [
+        ("authorization_endpoint", Some(&meta.authorization_endpoint)),
+        ("token_endpoint", Some(&meta.token_endpoint)),
+        ("jwks_uri", Some(&meta.jwks_uri)),
+        ("end_session_endpoint", meta.end_session_endpoint.as_ref()),
+    ] {
+        if let Some(url) = url
+            && !url.starts_with("https://")
+            && !is_loopback_url(url)
+        {
+            return Err(format!(
+                "the provider's {what} {url} is not https (http only for localhost)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn fetch(o: &OidcConfig) -> Result<Provider, String> {
+    let issuer = o.issuer.trim_end_matches('/');
+    let meta: Metadata = get_json(&format!("{issuer}/.well-known/openid-configuration")).await?;
+    check_metadata(&meta, issuer)?;
     let keys = get_json(&meta.jwks_uri).await?;
     Ok(Provider {
         configured: o.issuer.clone(),
@@ -1256,6 +1309,94 @@ viewer_groups = ["ariodb-viewers"]
         )
         .unwrap();
         assert!(admit(&o, &other).unwrap_err().contains("not in a domain"));
+    }
+
+    #[test]
+    fn an_email_without_email_verified_is_not_trusted() {
+        // OpenID Connect gives no meaning to a missing email_verified; some
+        // providers send an email the person can change without proof.
+        let mut o = config();
+        let who = identity(
+            &o,
+            &map(with(|c| {
+                c.as_object_mut().unwrap().remove("email_verified");
+                c["preferred_username"] = json!("pat");
+            })),
+        )
+        .unwrap();
+        assert_eq!(who.name, "pat");
+        assert_eq!(who.verified_email(), None);
+        o.allowed_email_domains = vec!["example.test".into()];
+        assert!(admit(&o, &who).unwrap_err().contains("verified email"));
+        // Some providers send the flag as a string.
+        let who = identity(&o, &map(with(|c| c["email_verified"] = json!("true")))).unwrap();
+        assert_eq!(who.verified_email(), Some("pat@example.test"));
+        assert_eq!(admit(&o, &who), Ok(Role::Approver));
+    }
+
+    #[test]
+    fn provider_endpoints_must_be_https() {
+        let meta = |jwks: &str, token: &str| Metadata {
+            issuer: ISSUER.into(),
+            authorization_endpoint: format!("{ISSUER}/auth"),
+            token_endpoint: token.into(),
+            jwks_uri: jwks.into(),
+            end_session_endpoint: None,
+            token_endpoint_auth_methods_supported: Vec::new(),
+        };
+        let good = format!("{ISSUER}/token");
+        assert!(check_metadata(&meta(&format!("{ISSUER}/certs"), &good), ISSUER).is_ok());
+        assert!(
+            check_metadata(&meta("http://keys.example.test/certs", &good), ISSUER)
+                .unwrap_err()
+                .contains("https")
+        );
+        assert!(
+            check_metadata(
+                &meta(&format!("{ISSUER}/certs"), "http://login.example.test/token"),
+                ISSUER
+            )
+            .is_err()
+        );
+        let mut other = meta(&format!("{ISSUER}/certs"), &good);
+        other.issuer = "https://evil.example.test".into();
+        assert!(check_metadata(&other, ISSUER).is_err());
+        // A provider on this machine may use http.
+        let local = "http://127.0.0.1:8180/realms/x";
+        let mut m = meta(&format!("{local}/certs"), &format!("{local}/token"));
+        m.issuer = local.into();
+        m.authorization_endpoint = format!("{local}/auth");
+        assert!(check_metadata(&m, local).is_ok());
+    }
+
+    #[test]
+    fn webhook_groups_need_links_that_need_sign_in() {
+        // Without a signed-in person, nobody's groups can be checked, so a
+        // link alone would let anyone holding it decide.
+        let base = r#"
+[database]
+url = "postgres://localhost:5432/app"
+
+[[approvers]]
+name = "pager"
+type = "webhook"
+url = "https://hooks.example.test/ariodb"
+hmac_secret_env = "NOT_A_REAL_KEY"
+groups = ["dba"]
+
+[dashboard]
+LINKS
+
+[dashboard.oidc]
+issuer = "https://login.example.test"
+client_id = "ariodb"
+admin_groups = ["ariodb-admins"]
+"#;
+        let load = |links: &str| Config::from_toml(&base.replace("LINKS", links));
+        assert!(load("").is_ok());
+        assert!(load("approval_links = \"sign_in\"").is_ok());
+        let e = load("approval_links = \"signed\"").unwrap_err().to_string();
+        assert!(e.contains("sign_in"), "{e}");
     }
 
     #[test]

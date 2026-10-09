@@ -532,7 +532,9 @@ pub(crate) fn new_session(
         expires_ms: store::now_ms() + SESSION_HOURS * 3_600_000,
         method: if sso.is_some() { "sso" } else { "password" },
         subject: sso.map(|s| s.subject.as_str()),
-        email: sso.and_then(|s| s.email.as_deref()),
+        // Only a verified email, which the domain check on every request
+        // relies on.
+        email: sso.and_then(|s| s.verified_email()),
         groups: sso.map_or(&no_groups, |s| &s.groups),
     })?;
     let cookie = format!(

@@ -106,21 +106,25 @@ With `[dashboard.oidc]`, people sign in with an OpenID Connect provider:
   leeway, and the nonce must be this sign-in's. Keys are cached for an
   hour and fetched again when a token names an unknown key id (at most
   every ten seconds), so the provider can rotate keys.
-- The issuer, token and key URLs must be `https://` except on localhost;
+- The issuer and every address in its discovery document must be
+  `https://` except on localhost;
   redirects are not followed when ariodb talks to the provider.
 - The role (viewer, approver, admin) comes from the groups in the ID token
   and the current config on every request. No mapped group means no
   access; a config change that takes a group away ends that role at once.
-  `allowed_email_domains` needs a verified email. A person is recorded as
-  `sso:<email>` only when the email is verified; otherwise by user name or
-  subject.
+  `allowed_email_domains` needs a verified email: `email_verified` must be
+  true in the ID token, and a token without the claim does not count. A
+  person is recorded as `sso:<email>` only when the email is verified;
+  otherwise by user name or subject.
 - Local passwords stay for break-glass use (`password_login =
   "break_glass"`) or are switched off (`"off"`), which also ends existing
   password sessions. Under single sign-on the first-run password page is
   off (accepted risk A4 does not apply).
 - `[[approvers]]` of type `dashboard` or `webhook` may set `groups`; only
   members of those groups may then decide their requests, in the
-  dashboard or through a link.
+  dashboard or through a link. A webhook approver with `groups` needs
+  `approval_links = "sign_in"`, since a link followed without signing in
+  has nobody whose groups could be checked.
 - Approval links (`approval_links = "sign_in"`, the default under single
   sign-on) need a signed-in approver as well as the signed link, and the
   form on the confirmation page carries the session's CSRF token. The

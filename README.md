@@ -352,7 +352,7 @@ effort = "low"                # default for anthropic
   request and a button; only a POST to the link decides. With single
   sign-on (or `approval_links = "sign_in"`), the link also needs a
   signed-in approver, who is recorded as the decider; `groups` works here
-  as for dashboard approvers.
+  as for dashboard approvers, and needs `approval_links = "sign_in"`.
 - **Model**: the SQL is passed as JSON data with an instruction not to follow
   text inside it, and the answer is limited to allow or deny. A refusal, an
   empty or cut-short answer, or anything but that one JSON object is a deny.
@@ -509,7 +509,7 @@ groups_claim = "groups"       # default; a dotted name reaches inside objects, e
 admin_groups = ["ariodb-admins"]
 approver_groups = ["ariodb-approvers", "dba"]
 viewer_groups = ["engineering"]
-allowed_email_domains = ["example.com"]   # optional; needs a verified email
+allowed_email_domains = ["example.com"]   # optional; needs email_verified = true in the ID token
 password_login = "break_glass"   # default: local passwords still work, offered below the button; "off"
 logout_at_provider = false    # true: signing out also ends the provider's session
 ```
@@ -528,7 +528,9 @@ from `admin_groups` takes effect at once.
 The provider must put the groups in the ID token under `groups_claim`
 (Keycloak: a group membership mapper; Okta: a groups claim; Microsoft
 Entra ID: `groups` in the token configuration). If it has no `groups`
-scope, set `scopes` without it. Changing `redirect_path` needs a restart.
+scope, set `scopes` without it. A provider that does not send
+`email_verified` (Microsoft Entra ID, for one) cannot be limited by
+`allowed_email_domains`; limit it by groups instead.
 
 ### `[audit]`
 
