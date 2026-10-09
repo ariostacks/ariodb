@@ -334,9 +334,9 @@ allowed_email_domains = ["example.com"]
 ```
 
 To make everyone in the domain a viewer instead, use `groups_claim = "hd"`
-and `viewer_groups = ["example.com"]`. Approver groups need a provider that
-puts groups in the token; to use Google groups, put a provider that does in
-front of Google (Keycloak, Okta and Auth0 can all federate Google sign-in).
+and `viewer_groups = ["example.com"]`. To map Google groups to roles, put
+a provider that puts groups in the token in front of Google (Keycloak, Okta
+and Auth0 can all federate Google sign-in).
 
 #### Auth0
 
@@ -448,9 +448,9 @@ decision. See [approvals.md](approvals.md) for how approvals work.
   press **Approve** or **Deny**. On a deny, the agent sees the note in its
   error message, so use it to say what to do instead. Your decision is
   recorded as `dashboard:<your user name>`, or `sso:<your name>` if you
-  signed in with single sign-on. Each card says who may decide it
-  ("approvers and admins", or the members of the approver's `groups`), and
-  people who may not see the request without the buttons.
+  signed in with single sign-on. If you may not decide a request, its card
+  has no buttons and says who may instead ("Only approvers and admins may
+  decide this request.", or the members of the approver's `groups`).
 - **Recent decisions**: past requests, newest first, with their status
   (`allowed`, `denied`, `expired`), who decided (a person, `slack:...`,
   `webhook`, `model:...`, `plugin:...`, `ariodb`, or "nobody (expired)"),

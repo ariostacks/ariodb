@@ -1040,7 +1040,7 @@ text follows `ariodb: kept the previous config:`.
 
 | Message | Fix |
 |---|---|
-| `config is not valid TOML: ...` `unknown field `pasword_login`` | A misspelt key: unknown keys are refused in this section. |
+| ``config is not valid TOML: ... unknown field `pasword_login` ...`` | A misspelt key: unknown keys are refused in this section. |
 | `dashboard.oidc.issuer must be an https:// URL (http:// only for localhost)` | Use the provider's `https://` issuer. |
 | `dashboard.oidc.client_id is empty` | Set the client ID. |
 | `dashboard.oidc: set client_secret_env or client_secret_secret, not both` | Keep one. |

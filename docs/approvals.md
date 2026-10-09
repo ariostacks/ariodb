@@ -467,10 +467,13 @@ cannot be turned into a deny link or the other way round.
   expiry the page says "This request was already decided or has expired."
 - Decisions through links are recorded as decided by `webhook`. The links
   carry no identity, so anyone holding a link can use it: send them only to
-  places where the people who see them are allowed to decide. With single
-  sign-on, or `[dashboard] approval_links = "sign_in"`, a link also needs a
-  signed-in approver, who is recorded instead; see
-  [who may decide](#who-may-decide).
+  places where the people who see them are allowed to decide. With
+  `[dashboard] approval_links = "sign_in"` (the default with single
+  sign-on), a link also needs a signed-in approver, who is recorded
+  instead; see [who may decide](#who-may-decide). A program can then no
+  longer decide by POSTing to the link, because the POST needs a dashboard
+  session and its CSRF token: keep `approval_links = "signed"` for a
+  receiver that decides on its own.
 
 `public_url` must be reachable by whoever opens the links. The webhook
 `url` itself is not checked: use `https` so the statement is not sent in
@@ -1002,7 +1005,7 @@ Slack messages, webhook payloads and channel messages link to
 `/hooks/approvals/...` are served by the same listener
 (`[dashboard] listen`), so that address has to be reachable by Slack, by
 the people who open the links, and by your webhook receiver if it decides
-by POSTing to them. See
+by POSTing to them (which needs `approval_links = "signed"`). See
 [dashboard.md](dashboard.md#running-behind-a-reverse-proxy) for running it
 behind a reverse proxy, and for exposing only the callback paths.
 

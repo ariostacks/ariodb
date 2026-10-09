@@ -399,7 +399,8 @@ listener refuses them:
 - rows written into the statement itself, after `VALUES` or after the
   format name, as some drivers send them (ClickHouse would read them as
   data before any block arrived);
-- `INSERT INTO FUNCTION`.
+- `INSERT INTO FUNCTION` (one that names a table function reaching
+  outside the server, such as `s3`, is refused by the policy first).
 
 These answer "over the native protocol ariodb checks only INSERT ... VALUES
 and INSERT ... FORMAT with the rows sent as data, which it counts before

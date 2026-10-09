@@ -277,8 +277,9 @@ approver`.
 **Webhook and channel links open a page instead of deciding.** That is
 deliberate: a `GET` on an approve or deny link only shows the request and a
 button, so link previews cannot decide. Receivers that decide
-programmatically must `POST` to the link. With single sign-on, or
-`approval_links = "sign_in"`, the page also asks the person to sign in; see
+programmatically must `POST` to the link, which works only with
+`approval_links = "signed"`. With `approval_links = "sign_in"` (the default
+with single sign-on), the page also asks the person to sign in; see
 [single sign-on and roles](#single-sign-on-and-roles).
 
 **A link says "This approval link is not valid."** The link was altered;
