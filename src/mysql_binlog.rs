@@ -229,11 +229,15 @@ pub fn changes(
     // Which columns each image carries. With binlog_row_image = FULL that
     // is all of them, except that MariaDB leaves out generated columns.
     let before_cols: Vec<bool> = match event.columns_before_image() {
-        Some(bits) => (0..count).map(|i| bits.get(i).is_some_and(|b| *b)).collect(),
+        Some(bits) => (0..count)
+            .map(|i| bits.get(i).is_some_and(|b| *b))
+            .collect(),
         None => vec![true; count],
     };
     let after_cols: Vec<bool> = match event.columns_after_image() {
-        Some(bits) => (0..count).map(|i| bits.get(i).is_some_and(|b| *b)).collect(),
+        Some(bits) => (0..count)
+            .map(|i| bits.get(i).is_some_and(|b| *b))
+            .collect(),
         None => vec![true; count],
     };
     let mut out = Vec::new();
@@ -311,8 +315,11 @@ pub fn encode(
         BinlogValue::Value(v) => {
             let fsp = meta.first().copied().unwrap_or(0).min(6) as usize;
             match (ty, v) {
-                (MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
-                | MYSQL_TYPE_LONGLONG, Value::Int(n)) => {
+                (
+                    MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
+                    | MYSQL_TYPE_LONGLONG,
+                    Value::Int(n),
+                ) => {
                     if col.unsigned && *n < 0 {
                         // Without signedness in the binlog the value was
                         // read as signed; reread it as the column's width.
@@ -323,7 +330,11 @@ pub fn encode(
                             MYSQL_TYPE_LONG => 32,
                             _ => 64,
                         };
-                        let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                        let mask = if bits == 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << bits) - 1
+                        };
                         ((*n as u64) & mask).to_string()
                     } else {
                         n.to_string()
@@ -358,13 +369,18 @@ pub fn encode(
                     }
                     names.join(",")
                 }
-                (MYSQL_TYPE_BIT, Value::Bytes(b)) => {
-                    b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64).to_string()
-                }
+                (MYSQL_TYPE_BIT, Value::Bytes(b)) => b
+                    .iter()
+                    .fold(0u64, |acc, x| (acc << 8) | *x as u64)
+                    .to_string(),
                 (MYSQL_TYPE_YEAR, Value::Bytes(b)) => {
                     let y = String::from_utf8_lossy(b);
                     // mysql_common adds 1900 to the stored byte; 0 means 0000.
-                    if y == "1900" { "0000".to_string() } else { y.to_string() }
+                    if y == "1900" {
+                        "0000".to_string()
+                    } else {
+                        y.to_string()
+                    }
                 }
                 (MYSQL_TYPE_NEWDECIMAL | MYSQL_TYPE_DECIMAL, Value::Bytes(b)) => {
                     String::from_utf8_lossy(b).to_string()
@@ -512,18 +528,49 @@ mod tests {
         let unsigned = col(Text::Utf8, true);
         assert_eq!(enc(Value::Int(-5), MYSQL_TYPE_LONG, &[], &signed), "-5");
         // Read as signed when the binlog has no signedness.
-        assert_eq!(enc(Value::Int(-1), MYSQL_TYPE_LONG, &[], &unsigned), "4294967295");
+        assert_eq!(
+            enc(Value::Int(-1), MYSQL_TYPE_LONG, &[], &unsigned),
+            "4294967295"
+        );
         assert_eq!(enc(Value::Int(-1), MYSQL_TYPE_TINY, &[], &unsigned), "255");
         assert_eq!(
             enc(Value::Int(-1), MYSQL_TYPE_LONGLONG, &[], &unsigned),
             "18446744073709551615"
         );
-        assert_eq!(enc(Value::UInt(u64::MAX), MYSQL_TYPE_LONGLONG, &[], &unsigned), "18446744073709551615");
-        assert_eq!(enc(Value::Float(0.1), MYSQL_TYPE_FLOAT, &[], &signed), "0.1");
-        assert_eq!(enc(Value::Double(1.0 / 3.0), MYSQL_TYPE_DOUBLE, &[], &signed), "0.3333333333333333");
-        assert_eq!(enc(Value::Bytes(b"12.50".to_vec()), MYSQL_TYPE_NEWDECIMAL, &[10, 2], &signed), "12.50");
-        assert_eq!(enc(Value::Bytes(vec![1, 2]), MYSQL_TYPE_BIT, &[0, 2], &signed), "258");
-        assert_eq!(enc(Value::Bytes(b"1900".to_vec()), MYSQL_TYPE_YEAR, &[], &signed), "0000");
+        assert_eq!(
+            enc(Value::UInt(u64::MAX), MYSQL_TYPE_LONGLONG, &[], &unsigned),
+            "18446744073709551615"
+        );
+        assert_eq!(
+            enc(Value::Float(0.1), MYSQL_TYPE_FLOAT, &[], &signed),
+            "0.1"
+        );
+        assert_eq!(
+            enc(Value::Double(1.0 / 3.0), MYSQL_TYPE_DOUBLE, &[], &signed),
+            "0.3333333333333333"
+        );
+        assert_eq!(
+            enc(
+                Value::Bytes(b"12.50".to_vec()),
+                MYSQL_TYPE_NEWDECIMAL,
+                &[10, 2],
+                &signed
+            ),
+            "12.50"
+        );
+        assert_eq!(
+            enc(Value::Bytes(vec![1, 2]), MYSQL_TYPE_BIT, &[0, 2], &signed),
+            "258"
+        );
+        assert_eq!(
+            enc(
+                Value::Bytes(b"1900".to_vec()),
+                MYSQL_TYPE_YEAR,
+                &[],
+                &signed
+            ),
+            "0000"
+        );
     }
 
     #[test]
@@ -531,25 +578,64 @@ mod tests {
         use ColumnType::*;
         let c = col(Text::Utf8, false);
         assert_eq!(
-            enc(Value::Date(2026, 10, 9, 8, 7, 6, 123_456), MYSQL_TYPE_DATETIME2, &[6], &c),
+            enc(
+                Value::Date(2026, 10, 9, 8, 7, 6, 123_456),
+                MYSQL_TYPE_DATETIME2,
+                &[6],
+                &c
+            ),
             "2026-10-09 08:07:06.123456"
         );
         assert_eq!(
-            enc(Value::Date(2026, 10, 9, 8, 7, 6, 120_000), MYSQL_TYPE_DATETIME2, &[2], &c),
+            enc(
+                Value::Date(2026, 10, 9, 8, 7, 6, 120_000),
+                MYSQL_TYPE_DATETIME2,
+                &[2],
+                &c
+            ),
             "2026-10-09 08:07:06.12"
         );
-        assert_eq!(enc(Value::Date(2026, 1, 2, 0, 0, 0, 0), MYSQL_TYPE_NEWDATE, &[], &c), "2026-01-02");
+        assert_eq!(
+            enc(
+                Value::Date(2026, 1, 2, 0, 0, 0, 0),
+                MYSQL_TYPE_NEWDATE,
+                &[],
+                &c
+            ),
+            "2026-01-02"
+        );
         // 2026-10-09 08:07:06 UTC
         assert_eq!(
-            enc(Value::Bytes(b"1791533226.500000".to_vec()), MYSQL_TYPE_TIMESTAMP2, &[3], &c),
+            enc(
+                Value::Bytes(b"1791533226.500000".to_vec()),
+                MYSQL_TYPE_TIMESTAMP2,
+                &[3],
+                &c
+            ),
             "2026-10-09 08:07:06.500"
         );
         assert_eq!(
             enc(Value::Bytes(b"0".to_vec()), MYSQL_TYPE_TIMESTAMP2, &[0], &c),
             "0000-00-00 00:00:00"
         );
-        assert_eq!(enc(Value::Time(true, 34, 22, 59, 59, 0), MYSQL_TYPE_TIME2, &[0], &c), "-838:59:59");
-        assert_eq!(enc(Value::Time(false, 0, 1, 2, 3, 400_000), MYSQL_TYPE_TIME2, &[1], &c), "01:02:03.4");
+        assert_eq!(
+            enc(
+                Value::Time(true, 34, 22, 59, 59, 0),
+                MYSQL_TYPE_TIME2,
+                &[0],
+                &c
+            ),
+            "-838:59:59"
+        );
+        assert_eq!(
+            enc(
+                Value::Time(false, 0, 1, 2, 3, 400_000),
+                MYSQL_TYPE_TIME2,
+                &[1],
+                &c
+            ),
+            "01:02:03.4"
+        );
     }
 
     #[test]
@@ -557,25 +643,61 @@ mod tests {
         use ColumnType::*;
         let text = col(Text::Utf8, false);
         let bytes = col(Text::Bytes, false);
-        assert_eq!(enc(Value::Bytes("café".into()), MYSQL_TYPE_VARCHAR, &[], &text), "café");
-        assert_eq!(enc(Value::Bytes(vec![0, 255]), MYSQL_TYPE_BLOB, &[], &bytes), "\\x00ff");
+        assert_eq!(
+            enc(Value::Bytes("café".into()), MYSQL_TYPE_VARCHAR, &[], &text),
+            "café"
+        );
+        assert_eq!(
+            enc(Value::Bytes(vec![0, 255]), MYSQL_TYPE_BLOB, &[], &bytes),
+            "\\x00ff"
+        );
         // BINARY(4): 0xfe is the real type (string), 4 the length.
-        let fixed = ColumnShape { fixed_binary: true, ..col(Text::Bytes, false) };
-        assert_eq!(enc(Value::Bytes(vec![255]), MYSQL_TYPE_STRING, &[0xfe, 4], &fixed), "\\xff000000");
+        let fixed = ColumnShape {
+            fixed_binary: true,
+            ..col(Text::Bytes, false)
+        };
+        assert_eq!(
+            enc(
+                Value::Bytes(vec![255]),
+                MYSQL_TYPE_STRING,
+                &[0xfe, 4],
+                &fixed
+            ),
+            "\\xff000000"
+        );
         assert_eq!(enc(Value::Int(2), MYSQL_TYPE_ENUM, &[], &text), "it's");
         assert_eq!(enc(Value::Int(0), MYSQL_TYPE_ENUM, &[], &text), "");
-        assert_eq!(enc(Value::Bytes(vec![0b101]), MYSQL_TYPE_SET, &[], &text), "small,large");
+        assert_eq!(
+            enc(Value::Bytes(vec![0b101]), MYSQL_TYPE_SET, &[], &text),
+            "small,large"
+        );
         // Text that is not UTF-8 cannot be recorded faithfully as text.
         assert_eq!(
-            encode(&BinlogValue::Value(Value::Bytes(vec![0xe9])), MYSQL_TYPE_VARCHAR, &[], &text),
+            encode(
+                &BinlogValue::Value(Value::Bytes(vec![0xe9])),
+                MYSQL_TYPE_VARCHAR,
+                &[],
+                &text
+            ),
             Some(Cell::Unchanged { unchanged: true })
         );
-        assert_eq!(encode(&BinlogValue::Value(Value::NULL), MYSQL_TYPE_VARCHAR, &[], &text), None);
+        assert_eq!(
+            encode(
+                &BinlogValue::Value(Value::NULL),
+                MYSQL_TYPE_VARCHAR,
+                &[],
+                &text
+            ),
+            None
+        );
     }
 
     #[test]
     fn members_parse_from_column_type() {
-        assert_eq!(members_of("enum('a','it''s','b,c')"), vec!["a", "it's", "b,c"]);
+        assert_eq!(
+            members_of("enum('a','it''s','b,c')"),
+            vec!["a", "it's", "b,c"]
+        );
         assert_eq!(members_of("set('x')"), vec!["x"]);
         assert!(members_of("int").is_empty());
     }

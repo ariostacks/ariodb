@@ -159,7 +159,9 @@ fn all_records(config: &Config) -> Result<Vec<journal::TxnRecord>, String> {
 }
 
 fn has_session(records: &[journal::TxnRecord], session: &str) -> bool {
-    records.iter().any(|r| r.session.as_deref() == Some(session))
+    records
+        .iter()
+        .any(|r| r.session.as_deref() == Some(session))
 }
 
 fn plan_json(plan: &undo::Plan) -> Value {

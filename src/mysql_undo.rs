@@ -15,8 +15,8 @@ use crate::mysql_journal::{self, code, message, quote_ident, quote_table};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Value};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 use std::fmt::Write as _;
+use std::time::Duration;
 
 /// The session settings undo runs with: TIMESTAMP values were recorded in
 /// UTC, and a re-inserted row must keep its own AUTO_INCREMENT id (even 0)
@@ -135,7 +135,9 @@ pub async fn undo(
     }
     print!("{text}");
     let done = apply_plan(&mut conn, config, &plan, skip_conflicts).await?;
-    Ok(format!("\nundone: {done} rows restored in one transaction\n"))
+    Ok(format!(
+        "\nundone: {done} rows restored in one transaction\n"
+    ))
 }
 
 /// A row one session changed: its first and last change to it.
@@ -262,7 +264,10 @@ pub async fn plan(
                         .session
                         .clone()
                         .unwrap_or_else(|| "someone outside ariodb".into());
-                    let text = format!("{table} row {} was changed later by {who}", show_key(&key.1));
+                    let text = format!(
+                        "{table} row {} was changed later by {who}",
+                        show_key(&key.1)
+                    );
                     conflicts.push(Conflict { key, text });
                 }
             }
@@ -294,7 +299,11 @@ pub async fn plan(
 }
 
 /// How a row differs now from what the session left, if it does.
-async fn live_difference(conn: &mut Conn, step: &Step, lock: bool) -> Result<Option<String>, String> {
+async fn live_difference(
+    conn: &mut Conn,
+    step: &Step,
+    lock: bool,
+) -> Result<Option<String>, String> {
     let sql = if lock {
         format!("{} FOR UPDATE", step.check_sql)
     } else {
@@ -303,7 +312,14 @@ async fn live_difference(conn: &mut Conn, step: &Step, lock: bool) -> Result<Opt
     let same: Option<Option<i64>> = conn
         .exec_first(sql, step.check_params.clone())
         .await
-        .map_err(|e| format!("cannot read {} row {}: {}", step.key.0, show_key(&step.key.1), message(&e)))?;
+        .map_err(|e| {
+            format!(
+                "cannot read {} row {}: {}",
+                step.key.0,
+                show_key(&step.key.1),
+                message(&e)
+            )
+        })?;
     Ok(match (step.expect_present, same) {
         (true, Some(Some(1))) | (false, None) => None,
         (true, None) => Some("was deleted since the session changed it".to_string()),
@@ -331,7 +347,11 @@ async fn cascade_warnings(conn: &mut Conn, touched: &[Touch<'_>]) -> Vec<String>
                 continue;
             }
             done.push(id);
-            let rule = if change.op == Op::Delete { "DELETE_RULE" } else { "UPDATE_RULE" };
+            let rule = if change.op == Op::Delete {
+                "DELETE_RULE"
+            } else {
+                "UPDATE_RULE"
+            };
             let rows: Vec<(String, String, String)> = conn
                 .exec(
                     format!(
@@ -424,7 +444,11 @@ async fn apply_in_transaction(
     {
         match live_difference(conn, step, true).await? {
             None => pending.push(step),
-            Some(why) => late.push(format!("{} row {} {why}", step.key.0, show_key(&step.key.1))),
+            Some(why) => late.push(format!(
+                "{} row {} {why}",
+                step.key.0,
+                show_key(&step.key.1)
+            )),
         }
     }
     if !late.is_empty() && !skip_conflicts {
@@ -463,7 +487,11 @@ async fn apply_in_transaction(
             conn.query_drop("SAVEPOINT ariodb_step")
                 .await
                 .map_err(|e| message(&e))?;
-            let changed_before = if measure { rows_changed(conn).await? } else { 0 };
+            let changed_before = if measure {
+                rows_changed(conn).await?
+            } else {
+                0
+            };
             match conn.exec_drop(step.sql.as_str(), step.params.clone()).await {
                 Ok(()) if conn.affected_rows() == 1 => {
                     let extra = if measure {
@@ -526,7 +554,10 @@ async fn apply_in_transaction(
 
 /// Can changing a row of this table change others: does it have triggers,
 /// or foreign keys that cascade or set null from it?
-async fn reaches_other_rows(conn: &mut Conn, (db, table): &(String, String)) -> Result<bool, String> {
+async fn reaches_other_rows(
+    conn: &mut Conn,
+    (db, table): &(String, String),
+) -> Result<bool, String> {
     let n: Option<i64> = conn
         .exec_first(
             "SELECT (SELECT COUNT(*) FROM information_schema.TRIGGERS
@@ -558,7 +589,15 @@ async fn rows_changed(conn: &mut Conn) -> Result<i64, String> {
 
 async fn table_info(conn: &mut Conn, db: &str, table: &str) -> Result<TableInfo, String> {
     let err = |e: mysql_async::Error| format!("{db}.{table}: {}", message(&e));
-    type Row = (String, String, String, Option<String>, String, Option<u64>, Option<u64>);
+    type Row = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<u64>,
+        Option<u64>,
+    );
     let rows: Vec<Row> = conn
         .exec(
             "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, CHARACTER_SET_NAME, EXTRA,
@@ -581,25 +620,27 @@ async fn table_info(conn: &mut Conn, db: &str, table: &str) -> Result<TableInfo,
         .map_err(err)?;
     let columns = rows
         .into_iter()
-        .map(|(name, data_type, column_type, charset, extra, precision, scale)| {
-            let data_type = data_type.to_lowercase();
-            let column_type = column_type.to_lowercase();
-            let extra = extra.to_uppercase();
-            Column {
-                unsigned: !matches!(data_type.as_str(), "enum" | "set")
-                    && column_type.contains(" unsigned"),
-                other_charset: charset
-                    .map(|c| c.to_lowercase())
-                    .filter(|c| !crate::mysql_binlog::is_utf8(c)),
-                generated: extra.contains("VIRTUAL GENERATED")
-                    || extra.contains("STORED GENERATED")
-                    || extra.contains("PERSISTENT GENERATED"),
-                name,
-                data_type,
-                precision,
-                scale,
-            }
-        })
+        .map(
+            |(name, data_type, column_type, charset, extra, precision, scale)| {
+                let data_type = data_type.to_lowercase();
+                let column_type = column_type.to_lowercase();
+                let extra = extra.to_uppercase();
+                Column {
+                    unsigned: !matches!(data_type.as_str(), "enum" | "set")
+                        && column_type.contains(" unsigned"),
+                    other_charset: charset
+                        .map(|c| c.to_lowercase())
+                        .filter(|c| !crate::mysql_binlog::is_utf8(c)),
+                    generated: extra.contains("VIRTUAL GENERATED")
+                        || extra.contains("STORED GENERATED")
+                        || extra.contains("PERSISTENT GENERATED"),
+                    name,
+                    data_type,
+                    precision,
+                    scale,
+                }
+            },
+        )
         .collect();
     Ok(TableInfo {
         db: db.to_string(),
@@ -692,7 +733,9 @@ fn decimal_cast(col: &Column) -> String {
 
 /// A character set name from information_schema, safe to put in SQL.
 fn safe_word(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect()
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
 }
 
 /// True when `col` holds exactly the bound value: compared as bytes for
@@ -753,10 +796,18 @@ fn param(col: &Column, cell: &Option<Cell>) -> Result<Value, String> {
 fn parse_datetime(text: &str) -> Option<Value> {
     let (date, time) = text.split_once(' ').unwrap_or((text, "00:00:00"));
     let mut d = date.split('-');
-    let (y, mo, da) = (d.next()?.parse().ok()?, d.next()?.parse().ok()?, d.next()?.parse().ok()?);
+    let (y, mo, da) = (
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+    );
     let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
     let mut t = hms.split(':');
-    let (h, mi, s) = (t.next()?.parse().ok()?, t.next()?.parse().ok()?, t.next()?.parse().ok()?);
+    let (h, mi, s) = (
+        t.next()?.parse().ok()?,
+        t.next()?.parse().ok()?,
+        t.next()?.parse().ok()?,
+    );
     Some(Value::Date(y, mo, da, h, mi, s, micros(frac)?))
 }
 
@@ -770,7 +821,14 @@ fn parse_time(text: &str) -> Option<Value> {
     let mut t = hms.split(':');
     let hours: u32 = t.next()?.parse().ok()?;
     let (m, s) = (t.next()?.parse().ok()?, t.next()?.parse().ok()?);
-    Some(Value::Time(neg, hours / 24, (hours % 24) as u8, m, s, micros(frac)?))
+    Some(Value::Time(
+        neg,
+        hours / 24,
+        (hours % 24) as u8,
+        m,
+        s,
+        micros(frac)?,
+    ))
 }
 
 /// `"5"` (tenths) to 500000 microseconds.
@@ -803,34 +861,41 @@ fn net_inverse(first: &Change, last: &Change, info: &TableInfo) -> Result<Option
         info.column(name)
             .ok_or_else(|| format!("column {name} no longer exists"))
     };
-    let value_of = |change: &Change, values: &[Option<Cell>], name: &str| -> Result<Value, String> {
-        let i = change
-            .columns
-            .iter()
-            .position(|c| c == name)
-            .ok_or_else(|| format!("column {name} was not recorded"))?;
-        param(column(name)?, &values[i])
-    };
+    let value_of =
+        |change: &Change, values: &[Option<Cell>], name: &str| -> Result<Value, String> {
+            let i = change
+                .columns
+                .iter()
+                .position(|c| c == name)
+                .ok_or_else(|| format!("column {name} was not recorded"))?;
+            param(column(name)?, &values[i])
+        };
     // `pk = ?` for each primary key column, with the row's values.
-    let where_pk = |change: &Change, values: &[Option<Cell>]| -> Result<(String, Vec<Value>), String> {
-        let mut parts = Vec::new();
-        let mut params = Vec::new();
-        for name in &info.primary_key {
-            let col = column(name)?;
-            let expr = if matches!(col.data_type.as_str(), "decimal" | "numeric") {
-                decimal_cast(col)
-            } else {
-                write_expr(col)
-            };
-            parts.push(format!("{} = {expr}", quote_ident(name)));
-            params.push(value_of(change, values, name)?);
-        }
-        Ok((parts.join(" AND "), params))
-    };
+    let where_pk =
+        |change: &Change, values: &[Option<Cell>]| -> Result<(String, Vec<Value>), String> {
+            let mut parts = Vec::new();
+            let mut params = Vec::new();
+            for name in &info.primary_key {
+                let col = column(name)?;
+                let expr = if matches!(col.data_type.as_str(), "decimal" | "numeric") {
+                    decimal_cast(col)
+                } else {
+                    write_expr(col)
+                };
+                parts.push(format!("{} = {expr}", quote_ident(name)));
+                params.push(value_of(change, values, name)?);
+            }
+            Ok((parts.join(" AND "), params))
+        };
 
     let before = match first.op {
         Op::Insert => None,
-        Op::Update | Op::Delete => Some(first.old.as_ref().ok_or("a change without its before-image")?),
+        Op::Update | Op::Delete => Some(
+            first
+                .old
+                .as_ref()
+                .ok_or("a change without its before-image")?,
+        ),
         Op::Truncate => return Err("TRUNCATE cannot be undone".to_string()),
     };
     let after = match last.op {
@@ -850,11 +915,22 @@ fn net_inverse(first: &Change, last: &Change, info: &TableInfo) -> Result<Option
                 values.push(value_of(last, new, name)?);
             }
             values.append(&mut params);
-            let test = if same.is_empty() { "1".to_string() } else { same.join(" AND ") };
-            (format!("SELECT ({test}) + 0 FROM {qt} WHERE {w}"), values, true)
+            let test = if same.is_empty() {
+                "1".to_string()
+            } else {
+                same.join(" AND ")
+            };
+            (
+                format!("SELECT ({test}) + 0 FROM {qt} WHERE {w}"),
+                values,
+                true,
+            )
         }
         None => {
-            let old = last.old.as_ref().ok_or("a delete without its before-image")?;
+            let old = last
+                .old
+                .as_ref()
+                .ok_or("a delete without its before-image")?;
             let (w, params) = where_pk(last, old)?;
             (format!("SELECT 1 FROM {qt} WHERE {w}"), params, false)
         }
@@ -877,14 +953,22 @@ fn net_inverse(first: &Change, last: &Change, info: &TableInfo) -> Result<Option
             let mut sets = Vec::new();
             let mut params = Vec::new();
             for name in writable(first, info) {
-                sets.push(format!("{} = {}", quote_ident(name), write_expr(column(name)?)));
+                sets.push(format!(
+                    "{} = {}",
+                    quote_ident(name),
+                    write_expr(column(name)?)
+                ));
                 params.push(value_of(first, old, name)?);
             }
             let (w, mut where_params) = where_pk(last, new)?;
             params.append(&mut where_params);
             let key = key_of(last, new, &info.primary_key);
             // Changing a primary key back is a delete and an insert to InnoDB.
-            let own = if key_of(first, old, &info.primary_key) == key { 1 } else { 2 };
+            let own = if key_of(first, old, &info.primary_key) == key {
+                1
+            } else {
+                2
+            };
             (
                 format!("UPDATE {qt} SET {} WHERE {w}", sets.join(", ")),
                 params,
@@ -904,7 +988,11 @@ fn net_inverse(first: &Change, last: &Change, info: &TableInfo) -> Result<Option
             }
             let key = key_of(first, old, &info.primary_key);
             (
-                format!("INSERT INTO {qt} ({}) VALUES ({})", cols.join(", "), exprs.join(", ")),
+                format!(
+                    "INSERT INTO {qt} ({}) VALUES ({})",
+                    cols.join(", "),
+                    exprs.join(", ")
+                ),
                 params,
                 format!("re-insert deleted {table} row {}", show_key(&key)),
                 key,
@@ -949,14 +1037,20 @@ mod tests {
         TableInfo {
             db: "shop".into(),
             table: "orders".into(),
-            columns: vec![col("id", "bigint"), col("status", "varchar"), total, doubled],
+            columns: vec![
+                col("id", "bigint"),
+                col("status", "varchar"),
+                total,
+                doubled,
+            ],
             primary_key: vec!["id".into()],
         }
     }
 
     fn change(op: Op, old: Option<[&str; 3]>, new: Option<[&str; 3]>) -> Change {
         let cells = |v: [&str; 3]| -> Vec<Option<Cell>> {
-            let mut out: Vec<Option<Cell>> = v.iter().map(|s| Some(Cell::Text(s.to_string()))).collect();
+            let mut out: Vec<Option<Cell>> =
+                v.iter().map(|s| Some(Cell::Text(s.to_string()))).collect();
             out.push(Some(Cell::Text("0".into())));
             out
         };
@@ -964,7 +1058,12 @@ mod tests {
             schema: "shop".into(),
             table: "orders".into(),
             op,
-            columns: vec!["id".into(), "status".into(), "total".into(), "doubled".into()],
+            columns: vec![
+                "id".into(),
+                "status".into(),
+                "total".into(),
+                "doubled".into(),
+            ],
             old: old.map(cells),
             new: new.map(cells),
         }
@@ -982,7 +1081,11 @@ mod tests {
         assert_eq!(s.params, vec![Value::Int(7)]);
         assert!(s.expect_present);
 
-        let u = change(Op::Update, Some(["7", "o'ld", "2.50"]), Some(["7", "void", "0.00"]));
+        let u = change(
+            Op::Update,
+            Some(["7", "o'ld", "2.50"]),
+            Some(["7", "void", "0.00"]),
+        );
         let s = step(&u, &u);
         assert_eq!(
             s.sql,
@@ -1015,9 +1118,17 @@ mod tests {
     #[test]
     fn several_changes_to_one_row_become_one_step() {
         let insert = change(Op::Insert, None, Some(["7", "new", "1.00"]));
-        let update = change(Op::Update, Some(["7", "new", "1.00"]), Some(["7", "newer", "1.00"]));
+        let update = change(
+            Op::Update,
+            Some(["7", "new", "1.00"]),
+            Some(["7", "newer", "1.00"]),
+        );
         let delete = change(Op::Delete, Some(["7", "newer", "1.00"]), None);
-        let paid = change(Op::Update, Some(["7", "paid", "1.00"]), Some(["7", "void", "1.00"]));
+        let paid = change(
+            Op::Update,
+            Some(["7", "paid", "1.00"]),
+            Some(["7", "void", "1.00"]),
+        );
         assert!(net_inverse(&insert, &delete, &info()).unwrap().is_none());
         assert!(step(&insert, &update).sql.starts_with("DELETE FROM"));
         let s = step(&paid, &delete);
@@ -1032,23 +1143,50 @@ mod tests {
         let mut u = col("n", "bigint");
         u.unsigned = true;
         let t = |s: &str| Some(Cell::Text(s.into()));
-        assert_eq!(param(&u, &t("18446744073709551615")).unwrap(), Value::UInt(u64::MAX));
-        assert_eq!(param(&col("f", "float"), &t("0.1")).unwrap(), Value::Float(0.1));
-        assert_eq!(param(&col("b", "blob"), &t("\\x00ff")).unwrap(), Value::Bytes(b"00ff".to_vec()));
+        assert_eq!(
+            param(&u, &t("18446744073709551615")).unwrap(),
+            Value::UInt(u64::MAX)
+        );
+        assert_eq!(
+            param(&col("f", "float"), &t("0.1")).unwrap(),
+            Value::Float(0.1)
+        );
+        assert_eq!(
+            param(&col("b", "blob"), &t("\\x00ff")).unwrap(),
+            Value::Bytes(b"00ff".to_vec())
+        );
         assert!(param(&col("b", "blob"), &t("\\x0g")).is_err());
         assert!(param(&col("b", "blob"), &t("00ff")).is_err());
         assert_eq!(
             param(&col("d", "datetime"), &t("2026-10-09 08:07:06.12")).unwrap(),
             Value::Date(2026, 10, 9, 8, 7, 6, 120_000)
         );
-        assert_eq!(param(&col("d", "date"), &t("2026-10-09")).unwrap(), Value::Date(2026, 10, 9, 0, 0, 0, 0));
-        assert_eq!(param(&col("t", "time"), &t("-838:59:59")).unwrap(), Value::Time(true, 34, 22, 59, 59, 0));
-        assert_eq!(param(&col("j", "json"), &t("{\"a\":1}")).unwrap(), Value::Bytes(b"{\"a\":1}".to_vec()));
+        assert_eq!(
+            param(&col("d", "date"), &t("2026-10-09")).unwrap(),
+            Value::Date(2026, 10, 9, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            param(&col("t", "time"), &t("-838:59:59")).unwrap(),
+            Value::Time(true, 34, 22, 59, 59, 0)
+        );
+        assert_eq!(
+            param(&col("j", "json"), &t("{\"a\":1}")).unwrap(),
+            Value::Bytes(b"{\"a\":1}".to_vec())
+        );
         assert_eq!(param(&col("x", "varchar"), &None).unwrap(), Value::NULL);
-        assert!(param(&col("x", "varchar"), &Some(Cell::Unchanged { unchanged: true })).is_err());
+        assert!(
+            param(
+                &col("x", "varchar"),
+                &Some(Cell::Unchanged { unchanged: true })
+            )
+            .is_err()
+        );
         let mut latin = col("l", "varchar");
         latin.other_charset = Some("latin1".into());
-        assert_eq!(param(&latin, &t("\\xe9")).unwrap(), Value::Bytes(b"e9".to_vec()));
+        assert_eq!(
+            param(&latin, &t("\\xe9")).unwrap(),
+            Value::Bytes(b"e9".to_vec())
+        );
         assert_eq!(write_expr(&latin), "CONVERT(UNHEX(?) USING latin1)");
         assert_eq!(same_expr(&latin), "CAST(`l` AS BINARY) <=> UNHEX(?)");
         assert_eq!(write_expr(&col("b", "varbinary")), "UNHEX(?)");
@@ -1060,6 +1198,9 @@ mod tests {
         let d = change(Op::Delete, Some(["7", hostile, "1.00"]), None);
         let s = step(&d, &d);
         assert!(!s.sql.contains("DROP"), "{}", s.sql);
-        assert!(s.params.contains(&Value::Bytes(hostile.as_bytes().to_vec())));
+        assert!(
+            s.params
+                .contains(&Value::Bytes(hostile.as_bytes().to_vec()))
+        );
     }
 }

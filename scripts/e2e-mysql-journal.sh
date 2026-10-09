@@ -6,6 +6,7 @@
 # without one. All passwords and tokens here are throwaway test values.
 #
 #   MYSQL_IMAGE=mariadb:11.4 E2E_OFFSET=50 ./scripts/e2e-mysql-journal.sh
+#   MYSQL_ARGS=--binlog-transaction-compression=ON ./scripts/e2e-mysql-journal.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
@@ -44,6 +45,9 @@ case "$IMAGE" in
   # journal takes column names from information_schema.
   *) CLI=mysql; ARGS=() ;;
 esac
+# Extra server options, such as --binlog-transaction-compression=ON.
+read -r -a EXTRA <<<"${MYSQL_ARGS:-}"
+ARGS+=(${EXTRA[@]+"${EXTRA[@]}"})
 
 timeout 600 cargo build -q 2>"$WORK/build.log" || { cat "$WORK/build.log"; fail "build"; }
 

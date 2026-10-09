@@ -117,7 +117,10 @@ fn host_port(addr: &str) -> Result<(String, u16), String> {
         ),
         _ => (addr, 3306),
     };
-    Ok((host.trim_matches(|c| c == '[' || c == ']').to_string(), port))
+    Ok((
+        host.trim_matches(|c| c == '[' || c == ']').to_string(),
+        port,
+    ))
 }
 
 /// Connect to the MySQL server as `user`, with TLS per `[mysql] tls`.
@@ -155,8 +158,13 @@ pub async fn connect_as(config: &Config, user: &str, password: &str) -> Result<C
         .ssl_opts(ssl);
     match tokio::time::timeout(Duration::from_secs(10), Conn::new(opts)).await {
         Ok(Ok(c)) => Ok(c),
-        Ok(Err(e)) => Err(format!("cannot connect to MySQL at {host}:{port} as {user}: {}", message(&e))),
-        Err(_) => Err(format!("cannot connect to MySQL at {host}:{port}: no answer in 10 seconds")),
+        Ok(Err(e)) => Err(format!(
+            "cannot connect to MySQL at {host}:{port} as {user}: {}",
+            message(&e)
+        )),
+        Err(_) => Err(format!(
+            "cannot connect to MySQL at {host}:{port}: no answer in 10 seconds"
+        )),
     }
 }
 
@@ -187,7 +195,10 @@ pub fn code(e: &mysql_async::Error) -> Option<u16> {
 pub fn tag_table(config: &Config) -> (String, String) {
     match config.mysql.tag_table.split_once('.') {
         Some((d, t)) => (d.to_string(), t.to_string()),
-        None => (config.mysql.database.clone(), config.mysql.tag_table.clone()),
+        None => (
+            config.mysql.database.clone(),
+            config.mysql.tag_table.clone(),
+        ),
     }
 }
 
@@ -245,7 +256,10 @@ async fn variables(conn: &mut Conn) -> Result<HashMap<String, String>, String> {
         )
         .await
         .map_err(|e| format!("cannot read server settings: {}", message(&e)))?;
-    Ok(rows.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect())
 }
 
 /// The binlog settings the journal needs, as findings. A failure means the
@@ -299,12 +313,19 @@ pub async fn binlog_findings(config: &Config, conn: &mut Conn) -> Vec<Finding> {
         ),
     }
     match get("binlog_row_metadata").as_str() {
-        "FULL" => push(Status::Ok, "binlog_row_metadata is FULL: the binlog names every column".to_string()),
+        "FULL" => push(
+            Status::Ok,
+            "binlog_row_metadata is FULL: the binlog names every column".to_string(),
+        ),
         other => push(
             Status::Warn,
             format!(
                 "binlog_row_metadata is {}; column names will come from information_schema, which is wrong if a table changes shape before the journal reads its changes. Set it to FULL",
-                if other.is_empty() { "not available" } else { other }
+                if other.is_empty() {
+                    "not available"
+                } else {
+                    other
+                }
             ),
         ),
     }
@@ -317,7 +338,8 @@ pub async fn binlog_findings(config: &Config, conn: &mut Conn) -> Vec<Finding> {
     if get("log_bin_compress") == "ON" {
         push(
             Status::Fail,
-            "log_bin_compress is ON; the journal cannot read compressed binlog events. Turn it off".to_string(),
+            "log_bin_compress is ON; the journal cannot read compressed binlog events. Turn it off"
+                .to_string(),
         );
     }
     if vars.get("server_id").and_then(|s| s.parse::<u32>().ok()) == Some(config.mysql.server_id) {
@@ -399,9 +421,12 @@ pub async fn setup(config: &Config) -> Result<(), String> {
 
     let (db, table) = tag_table(config);
     let qt = quote_table(&db, &table);
-    conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {}", quote_ident(&db)))
-        .await
-        .map_err(|e| format!("cannot create database {db}: {}", message(&e)))?;
+    conn.query_drop(format!(
+        "CREATE DATABASE IF NOT EXISTS {}",
+        quote_ident(&db)
+    ))
+    .await
+    .map_err(|e| format!("cannot create database {db}: {}", message(&e)))?;
     conn.query_drop(format!(
         "CREATE TABLE IF NOT EXISTS {qt} (
              id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -421,7 +446,10 @@ pub async fn setup(config: &Config) -> Result<(), String> {
         None => {
             let p = server_position(&mut conn).await?;
             save_position(config, &p)?;
-            println!("ok   the journal will record changes from {}:{}", p.file, p.pos);
+            println!(
+                "ok   the journal will record changes from {}:{}",
+                p.file, p.pos
+            );
         }
     }
 
@@ -429,8 +457,12 @@ pub async fn setup(config: &Config) -> Result<(), String> {
     let (journal_user, _) = config.mysql_journal_login()?;
     let journal = account(&journal_user);
     println!();
-    println!("Grants ariodb needs (not run; run them as an administrator, with the right host instead of '%'):");
-    println!("  -- the gateway login, for agents' queries: tagging writes, and counting the rows a write changed");
+    println!(
+        "Grants ariodb needs (not run; run them as an administrator, with the right host instead of '%'):"
+    );
+    println!(
+        "  -- the gateway login, for agents' queries: tagging writes, and counting the rows a write changed"
+    );
     println!("  GRANT INSERT ON {qt} TO {gateway};");
     println!("  GRANT PROCESS ON *.* TO {gateway};");
     println!("  -- the journal login: reading the binlog, pruning tags, and undo");
@@ -438,7 +470,9 @@ pub async fn setup(config: &Config) -> Result<(), String> {
     println!("  GRANT SELECT, INSERT, DELETE ON {qt} TO {journal};");
     let p = Protected::from_config(config);
     if p.all {
-        println!("  GRANT SELECT, INSERT, UPDATE, DELETE ON *.* TO {journal};  -- an agent may write any table");
+        println!(
+            "  GRANT SELECT, INSERT, UPDATE, DELETE ON *.* TO {journal};  -- an agent may write any table"
+        );
     } else {
         for (d, t) in &p.tables {
             println!(
@@ -584,7 +618,11 @@ impl<'a> Reader<'a> {
         loop {
             let next = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
             let event = match next {
-                Err(_) => return Err("no word from the MySQL server in 30 seconds; reconnecting".to_string()),
+                Err(_) => {
+                    return Err(
+                        "no word from the MySQL server in 30 seconds; reconnecting".to_string()
+                    );
+                }
                 Ok(None) => return Err("the MySQL server ended the binlog stream".to_string()),
                 Ok(Some(Err(e))) => {
                     let m = message(&e);
@@ -667,7 +705,12 @@ impl<'a> Reader<'a> {
         let data = match event.read_data() {
             Ok(Some(d)) => d,
             Ok(None) => return Ok(()),
-            Err(e) => return Err(format!("cannot decode a binlog event at {}:{}: {e}", self.file, self.pos)),
+            Err(e) => {
+                return Err(format!(
+                    "cannot decode a binlog event at {}:{}: {e}",
+                    self.file, self.pos
+                ));
+            }
         };
         match data {
             EventData::QueryEvent(q) => {
@@ -694,10 +737,13 @@ impl<'a> Reader<'a> {
             EventData::XidEvent(x) => self.commit(x.xid, header.timestamp())?,
             EventData::RowsEvent(rows) => {
                 let table_id = rows.table_id();
-                let tme = stream
-                    .get_tme(table_id)
-                    .ok_or_else(|| format!("a change to table id {table_id} without its table map"))?;
-                let (db, table) = (tme.database_name().to_string(), tme.table_name().to_string());
+                let tme = stream.get_tme(table_id).ok_or_else(|| {
+                    format!("a change to table id {table_id} without its table map")
+                })?;
+                let (db, table) = (
+                    tme.database_name().to_string(),
+                    tme.table_name().to_string(),
+                );
                 let is_tag = db == self.tag.0 && table == self.tag.1;
                 let open = self.open.get_or_insert_with(Open::default);
                 // Rows are kept for protected tables, and for every table in
@@ -714,10 +760,17 @@ impl<'a> Reader<'a> {
                 let open = self.open.get_or_insert_with(Open::default);
                 if is_tag {
                     let col = |name: &str, fallback: usize| {
-                        shape.columns.iter().position(|c| c.name == name).unwrap_or(fallback)
+                        shape
+                            .columns
+                            .iter()
+                            .position(|c| c.name == name)
+                            .unwrap_or(fallback)
                     };
                     let (si, ai) = (col("session", 1), col("agent", 2));
-                    for c in changes.iter().filter(|c| c.op == crate::journal::Op::Insert) {
+                    for c in changes
+                        .iter()
+                        .filter(|c| c.op == crate::journal::Op::Insert)
+                    {
                         let text = |i: usize| match c.new.as_ref().and_then(|v| v.get(i)) {
                             Some(Some(crate::journal::Cell::Text(t))) => t.clone(),
                             _ => String::new(),
@@ -807,7 +860,8 @@ impl<'a> Reader<'a> {
 }
 
 fn starts_with_word(sql: &str, word: &str) -> bool {
-    sql.get(..word.len()).is_some_and(|p| p.eq_ignore_ascii_case(word))
+    sql.get(..word.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(word))
 }
 
 /// Check an event's CRC32, when the server sends one.
@@ -818,7 +872,8 @@ fn verify_checksum(event: &mysql_async::binlog::events::Event) -> Result<(), Str
     }
     if let (Ok(Some(BinlogChecksumAlg::BINLOG_CHECKSUM_ALG_CRC32)), Some(sum)) =
         (footer.get_checksum_alg(), event.checksum())
-        && u32::from_le_bytes(sum) != event.calc_checksum(BinlogChecksumAlg::BINLOG_CHECKSUM_ALG_CRC32)
+        && u32::from_le_bytes(sum)
+            != event.calc_checksum(BinlogChecksumAlg::BINLOG_CHECKSUM_ALG_CRC32)
     {
         return Err("a binlog event failed its checksum".to_string());
     }
@@ -896,19 +951,25 @@ pub async fn doctor(config: &Config) -> (Section, Result<(), String>) {
 
 async fn doctor_checks(config: &Config, findings: &mut Vec<Finding>) -> Result<(), String> {
     let mut undo: Result<(), String> = Ok(());
-    let fail = |findings: &mut Vec<Finding>, undo: &mut Result<(), String>, text: String, short: &str| {
-        findings.push(Finding {
-            status: Status::Fail,
-            text,
-        });
-        if undo.is_ok() {
-            *undo = Err(short.to_string());
-        }
-    };
+    let fail =
+        |findings: &mut Vec<Finding>, undo: &mut Result<(), String>, text: String, short: &str| {
+            findings.push(Finding {
+                status: Status::Fail,
+                text,
+            });
+            if undo.is_ok() {
+                *undo = Err(short.to_string());
+            }
+        };
     let mut conn = match connect(config).await {
         Ok(c) => c,
         Err(e) => {
-            fail(findings, &mut undo, e.clone(), "the journal login cannot connect");
+            fail(
+                findings,
+                &mut undo,
+                e.clone(),
+                "the journal login cannot connect",
+            );
             return undo;
         }
     };
@@ -920,7 +981,12 @@ async fn doctor_checks(config: &Config, findings: &mut Vec<Finding>) -> Result<(
     let settings_ok = !settings.iter().any(|f| f.status == Status::Fail);
     findings.extend(settings);
     if !settings_ok {
-        fail(findings, &mut undo, "the binlog settings above must change before undo can work".to_string(), "the binlog settings do not allow it");
+        fail(
+            findings,
+            &mut undo,
+            "the binlog settings above must change before undo can work".to_string(),
+            "the binlog settings do not allow it",
+        );
         return undo;
     }
 
@@ -938,7 +1004,12 @@ async fn doctor_checks(config: &Config, findings: &mut Vec<Finding>) -> Result<(
             text: format!("tag table {db}.{table} exists"),
         });
     } else {
-        fail(findings, &mut undo, format!("tag table {db}.{table} does not exist; run `ariodb setup`"), "not set up (run ariodb setup)");
+        fail(
+            findings,
+            &mut undo,
+            format!("tag table {db}.{table} does not exist; run `ariodb setup`"),
+            "not set up (run ariodb setup)",
+        );
     }
 
     let logs: Result<Vec<mysql_async::Row>, _> = conn.query("SHOW BINARY LOGS").await;
@@ -954,7 +1025,10 @@ async fn doctor_checks(config: &Config, findings: &mut Vec<Finding>) -> Result<(
             fail(
                 findings,
                 &mut undo,
-                format!("cannot list binlogs ({}); GRANT REPLICATION CLIENT ON *.* to the journal login", message(&e)),
+                format!(
+                    "cannot list binlogs ({}); GRANT REPLICATION CLIENT ON *.* to the journal login",
+                    message(&e)
+                ),
                 "the journal login lacks REPLICATION CLIENT",
             );
             Vec::new()
@@ -1011,7 +1085,9 @@ async fn doctor_checks(config: &Config, findings: &mut Vec<Finding>) -> Result<(
                 Err(e) => fail(
                     findings,
                     &mut undo,
-                    format!("the binlog cannot be read: {e}; GRANT REPLICATION SLAVE ON *.* to the journal login"),
+                    format!(
+                        "the binlog cannot be read: {e}; GRANT REPLICATION SLAVE ON *.* to the journal login"
+                    ),
                     "the binlog cannot be read",
                 ),
             },
@@ -1112,7 +1188,10 @@ tables = ["customers"]
 
     #[test]
     fn tag_table_defaults_to_the_agents_database() {
-        assert_eq!(tag_table(&config("")), ("ariodb".into(), "session_tags".into()));
+        assert_eq!(
+            tag_table(&config("")),
+            ("ariodb".into(), "session_tags".into())
+        );
         assert_eq!(
             tag_table(&config("tag_table = \"tags\"")),
             ("shop".into(), "tags".into())
