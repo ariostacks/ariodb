@@ -303,6 +303,18 @@ stage = "after"
 condition = "'customers' in effects.tables && effects.rows > 30"
 verdict = "deny"
 reason = "changes of over 30 rows that touch customers need a human"
+
+[[rules]]
+name = "marked-on-readonly-login"
+condition = "agent.credential == 'pg-readonly' && sql.statement.contains('/*login-check*/')"
+verdict = "deny"
+reason = "refused on the read-only login"
+
+[[rules]]
+name = "marked-on-default-login"
+condition = "agent.credential == '' && sql.statement.contains('/*default-login-check*/')"
+verdict = "deny"
+reason = "refused on the default login"
 EOF
 export E2E_AGENT_TOKEN=agent-token-local-test-only E2E_BOT_TOKEN=bot-token-local-test-only
 export E2E_SLACK_BOT=xoxb-not-a-real-token E2E_SLACK_SIGNING=slack-signing-test-only
@@ -369,6 +381,10 @@ echo "rules"
 expect "rule denies by function" "Filesystem-reaching" "$(agent coding-agent $T "SELECT pg_ls_dir('.')")"
 expect "after-stage rule rolls back" "over 30 rows" "$(agent coding-agent $T "DELETE FROM customers WHERE id IN (4, 5)")"
 expect "after-stage rollback left no trace" "2" "$(admin -tAc "SELECT count(*) FROM customers WHERE id IN (4, 5)")"
+expect "rules see the agent's database login" "refused on the read-only login" "$(agent support-bot $E2E_BOT_TOKEN "SELECT 1 /*login-check*/")"
+expect "  which other logins do not match" "(1 row)" "$(agent coding-agent $T "SELECT 1 /*login-check*/")"
+expect "  and the default login is the empty string" "refused on the default login" "$(agent coding-agent $T "SELECT 1 /*default-login-check*/")"
+expect "  which a named login does not match" "(1 row)" "$(agent support-bot $E2E_BOT_TOKEN "SELECT 1 /*default-login-check*/")"
 cp "$WORK/ariodb.toml" "$WORK/ariodb.toml.orig"
 cat >> "$WORK/ariodb.toml" <<'TOML'
 

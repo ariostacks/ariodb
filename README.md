@@ -297,6 +297,7 @@ matches everything. A condition that fails to evaluate counts as a deny.
 | `sql.database` | string | The database the agent is using |
 | `sql.engine` | string | `postgres` or `clickhouse` |
 | `agent.name`, `agent.access` | string | Who is asking |
+| `agent.credential` | string | The [`[[credentials]]`](#credentials) login the agent's Postgres queries run as, or `""` for `[database]` |
 | `effects.rows` | int | Rows changed (after-stage only) |
 | `effects.tables` | list | Tables changed, including by triggers and cascades (after-stage only) |
 | `plugin.<name>.<key>` | any | Facts from a [plugin](#plugins) (before-stage only) |
