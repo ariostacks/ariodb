@@ -29,6 +29,7 @@ import {
 import { api, errorText, type AgentSession, type UndoPlan } from "@/lib/api"
 import { ago, plural, when } from "@/lib/format"
 import { useApi } from "@/lib/hooks"
+import { useCan } from "@/lib/me"
 
 const SHOWN_STEPS = 200
 
@@ -60,6 +61,7 @@ function PlanSheet({
   const [confirming, setConfirming] = useState(false)
   const [running, setRunning] = useState(false)
   const [done, setDone] = useState<number | null>(null)
+  const admin = useCan("admin")
   const id = session?.session
 
   // The page gives each session its own instance (see `key` below), so the
@@ -174,7 +176,8 @@ function PlanSheet({
           )}
         </div>
         <SheetFooter className="border-t">
-          {conflicts > 0 && done === null && (
+          {!admin && <p className="text-sm text-muted-foreground">Undoing a session needs the admin role.</p>}
+          {admin && conflicts > 0 && done === null && (
             <div className="flex items-start gap-2">
               <Checkbox id="skip-conflicts" checked={skip} onCheckedChange={(v) => setSkip(v === true)} />
               <Label htmlFor="skip-conflicts" className="leading-snug font-normal">
@@ -182,10 +185,12 @@ function PlanSheet({
               </Label>
             </div>
           )}
-          <Button variant="destructive" disabled={!canUndo || running} onClick={() => setConfirming(true)}>
-            {running ? <Loader2Icon className="animate-spin" /> : <Undo2Icon />}
-            {plan ? `Undo ${plural(plan.steps.length, "change")}` : "Undo"}
-          </Button>
+          {admin && (
+            <Button variant="destructive" disabled={!canUndo || running} onClick={() => setConfirming(true)}>
+              {running ? <Loader2Icon className="animate-spin" /> : <Undo2Icon />}
+              {plan ? `Undo ${plural(plan.steps.length, "change")}` : "Undo"}
+            </Button>
+          )}
         </SheetFooter>
       </SheetContent>
       <AlertDialog open={confirming} onOpenChange={setConfirming}>

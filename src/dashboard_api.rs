@@ -1,10 +1,13 @@
-//! The dashboard's JSON API beyond login and approvals. Reads need a
-//! logged-in user; changes also need the CSRF token (see dashboard.rs).
+//! The dashboard's JSON API beyond login and approvals. Every endpoint
+//! checks the caller's role: viewers read, admins change ariodb itself
+//! (config, rules from decisions, undo, users, secrets). Changes also need
+//! the CSRF token (see dashboard.rs).
 
 use crate::audit::{self, Filter};
 use crate::config::Config;
-use crate::dashboard::{ApiError, require_user, require_writer};
+use crate::dashboard::{ApiError, require_role, require_user, require_writer};
 use crate::gate::State;
+use crate::store::Role;
 use crate::{journal, testing, undo};
 use axum::extract::{Path, Query, State as AxState};
 use axum::http::{HeaderMap, StatusCode};
@@ -31,6 +34,8 @@ pub fn routes() -> Router<Arc<State>> {
         .route("/api/secrets", get(list_secrets))
         .route("/api/secrets/{name}", post(set_secret))
         .route("/api/users", get(list_users).post(add_user))
+        .route("/api/users/{name}", axum::routing::delete(remove_user))
+        .route("/api/users/{name}/role", post(set_user_role))
         .route("/api/audit/verify", get(verify_audit))
         .route("/api/plugins", get(list_plugins))
 }
@@ -80,8 +85,20 @@ async fn decisions(
     Query(f): Query<Filter>,
 ) -> Result<Json<Value>, ApiError> {
     require_user(&state, &headers)?;
-    let items = audit::query(&state_dir(&state), &f)?;
-    Ok(Json(json!({ "decisions": items })))
+    let dir = state_dir(&state);
+    let items = audit::query(&dir, &f).map_err(bad)?;
+    let ids: Vec<i64> = items.iter().map(|d| d.id).collect();
+    let mut deciders = audit::deciders(&dir, &ids)?;
+    let items: Vec<Value> = items
+        .into_iter()
+        .map(|d| {
+            let by = deciders.remove(&d.id).unwrap_or_default();
+            let mut v = json!(d);
+            v["decided_by"] = json!(by);
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "decisions": items, "deciders": state.db.deciders()? })))
 }
 
 async fn decision_fixture(
@@ -294,7 +311,9 @@ async fn get_config(
     AxState(state): AxState<Arc<State>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    require_user(&state, &headers)?;
+    // Admins only: the config names webhook addresses and other settings
+    // that viewers have no need to see.
+    require_role(&state, &headers, Role::Admin)?;
     let text = mask(&std::fs::read_to_string(&state.config_path).map_err(|e| e.to_string())?);
     Ok(Json(json!({
         "text": text,
@@ -313,7 +332,7 @@ async fn check_config(
     headers: HeaderMap,
     Json(body): Json<ConfigBody>,
 ) -> Result<Json<Value>, ApiError> {
-    require_user(&state, &headers)?;
+    require_role(&state, &headers, Role::Admin)?;
     Ok(Json(match Config::from_toml(&body.text) {
         Ok(c) => {
             json!({ "ok": true, "agents": c.agents.len(), "rules": c.rules.len(), "approvers": c.approvers.len() })
@@ -372,7 +391,7 @@ async fn block_like(
     let user = if body.apply {
         require_writer(&state, &headers)?
     } else {
-        require_user(&state, &headers)?
+        require_role(&state, &headers, Role::Admin)?
     };
     let d = audit::get(&state_dir(&state), body.decision)?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no such decision".into()))?;
@@ -491,7 +510,7 @@ async fn list_secrets(
     AxState(state): AxState<Arc<State>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    require_user(&state, &headers)?;
+    require_role(&state, &headers, Role::Admin)?;
     let store = crate::secrets::Store::open(FsPath::new(&state.config().journal.dir))?;
     Ok(Json(json!({ "secrets": store.names()? })))
 }
@@ -531,12 +550,13 @@ async fn list_users(
     AxState(state): AxState<Arc<State>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    require_user(&state, &headers)?;
-    let users: Vec<String> = state.db.with(|c| {
-        let mut stmt = c.prepare("SELECT name FROM dashboard_users ORDER BY name")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        rows.collect()
-    })?;
+    require_role(&state, &headers, Role::Admin)?;
+    let users: Vec<Value> = state
+        .db
+        .users()?
+        .into_iter()
+        .map(|(name, role)| json!({ "name": name, "role": role }))
+        .collect();
     Ok(Json(json!({ "users": users })))
 }
 
@@ -544,8 +564,12 @@ async fn list_users(
 struct UserBody {
     name: String,
     password: String,
+    /// For a new user; default viewer. An existing user keeps their role
+    /// unless one is given.
+    role: Option<Role>,
 }
 
+/// Add a local user, or set a new password for one.
 async fn add_user(
     AxState(state): AxState<Arc<State>>,
     headers: HeaderMap,
@@ -560,11 +584,62 @@ async fn add_user(
     {
         return Err(bad("user names use letters, digits and - _ . @"));
     }
-    crate::dashboard::set_password(&state.db, &body.name, &body.password).map_err(bad)?;
+    let exists = state.db.users()?.iter().any(|(n, _)| *n == body.name);
+    let role = match body.role {
+        Some(r) => Some(r),
+        None if exists => None,
+        None => Some(Role::Viewer),
+    };
+    crate::dashboard::set_password(&state.db, &body.name, &body.password, role).map_err(bad)?;
     println!(
-        "ariodb: {} set the password for dashboard user '{}'",
-        user.name, body.name
+        "ariodb: {} set the password for dashboard user '{}'{}",
+        user.name,
+        body.name,
+        role.map(|r| format!(" ({})", r.as_str()))
+            .unwrap_or_default()
     );
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RoleBody {
+    role: Role,
+}
+
+async fn set_user_role(
+    AxState(state): AxState<Arc<State>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<RoleBody>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_writer(&state, &headers)?;
+    if name == "root" {
+        return Err(bad("root is always an admin"));
+    }
+    if !state.db.set_role(&name, body.role)? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "no such user".into()));
+    }
+    println!(
+        "ariodb: {} made dashboard user '{name}' a {}",
+        user.name,
+        body.role.as_str()
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn remove_user(
+    AxState(state): AxState<Arc<State>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_writer(&state, &headers)?;
+    if name == "root" {
+        return Err(bad("root cannot be removed; set a new password instead"));
+    }
+    if !state.db.remove_user(&name)? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "no such user".into()));
+    }
+    println!("ariodb: {} removed dashboard user '{name}'", user.name);
     Ok(Json(json!({ "ok": true })))
 }
 

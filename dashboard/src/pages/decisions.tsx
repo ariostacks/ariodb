@@ -41,12 +41,27 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { api, errorText, type BlockLike, type ConfigFile, type Decision } from "@/lib/api"
-import { ago, copyText, when } from "@/lib/format"
+import { ago, copyText, deciderLabel, when } from "@/lib/format"
 import { useApi } from "@/lib/hooks"
+import { useCan } from "@/lib/me"
 
-type Filters = { agent: string; outcome: string; rule: string; q: string; limit: string }
+type Filters = {
+  agent: string
+  outcome: string
+  rule: string
+  q: string
+  decided_by: string
+  decided_by_kind: string
+  limit: string
+}
 
 const OUTCOMES = ["allowed", "refused", "rolled_back", "failed"]
+const DECIDER_KINDS = [
+  { value: "person", label: "Decided by a person" },
+  { value: "model", label: "Decided by a model" },
+  { value: "plugin", label: "Decided by a plugin" },
+]
+const EMPTY: Filters = { agent: "", outcome: "", rule: "", q: "", decided_by: "", decided_by_kind: "", limit: "200" }
 const LIMITS = ["100", "200", "500", "1000"]
 const ANY = "any"
 
@@ -57,6 +72,10 @@ function readFilters(): Filters {
     outcome: p.get("outcome") ?? "",
     rule: p.get("rule") ?? "",
     q: p.get("q") ?? "",
+    decided_by: p.get("decided_by") ?? "",
+    decided_by_kind: DECIDER_KINDS.some((k) => k.value === p.get("decided_by_kind"))
+      ? p.get("decided_by_kind")!
+      : "",
     limit: LIMITS.includes(p.get("limit") ?? "") ? p.get("limit")! : "200",
   }
 }
@@ -178,9 +197,10 @@ function BlockDialog({ decision, onClose }: { decision: Decision | null; onClose
 export function DecisionsPage() {
   const [form, setForm] = useState<Filters>(readFilters)
   const [applied, setApplied] = useState<Filters>(form)
-  const { data, error, loading, reload } = useApi<{ decisions: Decision[] }>(
+  const { data, error, loading, reload } = useApi<{ decisions: Decision[]; deciders: string[] }>(
     `/api/decisions?${query(applied)}`
   )
+  const admin = useCan("admin")
   const [blocking, setBlocking] = useState<Decision | null>(null)
   const [fixture, setFixture] = useState<string | null>(null)
 
@@ -193,9 +213,8 @@ export function DecisionsPage() {
   }
 
   function reset() {
-    const empty = { agent: "", outcome: "", rule: "", q: "", limit: "200" }
-    setForm(empty)
-    setApplied(empty)
+    setForm(EMPTY)
+    setApplied(EMPTY)
     history.replaceState(null, "", "/decisions")
   }
 
@@ -236,6 +255,18 @@ export function DecisionsPage() {
       sortFn: "text",
       cell: ({ getValue }) => <span className="font-mono text-xs">{getValue()}</span>,
     }),
+    col.accessor((d) => d.decided_by.join(", "), {
+      id: "decided_by",
+      header: "Decided by",
+      sortFn: "text",
+      cell: ({ row }) => (
+        <div className="flex max-w-[24ch] flex-col text-xs whitespace-normal">
+          {row.original.decided_by.map((by) => (
+            <span key={by}>{deciderLabel(by)}</span>
+          ))}
+        </div>
+      ),
+    }),
     col.accessor((d) => d.rows ?? -1, {
       id: "rows",
       header: "Rows",
@@ -275,10 +306,12 @@ export function DecisionsPage() {
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-44">
-              <DropdownMenuItem onSelect={() => setBlocking(d)}>
-                <BanIcon />
-                Block like this
-              </DropdownMenuItem>
+              {admin && (
+                <DropdownMenuItem onSelect={() => setBlocking(d)}>
+                  <BanIcon />
+                  Block like this
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem disabled={!fixtureable} onSelect={() => void copyAsTest(d)}>
                 <ClipboardCopyIcon />
                 Copy as test
@@ -289,7 +322,7 @@ export function DecisionsPage() {
       },
     }),
     ])
-  }, [])
+  }, [admin])
 
   return (
     <PageBody intro="Every statement agents sent, and what ariodb did with it. Filters run on the server; the newest come first.">
@@ -331,6 +364,37 @@ export function DecisionsPage() {
           onChange={(e) => setForm({ ...form, q: e.target.value })}
           className="@3xl/main:w-56"
         />
+        <Select
+          value={form.decided_by_kind || ANY}
+          onValueChange={(v) => setForm({ ...form, decided_by_kind: v === ANY ? "" : v })}
+        >
+          <SelectTrigger aria-label="Kind of decider" className="w-full @3xl/main:w-48">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ANY}>Any decider</SelectItem>
+            {DECIDER_KINDS.map((k) => (
+              <SelectItem key={k.value} value={k.value}>
+                {k.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Input
+          placeholder="Decided by"
+          aria-label="Decided by"
+          list="deciders"
+          value={form.decided_by}
+          onChange={(e) => setForm({ ...form, decided_by: e.target.value })}
+          className="@3xl/main:w-56"
+        />
+        <datalist id="deciders">
+          {(data?.deciders ?? []).map((d) => (
+            <option key={d} value={d}>
+              {deciderLabel(d)}
+            </option>
+          ))}
+        </datalist>
         <Select value={form.limit} onValueChange={(v) => setForm({ ...form, limit: v })}>
           <SelectTrigger aria-label="How many" className="w-full @3xl/main:w-32">
             <SelectValue />
@@ -364,7 +428,7 @@ export function DecisionsPage() {
           getRowId={(d) => String(d.id)}
           empty="No decisions match."
           pageSize={25}
-          minWidth="64rem"
+          minWidth="72rem"
         />
       )}
       <BlockDialog key={blocking?.id ?? "none"} decision={blocking} onClose={() => setBlocking(null)} />

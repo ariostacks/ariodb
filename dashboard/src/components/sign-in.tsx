@@ -1,6 +1,8 @@
 // Sign-in and first-run password setup, built from the shadcn login-03 block.
+// With single sign-on, its button comes first; a local password is then
+// for break-glass use only, or switched off.
 import { useState, type FormEvent } from "react"
-import { AlertCircleIcon, Loader2Icon } from "lucide-react"
+import { AlertCircleIcon, KeyRoundIcon, Loader2Icon, LogInIcon } from "lucide-react"
 import { Logo } from "@/components/logo"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -11,20 +13,18 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { Field, FieldDescription, FieldGroup, FieldLabel, FieldSeparator } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { api, errorText, type Session } from "@/lib/api"
+import { api, errorText, type Session, type SignedOut } from "@/lib/api"
 
 const MIN_PASSWORD = 12
 
-export function SignIn({
-  needsSetup,
-  onSignedIn,
-}: {
-  needsSetup: boolean
-  onSignedIn: (s: Session) => void
-}) {
-  const [user, setUser] = useState("root")
+export function SignIn({ how, onSignedIn }: { how: SignedOut; onSignedIn: (s: Session) => void }) {
+  const needsSetup = how.needs_setup
+  const sso = how.sso
+  // Under single sign-on the password form waits behind a button.
+  const [showPassword, setShowPassword] = useState(how.password_login === "primary")
+  const [user, setUser] = useState(sso ? "" : "root")
   const [password, setPassword] = useState("")
   const [repeat, setRepeat] = useState("")
   const [error, setError] = useState<string | null>(null)
@@ -75,69 +75,100 @@ export function SignIn({
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <form onSubmit={submit} noValidate={needsSetup}>
-              <FieldGroup>
-                {!needsSetup && (
-                  <Field>
-                    <FieldLabel htmlFor="user">User name</FieldLabel>
-                    <Input
-                      id="user"
-                      autoComplete="username"
-                      value={user}
-                      onChange={(e) => setUser(e.target.value)}
-                      required
-                    />
-                  </Field>
-                )}
-                {needsSetup && <input type="hidden" autoComplete="username" value="root" readOnly />}
+            <FieldGroup>
+              {sso && (
                 <Field>
-                  <FieldLabel htmlFor="password">Password</FieldLabel>
-                  <Input
-                    id="password"
-                    type="password"
-                    autoComplete={needsSetup ? "new-password" : "current-password"}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    autoFocus
-                    required
-                  />
-                  {needsSetup && (
-                    <FieldDescription>At least {MIN_PASSWORD} characters.</FieldDescription>
-                  )}
-                </Field>
-                {needsSetup && (
-                  <Field>
-                    <FieldLabel htmlFor="repeat">Repeat the password</FieldLabel>
-                    <Input
-                      id="repeat"
-                      type="password"
-                      autoComplete="new-password"
-                      value={repeat}
-                      onChange={(e) => setRepeat(e.target.value)}
-                      required
-                    />
-                  </Field>
-                )}
-                {error && (
-                  <Alert variant="destructive" role="alert">
-                    <AlertCircleIcon />
-                    <AlertDescription>{error}</AlertDescription>
-                  </Alert>
-                )}
-                <Field>
-                  <Button type="submit" disabled={busy}>
-                    {busy && <Loader2Icon className="animate-spin" />}
-                    {needsSetup ? "Set password and sign in" : "Sign in"}
+                  <Button asChild size="lg">
+                    <a href={sso.login_url}>
+                      <LogInIcon />
+                      Sign in with {sso.provider}
+                    </a>
                   </Button>
                 </Field>
-              </FieldGroup>
-            </form>
+              )}
+              {sso && how.password_login === "break_glass" && !showPassword && (
+                <Field>
+                  <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setShowPassword(true)}>
+                    <KeyRoundIcon />
+                    Use a local password instead
+                  </Button>
+                </Field>
+              )}
+              {sso && showPassword && (
+                <FieldSeparator className="*:data-[slot=field-separator-content]:bg-card">
+                  Break-glass password
+                </FieldSeparator>
+              )}
+              {showPassword && (
+                <form onSubmit={submit} noValidate={needsSetup}>
+                  <FieldGroup>
+                    {!needsSetup && (
+                      <Field>
+                        <FieldLabel htmlFor="user">User name</FieldLabel>
+                        <Input
+                          id="user"
+                          autoComplete="username"
+                          value={user}
+                          onChange={(e) => setUser(e.target.value)}
+                          required
+                        />
+                      </Field>
+                    )}
+                    {needsSetup && <input type="hidden" autoComplete="username" value="root" readOnly />}
+                    <Field>
+                      <FieldLabel htmlFor="password">Password</FieldLabel>
+                      <Input
+                        id="password"
+                        type="password"
+                        autoComplete={needsSetup ? "new-password" : "current-password"}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        autoFocus
+                        required
+                      />
+                      {needsSetup && (
+                        <FieldDescription>At least {MIN_PASSWORD} characters.</FieldDescription>
+                      )}
+                    </Field>
+                    {needsSetup && (
+                      <Field>
+                        <FieldLabel htmlFor="repeat">Repeat the password</FieldLabel>
+                        <Input
+                          id="repeat"
+                          type="password"
+                          autoComplete="new-password"
+                          value={repeat}
+                          onChange={(e) => setRepeat(e.target.value)}
+                          required
+                        />
+                      </Field>
+                    )}
+                    {error && (
+                      <Alert variant="destructive" role="alert">
+                        <AlertCircleIcon />
+                        <AlertDescription>{error}</AlertDescription>
+                      </Alert>
+                    )}
+                    <Field>
+                      <Button type="submit" variant={sso ? "outline" : "default"} disabled={busy}>
+                        {busy && <Loader2Icon className="animate-spin" />}
+                        {needsSetup ? "Set password and sign in" : "Sign in"}
+                      </Button>
+                    </Field>
+                  </FieldGroup>
+                </form>
+              )}
+            </FieldGroup>
           </CardContent>
         </Card>
         <FieldDescription className="px-6 text-center">
           {needsSetup
             ? "This works only from the server itself. Elsewhere, run ariodb dashboard-password."
-            : "Forgotten the password? Run ariodb dashboard-password on the server."}
+            : sso
+              ? how.password_login === "off"
+                ? `Local passwords are switched off. Ask an admin if ${sso.provider} lets you in but ariodb does not.`
+                : "Local passwords are for when single sign-on is unavailable."
+              : "Forgotten the password? Run ariodb dashboard-password on the server."}
         </FieldDescription>
       </div>
     </div>

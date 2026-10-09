@@ -14,6 +14,8 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 import { EllipsisVerticalIcon, LogOutIcon, Settings2Icon } from "lucide-react"
+import { ROLES } from "@/lib/api"
+import { useMe } from "@/lib/me"
 import { navigate } from "@/lib/router"
 
 function initials(name: string) {
@@ -21,8 +23,12 @@ function initials(name: string) {
   return (parts.length > 1 ? parts[0][0] + parts[1][0] : name.slice(0, 2)).toUpperCase()
 }
 
-export function NavUser({ user, onSignOut }: { user: string; onSignOut: () => void }) {
+export function NavUser({ onSignOut }: { onSignOut: () => void }) {
   const { isMobile, setOpenMobile } = useSidebar()
+  const me = useMe()
+  const user = me.email ?? me.user
+  const role = ROLES.find((r) => r.role === me.role)?.label ?? me.role
+  const how = me.method === "sso" ? `Signed in with ${me.provider ?? "single sign-on"}` : "Local password"
   const avatar = (
     <Avatar className="h-8 w-8 rounded-lg">
       <AvatarFallback className="rounded-lg">{initials(user)}</AvatarFallback>
@@ -40,7 +46,7 @@ export function NavUser({ user, onSignOut }: { user: string; onSignOut: () => vo
               {avatar}
               <div className="grid flex-1 text-left text-sm leading-tight">
                 <span className="truncate font-medium">{user}</span>
-                <span className="truncate text-xs text-muted-foreground">Dashboard user</span>
+                <span className="truncate text-xs text-muted-foreground">{role}</span>
               </div>
               <EllipsisVerticalIcon className="ml-auto size-4" />
             </SidebarMenuButton>
@@ -56,7 +62,9 @@ export function NavUser({ user, onSignOut }: { user: string; onSignOut: () => vo
                 {avatar}
                 <div className="grid flex-1 text-left text-sm leading-tight">
                   <span className="truncate font-medium">{user}</span>
-                  <span className="truncate text-xs text-muted-foreground">Signed in</span>
+                  <span className="truncate text-xs text-muted-foreground">
+                    {role} · {how}
+                  </span>
                 </div>
               </div>
             </DropdownMenuLabel>

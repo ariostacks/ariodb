@@ -20,6 +20,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar"
+import { useCan } from "@/lib/me"
 import { linkClick, type Page } from "@/lib/router"
 
 export const titles: Record<Page, string> = {
@@ -33,24 +34,23 @@ export const titles: Record<Page, string> = {
 }
 
 export function AppSidebar({
-  user,
   current,
   pending,
   onSignOut,
   ...props
 }: React.ComponentProps<typeof Sidebar> & {
-  user: string
   current: Page
   pending: number
   onSignOut: () => void
 }) {
+  const admin = useCan("admin")
   const main: NavItem[] = [
     { title: titles["/"], url: "/", icon: <LayoutDashboardIcon /> },
     { title: titles["/approvals"], url: "/approvals", icon: <InboxIcon />, badge: pending },
     { title: titles["/decisions"], url: "/decisions", icon: <ScrollTextIcon /> },
     { title: titles["/sessions"], url: "/sessions", icon: <HistoryIcon /> },
     { title: titles["/rules"], url: "/rules", icon: <ScaleIcon /> },
-    { title: titles["/config"], url: "/config", icon: <FileCode2Icon /> },
+    ...(admin ? [{ title: titles["/config"], url: "/config" as const, icon: <FileCode2Icon /> }] : []),
   ]
   const secondary: NavItem[] = [
     { title: titles["/settings"], url: "/settings", icon: <Settings2Icon /> },
@@ -74,7 +74,7 @@ export function AppSidebar({
         <NavMain items={secondary} current={current} className="mt-auto" />
       </SidebarContent>
       <SidebarFooter>
-        <NavUser user={user} onSignOut={onSignOut} />
+        <NavUser onSignOut={onSignOut} />
       </SidebarFooter>
     </Sidebar>
   )

@@ -1,19 +1,24 @@
 //! The dashboard: a web app and JSON API for people, plus the callback
-//! endpoints approvers use (signed webhook links, Slack buttons).
+//! endpoints approvers use (signed approval links, Slack buttons).
 //!
-//! Security: every management endpoint needs a logged-in session. Sessions
-//! are random tokens in an HttpOnly, SameSite=Strict cookie, stored only as
-//! SHA-256 hashes. Every state-changing request must also carry the
-//! session's CSRF token in `x-ariodb-csrf` and, when the browser sends one,
-//! an Origin that matches the dashboard. The first password can be set from
-//! this machine only (or with `ariodb dashboard-password`).
+//! Security: every management endpoint needs a signed-in session with a
+//! role that allows it (viewer, approver, admin), checked here on the
+//! server, not only in the app. Sessions are random tokens in an HttpOnly,
+//! SameSite=Strict cookie, stored only as SHA-256 hashes. Every
+//! state-changing request must also carry the session's CSRF token in
+//! `x-ariodb-csrf` and, when the browser sends one, an Origin that matches
+//! the dashboard. People sign in with a local password or, when
+//! `[dashboard.oidc]` is set, with single sign-on (see oidc.rs). The first
+//! password can be set from this machine only (or with
+//! `ariodb dashboard-password`).
 
+use crate::config::Config;
 use crate::gate::State;
-use crate::store;
+use crate::store::{self, Role};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use axum::extract::{ConnectInfo, Path, Query, State as AxState};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,6 +31,16 @@ use std::sync::Arc;
 
 const SESSION_HOURS: i64 = 12;
 const COOKIE: &str = "ariodb_session";
+
+/// The app's own pages (see dashboard/src/lib/router.ts).
+pub const PAGES: &[&str] = &[
+    "/approvals",
+    "/decisions",
+    "/sessions",
+    "/rules",
+    "/config",
+    "/settings",
+];
 
 pub async fn serve(state: Arc<State>) -> Result<(), String> {
     let config = state.config();
@@ -60,12 +75,30 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/me", get(me))
         .route("/api/approvals", get(list_approvals))
         .route("/api/approvals/{id}", post(decide_approval))
+        .route("/auth/login", get(crate::oidc::login))
         .route("/hooks/approvals/{id}", get(hook_confirm).post(hook_decide))
         .route("/slack/actions", post(slack_actions))
         .merge(api)
-        // The app's own pages and files (see dashboard_files.rs).
-        .fallback(crate::dashboard_files::serve)
+        // The single sign-on callback (its path is configurable, so it is
+        // matched here), then the app's own pages and files.
+        .fallback(fallback)
         .with_state(state)
+}
+
+async fn fallback(
+    AxState(state): AxState<Arc<State>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let config = state.config();
+    if method == Method::GET
+        && let Some(o) = &config.dashboard.oidc
+        && uri.path() == o.redirect_path
+    {
+        return crate::oidc::callback(&state, &headers, uri.query().unwrap_or("")).await;
+    }
+    crate::dashboard_files::serve(method, uri).await
 }
 
 // ---------------------------------------------------------------------------
@@ -85,51 +118,114 @@ impl From<String> for ApiError {
     }
 }
 
+/// A signed-in person and what they may do.
 pub struct User {
     pub name: String,
+    pub role: Role,
+    pub email: Option<String>,
+    /// Single sign-on groups; none for local users.
+    pub groups: Vec<String>,
+    /// Signed in with single sign-on rather than a local password.
+    pub sso: bool,
+}
+
+impl User {
+    /// How this person is recorded when they decide an approval.
+    pub fn decider(&self) -> String {
+        if self.sso {
+            format!("sso:{}", self.name)
+        } else {
+            format!("dashboard:{}", self.name)
+        }
+    }
 }
 
 fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-fn cookie_token(headers: &HeaderMap) -> Option<String> {
-    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookies
-        .split(';')
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|c| c.split(';'))
         .map(str::trim)
-        .find_map(|c| c.strip_prefix(&format!("{COOKIE}=")).map(str::to_string))
+        .find_map(|c| c.strip_prefix(&prefix).map(str::to_string))
 }
 
-/// Who is logged in, if anyone. Returns the user and the session's CSRF token.
-fn session(state: &State, headers: &HeaderMap) -> Option<(String, String)> {
-    let token = cookie_token(headers)?;
-    let hash = hash_token(&token);
-    state
-        .db
-        .with(|c| {
-            c.query_row(
-                "SELECT user, csrf FROM dashboard_sessions WHERE token_hash = ?1 AND expires_ms > ?2",
-                params![hash, store::now_ms()],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()
-        })
-        .ok()
-        .flatten()
+/// `; Secure` when the dashboard is served over https.
+pub(crate) fn secure_flag(config: &Config) -> &'static str {
+    if config.dashboard.public_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    }
 }
 
-/// For reads: a logged-in user.
-pub fn require_user(state: &State, headers: &HeaderMap) -> Result<User, ApiError> {
-    session(state, headers)
-        .map(|(name, _)| User { name })
-        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "log in first".into()))
+/// Who is signed in, if anyone, and the session's CSRF token. The role is
+/// worked out on every request: a local user's from the users table, a
+/// single sign-on user's from their groups and the current config. So a
+/// changed role, a changed group mapping or switched-off password logins
+/// apply at once, not at the next sign-in.
+fn session(state: &State, headers: &HeaderMap) -> Option<(User, String)> {
+    let token = cookie_value(headers, COOKIE)?;
+    let s = state.db.session(&hash_token(&token)).ok()??;
+    let config = state.config();
+    let sso = s.method == "sso";
+    let role = if sso {
+        config.dashboard.oidc.as_ref()?.role_for(&s.groups)?
+    } else if !crate::oidc::password_login_allowed(&config) {
+        return None;
+    } else if s.user == "root" {
+        Role::Admin
+    } else {
+        s.local_role?
+    };
+    Some((
+        User {
+            name: s.user,
+            role,
+            email: s.email,
+            groups: s.groups,
+            sso,
+        },
+        s.csrf,
+    ))
 }
 
-/// For changes: a logged-in user, the right CSRF token, and a same-origin request.
-pub fn require_writer(state: &State, headers: &HeaderMap) -> Result<User, ApiError> {
-    let (name, csrf) = session(state, headers)
-        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "log in first".into()))?;
+fn signed_in(state: &State, headers: &HeaderMap) -> Result<(User, String), ApiError> {
+    session(state, headers).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "log in first".into()))
+}
+
+fn needs(user: &User, role: Role) -> Result<(), ApiError> {
+    if user.role >= role {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::FORBIDDEN,
+            format!(
+                "this needs the {} role; {} has the {} role",
+                role.as_str(),
+                user.name,
+                user.role.as_str()
+            ),
+        ))
+    }
+}
+
+/// For reads: a signed-in user with at least this role.
+pub fn require_role(state: &State, headers: &HeaderMap, role: Role) -> Result<User, ApiError> {
+    let (user, _) = signed_in(state, headers)?;
+    needs(&user, role)?;
+    Ok(user)
+}
+
+/// For changes: a signed-in user with at least this role, the right CSRF
+/// token, and a same-origin request.
+pub fn require_change(state: &State, headers: &HeaderMap, role: Role) -> Result<User, ApiError> {
+    let (user, csrf) = signed_in(state, headers)?;
     let given = headers
         .get("x-ariodb-csrf")
         .and_then(|v| v.to_str().ok())
@@ -141,7 +237,18 @@ pub fn require_writer(state: &State, headers: &HeaderMap) -> Result<User, ApiErr
         ));
     }
     same_origin(headers)?;
-    Ok(User { name })
+    needs(&user, role)?;
+    Ok(user)
+}
+
+/// For reads any signed-in user may make.
+pub fn require_user(state: &State, headers: &HeaderMap) -> Result<User, ApiError> {
+    require_role(state, headers, Role::Viewer)
+}
+
+/// For changes to ariodb itself (config, users, secrets, undo): admins only.
+pub fn require_writer(state: &State, headers: &HeaderMap) -> Result<User, ApiError> {
+    require_change(state, headers, Role::Admin)
 }
 
 fn same_origin(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -162,7 +269,7 @@ fn same_origin(headers: &HeaderMap) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn constant_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_eq(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())
@@ -177,19 +284,39 @@ pub fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-pub fn set_password(state_db: &store::Db, user: &str, password: &str) -> Result<(), String> {
+/// Set a local user's password, adding the user (as an admin, unless
+/// `role` says otherwise) if they are new. An existing user keeps their
+/// role unless `role` is given; root is always an admin.
+pub fn set_password(
+    state_db: &store::Db,
+    user: &str,
+    password: &str,
+    role: Option<Role>,
+) -> Result<(), String> {
     if password.len() < 12 {
         return Err("use a password of at least 12 characters".to_string());
+    }
+    if user == "root" && role.is_some_and(|r| r != Role::Admin) {
+        return Err("root is always an admin".to_string());
     }
     let hash = hash_password(password)?;
     state_db.with(|c| {
         c.execute(
-            "INSERT INTO dashboard_users (name, password_hash, created_ms) VALUES (?1, ?2, ?3)
+            "INSERT INTO dashboard_users (name, password_hash, created_ms, role) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(name) DO UPDATE SET password_hash = excluded.password_hash",
-            params![user, hash, store::now_ms()],
+            params![user, hash, store::now_ms(), role.unwrap_or(Role::Admin).as_str()],
         )?;
+        if let Some(role) = role {
+            c.execute(
+                "UPDATE dashboard_users SET role = ?2 WHERE name = ?1",
+                params![user, role.as_str()],
+            )?;
+        }
         // A new password ends every existing session for that user.
-        c.execute("DELETE FROM dashboard_sessions WHERE user = ?1", [user])?;
+        c.execute(
+            "DELETE FROM dashboard_sessions WHERE user = ?1 AND method = 'password'",
+            [user],
+        )?;
         Ok(())
     })
 }
@@ -219,6 +346,13 @@ async fn setup(
     Json(body): Json<Credentials>,
 ) -> Result<Response, ApiError> {
     same_origin(&headers)?;
+    if state.config().dashboard.oidc.is_some() {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "single sign-on is configured; set a break-glass password with ariodb dashboard-password"
+                .into(),
+        ));
+    }
     if user_count(&state) > 0 {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -232,7 +366,7 @@ async fn setup(
                 .into(),
         ));
     }
-    set_password(&state.db, "root", &body.password)
+    set_password(&state.db, "root", &body.password, Some(Role::Admin))
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     start_session(&state, "root")
 }
@@ -244,6 +378,19 @@ async fn login(
     Json(body): Json<Credentials>,
 ) -> Result<Response, ApiError> {
     same_origin(&headers)?;
+    let config = state.config();
+    if !crate::oidc::password_login_allowed(&config) {
+        let provider = config
+            .dashboard
+            .oidc
+            .as_ref()
+            .map(|o| o.provider_name.clone())
+            .unwrap_or_default();
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            format!("local passwords are switched off; sign in with {provider}"),
+        ));
+    }
     let now = store::now_ms();
     let address = format!("address:{}", addr.ip());
     let user_key = format!("user:{}", body.user);
@@ -291,6 +438,12 @@ async fn login(
         .lock()
         .expect("login limiter")
         .succeeded(&address, &user_key);
+    if config.dashboard.oidc.is_some() {
+        println!(
+            "ariodb: {} signed in to the dashboard with a local password (break glass)",
+            body.user
+        );
+    }
     start_session(&state, &body.user)
 }
 
@@ -357,59 +510,146 @@ impl LoginLimiter {
     }
 }
 
-fn start_session(state: &State, user: &str) -> Result<Response, ApiError> {
+
+/// Start a session; returns its cookie and CSRF token. `sso` carries what
+/// the identity provider said, for single sign-on sessions.
+pub(crate) fn new_session(
+    state: &State,
+    user: &str,
+    sso: Option<&crate::oidc::Identity>,
+) -> Result<(String, String), String> {
     let token = hex::encode(rand::random::<[u8; 32]>());
     let csrf = hex::encode(rand::random::<[u8; 16]>());
-    let expires = store::now_ms() + SESSION_HOURS * 3_600_000;
-    state.db.with(|c| {
-        c.execute("DELETE FROM dashboard_sessions WHERE expires_ms < ?1", [store::now_ms()])?;
-        c.execute(
-            "INSERT INTO dashboard_sessions (token_hash, user, csrf, expires_ms) VALUES (?1, ?2, ?3, ?4)",
-            params![hash_token(&token), user, csrf, expires],
-        )
+    let no_groups = Vec::new();
+    state.db.insert_session(&store::NewSession {
+        token_hash: &hash_token(&token),
+        user,
+        csrf: &csrf,
+        expires_ms: store::now_ms() + SESSION_HOURS * 3_600_000,
+        method: if sso.is_some() { "sso" } else { "password" },
+        subject: sso.map(|s| s.subject.as_str()),
+        email: sso.and_then(|s| s.email.as_deref()),
+        groups: sso.map_or(&no_groups, |s| &s.groups),
     })?;
-    let secure = if state.config().dashboard.public_url.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
     let cookie = format!(
-        "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{secure}",
-        SESSION_HOURS * 3600
+        "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        SESSION_HOURS * 3600,
+        secure_flag(&state.config())
     );
+    Ok((cookie, csrf))
+}
+
+fn start_session(state: &State, user: &str) -> Result<Response, ApiError> {
+    let (cookie, csrf) = new_session(state, user, None)?;
+    let role = state
+        .db
+        .users()?
+        .into_iter()
+        .find(|(name, _)| name == user)
+        .map(|(_, role)| if user == "root" { Role::Admin } else { role })
+        .unwrap_or(Role::Viewer);
+    let me = User {
+        name: user.to_string(),
+        role,
+        email: None,
+        groups: Vec::new(),
+        sso: false,
+    };
     Ok((
         [(header::SET_COOKIE, cookie)],
-        Json(json!({ "user": user, "csrf": csrf })),
+        Json(me_json(&state.config(), &me, &csrf)),
     )
         .into_response())
+}
+
+/// What the app is told about the signed-in user.
+fn me_json(config: &Config, user: &User, csrf: &str) -> Value {
+    json!({
+        "user": user.name,
+        "csrf": csrf,
+        "role": user.role,
+        "email": user.email,
+        "groups": user.groups,
+        "method": if user.sso { "sso" } else { "password" },
+        "provider": config.dashboard.oidc.as_ref().map(|o| o.provider_name.clone()),
+        "config_writes": config.dashboard.config_writes,
+    })
 }
 
 async fn logout(
     AxState(state): AxState<Arc<State>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    require_writer(&state, &headers)?;
-    if let Some(token) = cookie_token(&headers) {
-        state.db.with(|c| {
-            c.execute(
-                "DELETE FROM dashboard_sessions WHERE token_hash = ?1",
-                [hash_token(&token)],
-            )
-        })?;
+    let user = require_change(&state, &headers, Role::Viewer)?;
+    if let Some(token) = cookie_value(&headers, COOKIE) {
+        state.db.end_session(&hash_token(&token))?;
     }
+    let config = state.config();
+    let logout_url = if user.sso {
+        crate::oidc::logout_url(&config).await
+    } else {
+        None
+    };
     let cookie = format!("{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
-    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
+    Ok((
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({ "ok": true, "logout_url": logout_url })),
+    )
+        .into_response())
 }
 
 async fn me(AxState(state): AxState<Arc<State>>, headers: HeaderMap) -> Json<Value> {
+    let config = state.config();
     match session(&state, &headers) {
-        Some((user, csrf)) => Json(json!({ "user": user, "csrf": csrf })),
-        None => Json(json!({ "user": null, "needs_setup": user_count(&state) == 0 })),
+        Some((user, csrf)) => Json(me_json(&config, &user, &csrf)),
+        None => {
+            let oidc = config.dashboard.oidc.as_ref();
+            let password_login = match oidc {
+                None => "primary",
+                Some(o) if o.password_login == crate::oidc::PasswordLogin::Off => "off",
+                Some(_) => "break_glass",
+            };
+            Json(json!({
+                "user": null,
+                "needs_setup": oidc.is_none() && user_count(&state) == 0,
+                "sso": oidc.map(|o| json!({ "provider": o.provider_name, "login_url": "/auth/login" })),
+                "password_login": password_login,
+            }))
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Approvals
+
+/// The single sign-on groups that may decide an approver's requests; empty
+/// when anyone with the approver role may.
+fn decider_groups<'a>(config: &'a Config, approver: &str) -> &'a [String] {
+    config
+        .approvers
+        .iter()
+        .find(|a| a.name == approver)
+        .map_or(&[], |a| a.groups.as_slice())
+}
+
+/// May this person decide a request waiting on this approver?
+pub fn may_decide(config: &Config, user: &User, approver: &str) -> Result<(), String> {
+    if user.role < Role::Approver {
+        return Err(format!(
+            "{} has the {} role; deciding needs the approver role",
+            user.name,
+            user.role.as_str()
+        ));
+    }
+    let groups = decider_groups(config, approver);
+    if !groups.is_empty() && !user.groups.iter().any(|g| groups.contains(g)) {
+        return Err(format!(
+            "only members of {} may decide requests for approver '{approver}'",
+            groups.join(", ")
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 struct ListQuery {
@@ -422,8 +662,19 @@ async fn list_approvals(
     headers: HeaderMap,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    require_user(&state, &headers)?;
-    let items = state.db.approvals(!q.all, 200)?;
+    let user = require_user(&state, &headers)?;
+    let config = state.config();
+    let items: Vec<Value> = state
+        .db
+        .approvals(!q.all, 200)?
+        .into_iter()
+        .map(|a| {
+            let mut v = json!(a);
+            v["decider_groups"] = json!(decider_groups(&config, &a.approver));
+            v["you_may_decide"] = json!(may_decide(&config, &user, &a.approver).is_ok());
+            v
+        })
+        .collect();
     Ok(Json(json!({ "approvals": items })))
 }
 
@@ -439,7 +690,7 @@ async fn decide_approval(
     Path(id): Path<String>,
     Json(body): Json<DecideBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = require_writer(&state, &headers)?;
+    let user = require_change(&state, &headers, Role::Approver)?;
     let allow = match body.verdict.as_str() {
         "allow" => true,
         "deny" => false,
@@ -450,12 +701,15 @@ async fn decide_approval(
             ));
         }
     };
-    let decided = state.db.decide(
-        &id,
-        allow,
-        &format!("dashboard:{}", user.name),
-        body.note.as_deref(),
-    )?;
+    let approval = state
+        .db
+        .approval(&id)?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no such approval request".into()))?;
+    may_decide(&state.config(), &user, &approval.approver)
+        .map_err(|e| ApiError(StatusCode::FORBIDDEN, e))?;
+    let decided = state
+        .db
+        .decide(&id, allow, &user.decider(), body.note.as_deref())?;
     if !decided {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -469,15 +723,59 @@ async fn decide_approval(
 struct HookQuery {
     verdict: String,
     token: String,
+    /// Set on the page's own reload (see `hook_confirm`).
+    #[serde(default)]
+    again: Option<String>,
 }
 
-/// A webhook decision link, opened in a browser. Chat apps and mail
-/// scanners fetch links to preview them, so a GET only shows what would be
-/// decided; the decision itself needs the POST this page's button sends.
+impl HookQuery {
+    /// The link itself, as a path on this dashboard.
+    fn path(&self, id: &str) -> String {
+        format!(
+            "/hooks/approvals/{}?{}",
+            form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>(),
+            form_urlencoded::Serializer::new(String::new())
+                .append_pair("verdict", &self.verdict)
+                .append_pair("token", &self.token)
+                .finish()
+        )
+    }
+}
+
+/// Who may follow an approval link, when links need a signed-in approver.
+enum LinkUser {
+    Allowed(User, String),
+    /// Signed in, but may not decide this request.
+    Refused(String),
+    /// Nobody is signed in (as far as this request shows).
+    Nobody,
+}
+
+fn link_user(state: &State, headers: &HeaderMap, approver: &str) -> LinkUser {
+    match session(state, headers) {
+        None => LinkUser::Nobody,
+        Some((user, csrf)) => match may_decide(&state.config(), &user, approver) {
+            Ok(()) => LinkUser::Allowed(user, csrf),
+            Err(e) => LinkUser::Refused(e),
+        },
+    }
+}
+
+/// An approval link, opened in a browser. Chat apps and mail scanners
+/// fetch links to preview them, so a GET only shows what would be decided;
+/// the decision itself needs the POST this page's button sends.
+///
+/// With `approval_links = "sign_in"` (the default under single sign-on),
+/// the page also needs a signed-in approver. A link clicked in a chat app
+/// or email is a cross-site navigation, so the browser leaves out the
+/// SameSite=Strict session cookie; the page then reloads itself once, as
+/// a same-site navigation that carries the cookie, before asking anyone to
+/// sign in.
 async fn hook_confirm(
     AxState(state): AxState<Arc<State>>,
     Path(id): Path<String>,
     Query(q): Query<HookQuery>,
+    headers: HeaderMap,
 ) -> Response {
     let config = state.config();
     if !matches!(q.verdict.as_str(), "allow" | "deny")
@@ -499,30 +797,86 @@ async fn hook_confirm(
     } else {
         "Deny"
     };
-    let target = format!(
-        "/hooks/approvals/{}?verdict={}&token={}",
-        html_escape(&id),
-        html_escape(&q.verdict),
-        html_escape(&q.token)
-    );
+    let link = q.path(&id);
+    let (signed_in_as, csrf_field) = if config.dashboard.links_need_sign_in() {
+        match link_user(&state, &headers, &a.approver) {
+            LinkUser::Allowed(user, csrf) => (
+                format!(
+                    "<p>Signed in as <b>{}</b>; you will be recorded as the decider.</p>",
+                    html_escape(&user.name)
+                ),
+                format!(
+                    "<input type=\"hidden\" name=\"csrf\" value=\"{}\">",
+                    html_escape(&csrf)
+                ),
+            ),
+            LinkUser::Refused(why) => {
+                return hook_page(
+                    StatusCode::FORBIDDEN,
+                    format!("<p>You may not decide this request: {}.</p>", html_escape(&why)),
+                );
+            }
+            LinkUser::Nobody => {
+                let cross_site = headers
+                    .get("sec-fetch-site")
+                    .and_then(|v| v.to_str().ok())
+                    == Some("cross-site");
+                if cross_site && q.again.is_none() {
+                    let again = format!("{link}&again=1");
+                    return hook_page(
+                        StatusCode::OK,
+                        format!(
+                            "<meta http-equiv=\"refresh\" content=\"0;url={0}\"><p><a href=\"{0}\">Continue</a></p>",
+                            html_escape(&again)
+                        ),
+                    );
+                }
+                return sign_in_page(&config, &link);
+            }
+        }
+    } else {
+        (String::new(), String::new())
+    };
     hook_page(
         StatusCode::OK,
         format!(
-            "<p>Agent <b>{}</b> wants to run:</p><pre>{}</pre><p>Rule: {} ({}). Status: {}.</p>\
-             <form method=\"post\" action=\"{target}\"><button type=\"submit\">{action} this request</button></form>",
+            "<p>Agent <b>{}</b> wants to run:</p><pre>{}</pre><p>Rule: {} ({}). Status: {}.</p>{signed_in_as}\
+             <form method=\"post\" action=\"{}\">{csrf_field}<button type=\"submit\">{action} this request</button></form>",
             html_escape(&a.agent),
             html_escape(&a.sql),
             html_escape(&a.rule),
             html_escape(&a.reason),
             html_escape(&a.status),
+            html_escape(&link),
         ),
     )
+}
+
+/// Asks the person to sign in, then come back to the link.
+fn sign_in_page(config: &Config, link: &str) -> Response {
+    let mut body = "<p>Sign in to decide this request.</p>".to_string();
+    if let Some(o) = &config.dashboard.oidc {
+        let next = form_urlencoded::byte_serialize(link.as_bytes()).collect::<String>();
+        body.push_str(&format!(
+            "<p><a href=\"/auth/login?next={}\">Sign in with {}</a></p>",
+            html_escape(&next),
+            html_escape(&o.provider_name)
+        ));
+    }
+    if crate::oidc::password_login_allowed(config) {
+        body.push_str(
+            "<p>Or <a href=\"/\">sign in to the dashboard</a> with a password, then open this link again.</p>",
+        );
+    }
+    hook_page(StatusCode::UNAUTHORIZED, body)
 }
 
 async fn hook_decide(
     AxState(state): AxState<Arc<State>>,
     Path(id): Path<String>,
     Query(q): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
 ) -> Response {
     let config = state.config();
     if !matches!(q.verdict.as_str(), "allow" | "deny")
@@ -533,7 +887,39 @@ async fn hook_decide(
             "<p>This approval link is not valid.</p>".into(),
         );
     }
-    match state.db.decide(&id, q.verdict == "allow", "webhook", None) {
+    let mut decider = "webhook".to_string();
+    if config.dashboard.links_need_sign_in() {
+        let approver = state
+            .db
+            .approval(&id)
+            .ok()
+            .flatten()
+            .map(|a| a.approver)
+            .unwrap_or_default();
+        match link_user(&state, &headers, &approver) {
+            LinkUser::Allowed(user, csrf) => {
+                let given = form_urlencoded::parse(body.as_bytes())
+                    .find(|(k, _)| k == "csrf")
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap_or_default();
+                if !constant_eq(&given, &csrf) || same_origin(&headers).is_err() {
+                    return hook_page(
+                        StatusCode::FORBIDDEN,
+                        "<p>This form is out of date. Open the link again.</p>".into(),
+                    );
+                }
+                decider = user.decider();
+            }
+            LinkUser::Refused(why) => {
+                return hook_page(
+                    StatusCode::FORBIDDEN,
+                    format!("<p>You may not decide this request: {}.</p>", html_escape(&why)),
+                );
+            }
+            LinkUser::Nobody => return sign_in_page(&config, &q.path(&id)),
+        }
+    }
+    match state.db.decide(&id, q.verdict == "allow", &decider, None) {
         Ok(true) => hook_page(
             StatusCode::OK,
             format!(
@@ -553,9 +939,10 @@ async fn hook_decide(
     }
 }
 
-/// The small pages behind webhook links: no scripts, never framed (so the
-/// button cannot be clickjacked), and the token in the URL is not passed on.
-fn hook_page(status: StatusCode, body: String) -> Response {
+/// The small pages behind approval links and sign-in errors: no scripts,
+/// never framed (so the button cannot be clickjacked), and the token in
+/// the URL is not passed on.
+pub(crate) fn hook_page(status: StatusCode, body: String) -> Response {
     (
         status,
         [
@@ -574,7 +961,7 @@ fn hook_page(status: StatusCode, body: String) -> Response {
         .into_response()
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

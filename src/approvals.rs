@@ -88,6 +88,12 @@ pub struct ApproverConfig {
     // plugin
     /// The `[[plugins]]` entry that decides.
     pub plugin: Option<String>,
+    // people
+    /// Single sign-on groups whose members may decide this approver's
+    /// requests (in the dashboard or through its links). Empty: anyone
+    /// with the approver role.
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -112,6 +118,19 @@ pub fn validate(
         }
         let missing =
             |what: &str| Err(format!("approver '{}' ({:?}) needs {what}", a.name, a.kind));
+        // Groups name dashboard users; Slack buttons, models and plugins
+        // decide without one.
+        if !a.groups.is_empty()
+            && matches!(
+                a.kind,
+                ApproverKind::Slack | ApproverKind::Llm | ApproverKind::Plugin
+            )
+        {
+            return Err(format!(
+                "approver '{}' ({:?}) cannot set groups: only dashboard and webhook approvers are decided by signed-in people",
+                a.name, a.kind
+            ));
+        }
         match a.kind {
             ApproverKind::Dashboard => {}
             ApproverKind::Slack => {
@@ -691,6 +710,7 @@ mod tests {
             base_url: None,
             api_version: None,
             plugin: None,
+            groups: Vec::new(),
         };
         let lenient = approver("Allow anything.");
         let strict = approver("Deny writes.");

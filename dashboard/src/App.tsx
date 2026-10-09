@@ -8,7 +8,8 @@ import { SiteHeader } from "@/components/site-header"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
-import { api, errorText, setCsrf, whenSignedOut, type Me, type Session } from "@/lib/api"
+import { api, errorText, setCsrf, whenSignedOut, type Me, type Session, type SignedOut } from "@/lib/api"
+import { MeProvider, useCan } from "@/lib/me"
 import { PendingProvider, usePending } from "@/lib/pending"
 import { upgradeLegacyHash, usePage, type Page } from "@/lib/router"
 import { ApprovalsPage } from "@/pages/approvals"
@@ -22,39 +23,43 @@ import { SettingsPage } from "@/pages/settings"
 type Auth =
   | { state: "loading" }
   | { state: "failed"; error: string }
-  | { state: "signed-out"; needsSetup: boolean }
-  | { state: "signed-in"; user: string }
+  | { state: "signed-out"; how: SignedOut }
+  | { state: "signed-in"; me: Session }
 
 export default function App() {
   const [auth, setAuth] = useState<Auth>({ state: "loading" })
 
   const signedIn = useCallback((s: Session) => {
     setCsrf(s.csrf)
-    setAuth({ state: "signed-in", user: s.user })
+    setAuth({ state: "signed-in", me: s })
   }, [])
 
+  // Ask again how people may sign in: the session may have ended because
+  // the config changed.
   const signedOut = useCallback(() => {
     setCsrf(null)
-    setAuth({ state: "signed-out", needsSetup: false })
-  }, [])
+    api<Me>("/api/me")
+      .then((me) => (me.user === null ? setAuth({ state: "signed-out", how: me }) : signedIn(me)))
+      .catch((e) => setAuth({ state: "failed", error: errorText(e) }))
+  }, [signedIn])
 
   useEffect(() => {
     upgradeLegacyHash()
     whenSignedOut(signedOut)
-    api<Me>("/api/me")
-      .then((me) =>
-        me.user === null
-          ? setAuth({ state: "signed-out", needsSetup: me.needs_setup })
-          : signedIn(me)
-      )
-      .catch((e) => setAuth({ state: "failed", error: errorText(e) }))
-  }, [signedIn, signedOut])
+    signedOut()
+  }, [signedOut])
 
   const signOut = useCallback(async () => {
+    let logoutUrl: string | null = null
     try {
-      await api("/api/logout", { method: "POST" })
+      logoutUrl = (await api<{ logout_url: string | null }>("/api/logout", { method: "POST" })).logout_url
     } catch (e) {
       toast.error(errorText(e))
+      return
+    }
+    // Single sign-on may end the provider's session too.
+    if (logoutUrl) {
+      location.assign(logoutUrl)
       return
     }
     signedOut()
@@ -72,21 +77,24 @@ export default function App() {
           <ErrorNote title="The dashboard could not reach ariodb" message={auth.error} />
         </div>
       )}
-      {auth.state === "signed-out" && (
-        <SignIn needsSetup={auth.needsSetup} onSignedIn={signedIn} />
-      )}
+      {auth.state === "signed-out" && <SignIn how={auth.how} onSignedIn={signedIn} />}
       {auth.state === "signed-in" && (
-        <PendingProvider>
-          <Shell user={auth.user} onSignOut={signOut} />
-        </PendingProvider>
+        <MeProvider me={auth.me}>
+          <PendingProvider>
+            <Shell onSignOut={signOut} />
+          </PendingProvider>
+        </MeProvider>
       )}
       <Toaster position="top-center" richColors closeButton />
     </TooltipProvider>
   )
 }
 
-function Shell({ user, onSignOut }: { user: string; onSignOut: () => void }) {
-  const page = usePage()
+function Shell({ onSignOut }: { onSignOut: () => void }) {
+  const admin = useCan("admin")
+  const asked = usePage()
+  // Config is for admins; anyone else who follows a link there gets the overview.
+  const page: Page = asked === "/config" && !admin ? "/" : asked
   const pending = usePending().data?.approvals.length ?? 0
   return (
     <SidebarProvider
@@ -97,18 +105,18 @@ function Shell({ user, onSignOut }: { user: string; onSignOut: () => void }) {
         } as CSSProperties
       }
     >
-      <AppSidebar variant="inset" user={user} current={page} pending={pending} onSignOut={onSignOut} />
+      <AppSidebar variant="inset" current={page} pending={pending} onSignOut={onSignOut} />
       <SidebarInset className="min-w-0">
         <SiteHeader title={titles[page]} pending={pending} onApprovals={page === "/approvals"} />
         <main className="flex flex-1 flex-col">
-          <Content page={page} user={user} onSignOut={onSignOut} />
+          <Content page={page} onSignOut={onSignOut} />
         </main>
       </SidebarInset>
     </SidebarProvider>
   )
 }
 
-function Content({ page, user, onSignOut }: { page: Page; user: string; onSignOut: () => void }) {
+function Content({ page, onSignOut }: { page: Page; onSignOut: () => void }) {
   switch (page) {
     case "/":
       return <OverviewPage />
@@ -123,6 +131,6 @@ function Content({ page, user, onSignOut }: { page: Page; user: string; onSignOu
     case "/config":
       return <ConfigPage />
     case "/settings":
-      return <SettingsPage user={user} onSignOut={onSignOut} />
+      return <SettingsPage onSignOut={onSignOut} />
   }
 }

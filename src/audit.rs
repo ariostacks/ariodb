@@ -95,6 +95,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS decisions_at ON decisions(at_ms);
 CREATE INDEX IF NOT EXISTS decisions_agent ON decisions(agent, id);
+CREATE INDEX IF NOT EXISTS decisions_session ON decisions(session, id);
 CREATE TABLE IF NOT EXISTS plugin_cursors (
     plugin TEXT PRIMARY KEY,
     last_id INTEGER NOT NULL
@@ -361,11 +362,72 @@ pub struct Filter {
     /// Only entries older than this id (for paging).
     pub before: Option<i64>,
     pub limit: Option<i64>,
+    /// Only statements whose approval this one decided, as approvals
+    /// record it (`sso:pat@example.com`, `model:openai/...`, `plugin:x`).
+    pub decided_by: Option<String>,
+    /// Only statements an approval of this kind decided: `person`,
+    /// `model` or `plugin`.
+    pub decided_by_kind: Option<String>,
+}
+
+/// The approvals behind a decision (from `store.rs`'s table in the same
+/// database): same session, agent and rule, asked for after the session's
+/// previous statement was decided, and decided before this one was. A
+/// session sends one statement at a time, so that window holds only this
+/// statement's approvals. Refers to the decision as `d`, the approval as `a`.
+const APPROVAL_OF_D: &str = "a.session = d.session AND a.agent = d.agent \
+    AND a.rule = d.rule AND a.decided_by IS NOT NULL \
+    AND a.created_ms <= d.at_ms AND a.decided_ms <= d.at_ms \
+    AND a.created_ms >= coalesce((SELECT max(p.at_ms) FROM decisions p WHERE p.session = d.session AND p.id < d.id), 0)";
+
+/// The SQL condition on `a.decided_by` for a kind of decider.
+fn decider_kind_condition(kind: &str) -> Result<&'static str, String> {
+    Ok(match kind {
+        "model" => "a.decided_by LIKE 'model:%'",
+        "plugin" => "a.decided_by LIKE 'plugin:%'",
+        "person" => {
+            "a.decided_by NOT LIKE 'model:%' AND a.decided_by NOT LIKE 'plugin:%' AND a.decided_by != 'ariodb'"
+        }
+        _ => return Err(format!("decided_by_kind must be person, model or plugin, not '{kind}'")),
+    })
+}
+
+/// Who decided the approvals behind each of these decisions, by decision id.
+pub fn deciders(
+    dir: &Path,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Vec<String>>, String> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let conn = open_conn(dir)?;
+    let list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT d.id, a.decided_by FROM decisions d JOIN approvals a ON {APPROVAL_OF_D} \
+         WHERE d.id IN ({list}) ORDER BY d.id, a.decided_ms"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (id, by) = row.map_err(|e| e.to_string())?;
+        let list: &mut Vec<String> = out.entry(id).or_default();
+        if !list.contains(&by) {
+            list.push(by);
+        }
+    }
+    Ok(out)
 }
 
 pub fn query(dir: &Path, f: &Filter) -> Result<Vec<Decision>, String> {
     let conn = open_conn(dir)?;
-    let mut sql = "SELECT * FROM decisions WHERE 1 = 1".to_string();
+    let mut sql = "SELECT d.* FROM decisions d WHERE 1 = 1".to_string();
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     // Each condition is a template where `?` becomes the next parameter.
     let mut conditions: Vec<(&str, Box<dyn rusqlite::ToSql>)> = Vec::new();
@@ -386,6 +448,19 @@ pub fn query(dir: &Path, f: &Filter) -> Result<Vec<Decision>, String> {
     }
     if let Some(v) = f.before {
         conditions.push(("id < ?", Box::new(v)));
+    }
+    let by_condition = f
+        .decided_by
+        .as_ref()
+        .map(|_| format!("EXISTS (SELECT 1 FROM approvals a WHERE {APPROVAL_OF_D} AND a.decided_by = ?)"));
+    if let (Some(c), Some(v)) = (&by_condition, &f.decided_by) {
+        conditions.push((c.as_str(), Box::new(v.clone())));
+    }
+    if let Some(kind) = &f.decided_by_kind {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM approvals a WHERE {APPROVAL_OF_D} AND {})",
+            decider_kind_condition(kind)?
+        ));
     }
     for (template, value) in conditions {
         args.push(value);
