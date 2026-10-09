@@ -17,6 +17,10 @@ const tones: Record<string, string> = {
   approve: "wait",
   expired: "wait",
   failed: "wait",
+  running: "ok",
+  restarting: "bad",
+  starting: "wait",
+  stopped: "wait",
 }
 
 const toneClass: Record<string, string> = {

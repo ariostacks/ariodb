@@ -697,6 +697,12 @@ fn print_summary(config: &Config) {
     if !config.tunnels.is_empty() {
         println!();
     }
+    for p in &config.plugins {
+        println!("plugin {:<15} {}", p.name, p.command.join(" "));
+    }
+    if !config.plugins.is_empty() {
+        println!();
+    }
 
     if config.agents.is_empty() {
         println!("no agents configured: every agent will be refused");
