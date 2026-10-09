@@ -167,15 +167,19 @@ pub(crate) fn secure_flag(config: &Config) -> &'static str {
 /// Who is signed in, if anyone, and the session's CSRF token. The role is
 /// worked out on every request: a local user's from the users table, a
 /// single sign-on user's from their groups and the current config. So a
-/// changed role, a changed group mapping or switched-off password logins
-/// apply at once, not at the next sign-in.
+/// changed role, a changed group mapping or email domain list, or
+/// switched-off password logins apply at once, not at the next sign-in.
 fn session(state: &State, headers: &HeaderMap) -> Option<(User, String)> {
     let token = cookie_value(headers, COOKIE)?;
     let s = state.db.session(&hash_token(&token)).ok()??;
     let config = state.config();
     let sso = s.method == "sso";
     let role = if sso {
-        config.dashboard.oidc.as_ref()?.role_for(&s.groups)?
+        let o = config.dashboard.oidc.as_ref()?;
+        if !crate::oidc::email_allowed(o, s.email.as_deref()) {
+            return None;
+        }
+        o.role_for(&s.groups)?
     } else if !crate::oidc::password_login_allowed(&config) {
         return None;
     } else if s.user == "root" {
@@ -1062,6 +1066,46 @@ mod tests {
         let mut l = LoginLimiter::default();
         l.failed("address:192.0.2.7", None, 1_000);
         assert_eq!(l.failures.len(), 1);
+    }
+
+    #[test]
+    fn deciding_needs_the_role_and_the_approvers_groups() {
+        let config = Config::from_toml(
+            r#"
+[database]
+url = "postgres://localhost:5432/app"
+
+[[approvers]]
+name = "ops"
+type = "dashboard"
+
+[[approvers]]
+name = "dba-ops"
+type = "dashboard"
+groups = ["dba"]
+
+[dashboard.oidc]
+issuer = "https://login.example.test"
+client_id = "ariodb"
+admin_groups = ["admins"]
+"#,
+        )
+        .unwrap();
+        let user = |role, groups: &[&str]| User {
+            name: "pat@example.test".into(),
+            role,
+            email: None,
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            sso: true,
+        };
+        assert!(may_decide(&config, &user(Role::Viewer, &["dba"]), "ops").is_err());
+        assert!(may_decide(&config, &user(Role::Approver, &[]), "ops").is_ok());
+        assert!(may_decide(&config, &user(Role::Approver, &[]), "dba-ops").is_err());
+        assert!(may_decide(&config, &user(Role::Admin, &["admins"]), "dba-ops").is_err());
+        assert!(may_decide(&config, &user(Role::Approver, &["dba"]), "dba-ops").is_ok());
+        assert_eq!(user(Role::Admin, &[]).decider(), "sso:pat@example.test");
+        assert!(needs(&user(Role::Approver, &[]), Role::Admin).is_err());
+        assert!(needs(&user(Role::Admin, &[]), Role::Approver).is_ok());
     }
 
     #[test]

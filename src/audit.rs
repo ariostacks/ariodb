@@ -372,13 +372,15 @@ pub struct Filter {
 
 /// The approvals behind a decision (from `store.rs`'s table in the same
 /// database): same session, agent and rule, asked for after the session's
-/// previous statement was decided, and decided before this one was. A
+/// previous statement was recorded, and decided before this one was. A
 /// session sends one statement at a time, so that window holds only this
-/// statement's approvals. Refers to the decision as `d`, the approval as `a`.
+/// statement's approvals (to the millisecond: an approval asked for in the
+/// very millisecond the previous statement was recorded is not found).
+/// Refers to the decision as `d`, the approval as `a`.
 const APPROVAL_OF_D: &str = "a.session = d.session AND a.agent = d.agent \
     AND a.rule = d.rule AND a.decided_by IS NOT NULL \
     AND a.created_ms <= d.at_ms AND a.decided_ms <= d.at_ms \
-    AND a.created_ms >= coalesce((SELECT max(p.at_ms) FROM decisions p WHERE p.session = d.session AND p.id < d.id), 0)";
+    AND a.created_ms > coalesce((SELECT max(p.at_ms) FROM decisions p WHERE p.session = d.session AND p.id < d.id), 0)";
 
 /// The SQL condition on `a.decided_by` for a kind of decider.
 fn decider_kind_condition(kind: &str) -> Result<&'static str, String> {
@@ -659,6 +661,94 @@ mod tests {
         assert_eq!(rest[0].decision.sql, "SELECT 3");
         // The byte budget stops a batch early, but never empties it.
         assert_eq!(cursor.after(0, 100, 1).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decisions_know_who_decided_their_approvals() {
+        let dir = std::env::temp_dir().join(format!("ariodb-audit-d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = AuditLog::open(&dir, &Settings::default()).unwrap();
+        let db = crate::store::Db::open(&dir).unwrap();
+        let approval = |id: &str, session: &str, rule: &str, by: &str| {
+            let now = crate::store::now_ms();
+            db.insert_approval(&crate::store::Approval {
+                id: id.into(),
+                created_ms: now,
+                expires_ms: now + 1000,
+                agent: "bot".into(),
+                session: session.into(),
+                sql: "SELECT 1".into(),
+                rule: rule.into(),
+                approver: "ops".into(),
+                reason: String::new(),
+                status: "allowed".into(),
+                decided_by: Some(by.into()),
+                note: None,
+                decided_ms: Some(now),
+            })
+            .unwrap();
+        };
+        let decide = |session: &str, rule: Option<&str>| {
+            let mut e = entry("SELECT 1", &[]);
+            e.session = session;
+            e.rule = rule;
+            log.record(&e);
+        };
+        // Two statements in one session, each approved by someone else, and
+        // one in another session decided by a model.
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(3));
+        approval("a-1", "s1", "ask", "sso:pat@example.test");
+        decide("s1", Some("ask"));
+        tick();
+        approval("a-2", "s1", "ask", "dashboard:root");
+        decide("s1", Some("ask"));
+        approval("a-3", "s2", "ask", "model:openai/gpt-test");
+        decide("s2", Some("ask"));
+        tick();
+        decide("s2", None);
+        let all = query(&dir, &Filter::default()).unwrap();
+        let ids: Vec<i64> = all.iter().map(|d| d.id).collect();
+        let by = deciders(&dir, &ids).unwrap();
+        let of = |n: usize| by.get(&all[n].id).cloned().unwrap_or_default();
+        // Newest first: s2 unruled, s2 model, s1 root, s1 pat.
+        assert!(of(0).is_empty());
+        assert_eq!(of(1), vec!["model:openai/gpt-test"]);
+        assert_eq!(of(2), vec!["dashboard:root"]);
+        assert_eq!(of(3), vec!["sso:pat@example.test"]);
+        let filtered = |f: Filter| query(&dir, &f).unwrap().len();
+        assert_eq!(
+            filtered(Filter {
+                decided_by: Some("sso:pat@example.test".into()),
+                ..Default::default()
+            }),
+            1
+        );
+        assert_eq!(
+            filtered(Filter {
+                decided_by_kind: Some("person".into()),
+                ..Default::default()
+            }),
+            2
+        );
+        assert_eq!(
+            filtered(Filter {
+                decided_by_kind: Some("model".into()),
+                agent: Some("bot".into()),
+                ..Default::default()
+            }),
+            1
+        );
+        assert!(
+            query(
+                &dir,
+                &Filter {
+                    decided_by_kind: Some("robot".into()),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

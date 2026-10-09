@@ -110,6 +110,7 @@ export function SignIn({ how, onSignedIn }: { how: SignedOut; onSignedIn: (s: Se
                           autoComplete="username"
                           value={user}
                           onChange={(e) => setUser(e.target.value)}
+                          autoFocus={sso !== null}
                           required
                         />
                       </Field>
@@ -123,7 +124,7 @@ export function SignIn({ how, onSignedIn }: { how: SignedOut; onSignedIn: (s: Se
                         autoComplete={needsSetup ? "new-password" : "current-password"}
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
-                        autoFocus
+                        autoFocus={sso === null}
                         required
                       />
                       {needsSetup && (

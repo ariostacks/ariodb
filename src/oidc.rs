@@ -442,6 +442,19 @@ fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(256).collect()
 }
 
+/// Is this email in one of the allowed domains (when any are set)?
+pub fn email_allowed(o: &OidcConfig, email: Option<&str>) -> bool {
+    if o.allowed_email_domains.is_empty() {
+        return true;
+    }
+    let domain = email.and_then(|e| e.rsplit_once('@')).map(|(_, d)| d);
+    domain.is_some_and(|d| {
+        o.allowed_email_domains
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(d))
+    })
+}
+
 /// May this person use the dashboard, and as what?
 pub fn admit(o: &OidcConfig, who: &Identity) -> Result<Role, String> {
     if !o.allowed_email_domains.is_empty() {
@@ -450,12 +463,7 @@ pub fn admit(o: &OidcConfig, who: &Identity) -> Result<Role, String> {
             .as_deref()
             .filter(|_| who.email_verified != Some(false))
             .ok_or("this dashboard needs a verified email address, and the provider sent none")?;
-        let domain = email.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase());
-        if !domain.is_some_and(|d| {
-            o.allowed_email_domains
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(&d))
-        }) {
+        if !email_allowed(o, Some(email)) {
             return Err(format!(
                 "{email} is not in a domain allowed to use this dashboard"
             ));
@@ -665,11 +673,15 @@ pub async fn login(
         let mut pending = PENDING.lock().expect("pending sign-ins");
         let map = pending.get_or_insert_with(HashMap::new);
         map.retain(|_, p| p.created.elapsed() < PENDING_FOR);
-        if map.len() >= MAX_PENDING {
-            return error_page(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many sign-ins in progress; try again in a few minutes.",
-            );
+        // Past the cap the oldest sign-in is dropped, so a flood of
+        // unfinished sign-ins slows people down rather than locking them out.
+        if map.len() >= MAX_PENDING
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, p)| p.created)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
         }
         map.insert(
             state_param.clone(),
