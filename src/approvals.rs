@@ -480,7 +480,7 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-pub(crate) fn http() -> reqwest::Client {
+fn http() -> reqwest::Client {
     crate::tls::init();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -556,6 +556,8 @@ async fn ask_model(
     let cacheable = matches!(judged, Judged::Allow | Judged::Deny(_));
     let decider = crate::llm::decider(approver);
     let who = format!("model approver '{}' ({decider})", approver.name);
+    // An allow the model never gave must not look like one in the record.
+    let mut failed_open = None;
     let verdict = match judged {
         Judged::Allow => Ok(()),
         Judged::Deny(reason) => Err(format!("denied by {who}: {reason}")),
@@ -563,7 +565,9 @@ async fn ask_model(
         Judged::Unavailable(e) => match config.approvals.llm_fail_mode {
             FailMode::Closed => Err(format!("{who} unavailable ({e}); failing closed")),
             FailMode::Open => {
-                eprintln!("ariodb: {who} unavailable ({e}); failing open");
+                let why = format!("{who} unavailable ({e}); failing open");
+                eprintln!("ariodb: {why}");
+                failed_open = Some(why);
                 Ok(())
             }
         },
@@ -587,7 +591,7 @@ async fn ask_model(
             "denied".into()
         },
         decided_by: Some(decider),
-        note: verdict.as_ref().err().cloned(),
+        note: verdict.as_ref().err().cloned().or(failed_open),
         decided_ms: Some(now),
     });
 

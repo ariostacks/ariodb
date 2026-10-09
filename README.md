@@ -420,8 +420,11 @@ for a gateway in front of the provider.
 
 Network errors, 408, 429 and 5xx are tried three times in all, with
 backoff that honours `Retry-After` (a provider asking for more than 30
-seconds counts as down). Then `llm_fail_mode` decides. A wrong key, model
-or setting is a configuration error and always refuses.
+seconds counts as down). Then `llm_fail_mode` decides, and an allow under
+`open` is recorded with a note saying the model never answered. A wrong
+key, model or setting is a configuration error and always refuses, as does
+a redirect: ariodb does not follow one, so the key and the statements never
+go to an address you did not configure.
 
 **Data leaves your network.** A model approver sends the statements it
 judges, the agent's name, the database, the rule and the policy to the

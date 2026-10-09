@@ -21,6 +21,7 @@
 //!   server rejects the schema.
 
 use crate::approvals::ApproverConfig;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -251,6 +252,8 @@ const MAX_OUTPUT_TOKENS: u32 = 16000;
 const ATTEMPTS: u32 = 3;
 /// A provider that asks for a longer wait than this is treated as down.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The most of a response ariodb reads.
+const MAX_RESPONSE: usize = 1 << 20;
 
 /// One approver's model, resolved: where to send the question and how.
 #[derive(Debug, Clone)]
@@ -427,7 +430,9 @@ pub async fn ask(t: &Target, user: &str) -> Judged {
             Err(e) => (None, None, format!("network error: {e}")),
         };
         match status {
-            Some(200..=299) => return parse(t.provider, &text),
+            // Only 200 carries an answer; any other status, a redirect
+            // included, is something ariodb was not set up to expect.
+            Some(200) => return parse(t.provider, &text),
             // A server without JSON schema support: ask for plain JSON once.
             Some(400 | 422) if t.provider == Provider::OpenAiCompatible && !json_mode => {
                 json_mode = true;
@@ -456,14 +461,24 @@ pub async fn ask(t: &Target, user: &str) -> Judged {
     }
 }
 
+/// Redirects are not followed: reqwest would carry the `x-api-key`,
+/// `api-key` and `x-goog-api-key` headers, and the statements, to another
+/// host, plain http included.
+fn client() -> reqwest::Client {
+    crate::tls::init();
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("HTTP client")
+}
+
 async fn send(req: &Request) -> Result<(Option<u16>, Option<Duration>, String), String> {
-    let mut http = crate::approvals::http()
-        .post(&req.url)
-        .timeout(Duration::from_secs(60));
+    let mut http = client().post(&req.url);
     for (name, value) in &req.headers {
         http = http.header(*name, value);
     }
-    let resp = http
+    let mut resp = http
         .body(req.body.to_string())
         .send()
         .await
@@ -475,9 +490,27 @@ async fn send(req: &Request) -> Result<(Option<u16>, Option<Duration>, String), 
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|s| s.is_finite() && *s >= 0.0)
-        .map(Duration::from_secs_f64);
-    let text = resp.text().await.unwrap_or_default();
-    Ok((Some(status), retry_after, text))
+        // Too long for a Duration is still a request to wait too long.
+        .map(|s| Duration::try_from_secs_f64(s).unwrap_or(Duration::MAX));
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| e.without_url().to_string())?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE {
+            return Err(format!(
+                "the response was larger than {} KiB",
+                MAX_RESPONSE / 1024
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((
+        Some(status),
+        retry_after,
+        String::from_utf8_lossy(&body).into_owned(),
+    ))
 }
 
 /// The provider's error message, which all of them put in `error.message`
@@ -608,18 +641,39 @@ fn chat_answer(v: &Value) -> Result<String, String> {
     Ok(message["content"].as_str().unwrap_or_default().to_string())
 }
 
+/// The answer's one allowed shape. Unknown and repeated keys are errors
+/// here, where a `Value` would quietly keep the last of two `decision`s.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Verdict {
+    decision: Decision,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Decision {
+    Allow,
+    Deny,
+}
+
 /// The verdict itself: exactly one JSON object with `decision` and
 /// `reason`, nothing around it. Anything else denies.
 fn read_verdict(out: &str) -> Judged {
-    let Ok(Value::Object(answer)) = serde_json::from_str::<Value>(out.trim()) else {
+    let out = out.trim();
+    if !matches!(serde_json::from_str::<Value>(out), Ok(Value::Object(_))) {
         return Judged::Deny("the model's answer could not be read".into());
-    };
-    let reason = answer.get("reason").and_then(Value::as_str);
-    let tidy = answer.keys().all(|k| k == "decision" || k == "reason");
-    match (answer.get("decision").and_then(Value::as_str), reason) {
-        (Some("allow"), Some(_)) if tidy => Judged::Allow,
-        (Some("deny"), Some(reason)) if tidy => Judged::Deny(reason.to_string()),
-        _ => Judged::Deny("the model's answer was ambiguous".into()),
+    }
+    match serde_json::from_str::<Verdict>(out) {
+        Ok(Verdict {
+            decision: Decision::Allow,
+            ..
+        }) => Judged::Allow,
+        Ok(Verdict {
+            decision: Decision::Deny,
+            reason,
+        }) => Judged::Deny(reason),
+        Err(_) => Judged::Deny("the model's answer was ambiguous".into()),
     }
 }
 
@@ -1039,6 +1093,134 @@ mod tests {
         a.provider = Some("gemini".into());
         a.model = Some("gemini-3.5-flash".into());
         assert_eq!(decider(&a), "model:gemini/gemini-3.5-flash");
+    }
+
+    #[test]
+    fn duplicate_keys_are_ambiguous() {
+        let twice = r#"{"decision":"deny","reason":"writes","decision":"allow"}"#;
+        assert!(denies(read_verdict(twice), "ambiguous"));
+        let no_reason = r#"{"decision":"allow"}"#;
+        assert!(denies(read_verdict(no_reason), "ambiguous"));
+        assert!(is_allow(read_verdict(ALLOW)));
+    }
+
+    /// A local server that answers each connection with the next of
+    /// `replies` (raw HTTP), and keeps what it was sent.
+    struct Mock {
+        base: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn mock(replies: Vec<String>) -> Mock {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            for reply in replies {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                // Headers, then as much body as content-length says.
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                log.lock()
+                    .expect("log")
+                    .push(String::from_utf8_lossy(&request).to_string());
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        Mock { base, seen }
+    }
+
+    fn http(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn openai_allow() -> String {
+        responses(
+            "completed",
+            json!([{ "type": "output_text", "text": ALLOW }]),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_wild_retry_after_is_an_outage_not_a_crash() {
+        let server = mock(vec![
+            http("200 OK", "retry-after: 1e20\r\n", &openai_allow()),
+            http("503 Service Unavailable", "retry-after: 1e20\r\n", "{}"),
+        ])
+        .await;
+        let t = target(Provider::OpenAi, "gpt-6-astra", &server.base);
+        assert!(is_allow(ask(&t, SQL_QUESTION).await));
+        assert!(matches!(
+            ask(&t, SQL_QUESTION).await,
+            Judged::Unavailable(why) if why.contains("asked to wait")
+        ));
+    }
+
+    #[tokio::test]
+    async fn redirects_are_refused_and_keys_stay_put() {
+        let elsewhere = mock(vec![http("200 OK", "", &openai_allow())]).await;
+        let location = format!("location: {}/v1/interactions\r\n", elsewhere.base);
+        let server = mock(vec![http("307 Temporary Redirect", &location, "")]).await;
+        let t = target(Provider::Gemini, "gemini-3.8-flash", &server.base);
+        let judged = ask(&t, SQL_QUESTION).await;
+        assert!(matches!(judged, Judged::ConfigError(_)), "{judged:?}");
+        assert!(
+            elsewhere.seen.lock().expect("log").is_empty(),
+            "the key and the statement went to the redirect's target"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_200_is_an_answer() {
+        let server = mock(vec![http("204 No Content", "", "")]).await;
+        let t = target(Provider::OpenAi, "gpt-6-astra", &server.base);
+        let judged = ask(&t, SQL_QUESTION).await;
+        assert!(matches!(judged, Judged::ConfigError(_)), "{judged:?}");
+    }
+
+    #[tokio::test]
+    async fn huge_answers_are_not_read_into_memory() {
+        let padded = format!("{}{}", " ".repeat(MAX_RESPONSE + 1), openai_allow());
+        let big = http("200 OK", "", &padded);
+        let server = mock(vec![big.clone(), big.clone(), big]).await;
+        let t = target(Provider::OpenAi, "gpt-6-astra", &server.base);
+        let judged = ask(&t, SQL_QUESTION).await;
+        assert!(
+            matches!(&judged, Judged::Unavailable(why) if why.contains("larger than")),
+            "{judged:?}"
+        );
+        assert!(server.seen.lock().expect("log")[0].contains("authorization: Bearer"));
     }
 
     #[test]

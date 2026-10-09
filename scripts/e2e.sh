@@ -542,6 +542,14 @@ OUT503=$(agent coding-agent $T "SELECT /*ask-openai*/ 'unavailable-503' FROM ord
 expect "a provider that is down fails closed" "unavailable (HTTP 503); failing closed" "$OUT503"
 expect "and the refusal names provider and model" "model approver 'judge-openai' (model:openai/gpt-6-astra)" "$OUT503"
 [ "$(grep -c 'unavailable-503' "$WORK/mock.log")" = 3 ] && pass "503 is retried three times in all" || fail "expected 3 tries, got $(grep -c 'unavailable-503' "$WORK/mock.log")"
+cp "$WORK/ariodb.toml" "$WORK/ariodb.toml.orig"
+sed -e 's|^llm_fail_mode = "closed"|llm_fail_mode = "open"|' "$WORK/ariodb.toml.orig" > "$WORK/ariodb.toml"
+sleep 3
+expect "under fail-open, a provider that is down lets the statement through" "(1 row)" \
+  "$(agent coding-agent $T "SELECT /*ask-openai*/ count(*) FROM orders WHERE 'unavailable-503' <> ''")"
+expect "and the record says the model never answered" "failing open" "$($BIN "${CFG[@]}" approvals --all)"
+cp "$WORK/ariodb.toml.orig" "$WORK/ariodb.toml"
+sleep 3
 APPROVALS=$($BIN "${CFG[@]}" approvals --all)
 for d in model:openai/gpt-6-astra model:gemini/gemini-3.8-flash model:azure_openai/ariodb-judge \
   model:openai_compatible/llama-test model:openai_compatible/old-test; do
