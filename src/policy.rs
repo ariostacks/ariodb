@@ -186,6 +186,7 @@ mod tests {
             token_env: Some("UNUSED".into()),
             token_secret: None,
             clickhouse: None,
+            mysql: None,
             max_rows_per_write: None,
             credential: None,
         }

@@ -38,6 +38,8 @@ pub struct Config {
     pub audit: crate::audit::Settings,
     #[serde(default)]
     pub clickhouse: ClickHouse,
+    #[serde(default)]
+    pub mysql: MySql,
     /// Side processes (cloud-sql-proxy, SSH port-forwards) that carry
     /// connections to the database. Started by `ariodb serve`.
     #[serde(default)]
@@ -90,11 +92,82 @@ impl Default for ClickHouse {
     }
 }
 
-/// An agent's ClickHouse access, separate from its Postgres access.
+/// An agent's access to another engine (ClickHouse, MySQL), separate from
+/// its Postgres access.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ClickHouseAccess {
+pub struct EngineAccess {
     pub access: Access,
     pub tables: Vec<String>,
+}
+
+pub type ClickHouseAccess = EngineAccess;
+
+/// MySQL and MariaDB: ariodb speaks the MySQL protocol to agents and relays
+/// to the real server as its own login.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct MySql {
+    /// Where agents connect with a MySQL client. Empty (default) turns it off.
+    pub listen: String,
+    /// The real server, host:port.
+    pub addr: String,
+    /// The database agents work in. Unqualified table names, in statements
+    /// and in `[agents.mysql] tables`, mean tables in this database.
+    pub database: String,
+    /// The login ariodb uses for agents' queries; agents never see it.
+    pub user: String,
+    pub password_env: Option<String>,
+    pub password_secret: Option<String>,
+    /// TLS to the server: `disable`, `require` or `verify`. Default: disable
+    /// on localhost, verify elsewhere.
+    pub tls: Option<TlsMode>,
+    pub ca_file: Option<String>,
+    /// Certificate and key (PEM) for TLS between agents and ariodb.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    /// Refuse agents that do not use TLS.
+    pub require_tls: bool,
+    /// Reach the server through this tunnel.
+    pub tunnel: Option<String>,
+    /// Record agents' changes from the binlog, for undo.
+    pub journal: bool,
+    /// The login the journal and undo use (needs REPLICATION SLAVE and
+    /// REPLICATION CLIENT, and write access to the protected tables for
+    /// undo). Default: `user`, with its password.
+    pub journal_user: Option<String>,
+    pub journal_password_env: Option<String>,
+    pub journal_password_secret: Option<String>,
+    /// The server id ariodb registers with to read the binlog. Must differ
+    /// from every real replica's.
+    pub server_id: u32,
+    /// Each write transaction records its session in this table, so the
+    /// journal can tell which agent session made a change.
+    pub tag_table: String,
+}
+
+impl Default for MySql {
+    fn default() -> Self {
+        MySql {
+            listen: String::new(),
+            addr: "127.0.0.1:3306".to_string(),
+            database: String::new(),
+            user: "ariodb".to_string(),
+            password_env: None,
+            password_secret: None,
+            tls: None,
+            ca_file: None,
+            tls_cert: None,
+            tls_key: None,
+            require_tls: false,
+            tunnel: None,
+            journal: true,
+            journal_user: None,
+            journal_password_env: None,
+            journal_password_secret: None,
+            server_id: 4242,
+            tag_table: "ariodb.session_tags".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,6 +336,9 @@ pub struct Agent {
     /// ClickHouse access, if this agent may use ClickHouse.
     #[serde(default)]
     pub clickhouse: Option<ClickHouseAccess>,
+    /// MySQL access, if this agent may use MySQL.
+    #[serde(default)]
+    pub mysql: Option<EngineAccess>,
 }
 
 impl Agent {
@@ -324,6 +400,11 @@ impl Config {
 
     /// Rules that TOML alone cannot express.
     fn check(&self) -> Result<(), ConfigError> {
+        if !self.mysql.listen.is_empty() && self.mysql.database.is_empty() {
+            return Err(ConfigError::Problem(
+                "[mysql] database must name the database agents work in".to_string(),
+            ));
+        }
         if self.on_failure == FailureMode::Open {
             return Err(ConfigError::Problem(
                 "on_failure = \"open\" is not supported: ariodb always refuses a statement it cannot check. Remove the line or set it to \"closed\"".to_string(),
@@ -419,6 +500,90 @@ impl Config {
             (Some(c), Some(k)) => crate::tls::server_acceptor(c, k).map(Some),
             (None, None) => Ok(None),
             _ => Err("clickhouse.tls_cert and clickhouse.tls_key must be set together".to_string()),
+        }
+    }
+
+    /// The MySQL password ariodb uses for agents' queries.
+    pub fn mysql_password(&self) -> Result<String, String> {
+        self.password_from(&self.mysql.password_secret, &self.mysql.password_env)
+    }
+
+    /// The MySQL login (user, password) the journal and undo use.
+    pub fn mysql_journal_login(&self) -> Result<(String, String), String> {
+        match &self.mysql.journal_user {
+            None => Ok((self.mysql.user.clone(), self.mysql_password()?)),
+            Some(user) => Ok((
+                user.clone(),
+                self.password_from(
+                    &self.mysql.journal_password_secret,
+                    &self.mysql.journal_password_env,
+                )?,
+            )),
+        }
+    }
+
+    /// Where to dial the MySQL server, through its tunnel if it has one.
+    pub fn mysql_dial_addr(&self) -> Result<String, String> {
+        Ok(match &self.mysql.tunnel {
+            Some(name) => crate::tunnels::find(&self.tunnels, name)?.listen.clone(),
+            None => self.mysql.addr.clone(),
+        })
+    }
+
+    /// TLS mode to the MySQL server, defaulting as for Postgres.
+    pub fn mysql_tls_mode(&self) -> TlsMode {
+        self.mysql.tls.unwrap_or_else(|| {
+            let host = self.mysql.addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+            if host == "localhost" || host.starts_with("127.") || host == "[::1]" {
+                TlsMode::Disable
+            } else {
+                TlsMode::Verify
+            }
+        })
+    }
+
+    /// The TLS acceptor for the MySQL listener, if TLS is configured.
+    pub fn mysql_listener_tls(&self) -> Result<Option<tokio_rustls::TlsAcceptor>, String> {
+        match (&self.mysql.tls_cert, &self.mysql.tls_key) {
+            (Some(c), Some(k)) => crate::tls::server_acceptor(c, k).map(Some),
+            (None, None) => Ok(None),
+            _ => Err("mysql.tls_cert and mysql.tls_key must be set together".to_string()),
+        }
+    }
+
+    /// An agent's view for another engine: its name and token checked, and
+    /// its access and tables replaced by that engine's block. `engine` is
+    /// `clickhouse` or `mysql`.
+    pub fn engine_agent(&self, engine: &str, name: &str, token: &str) -> Result<Agent, &'static str> {
+        let agent = self.agent(name).ok_or("unknown agent")?;
+        let expected = self.agent_token(agent).ok_or("unknown agent")?;
+        let ok = expected.len() == token.len()
+            && expected
+                .bytes()
+                .zip(token.bytes())
+                .fold(0, |a, (x, y)| a | (x ^ y))
+                == 0;
+        if !ok {
+            return Err("wrong token");
+        }
+        let access = match engine {
+            "clickhouse" => agent.clickhouse.as_ref().ok_or("this agent has no ClickHouse access")?,
+            "mysql" => agent.mysql.as_ref().ok_or("this agent has no MySQL access")?,
+            _ => return Err("unknown engine"),
+        };
+        let mut view = agent.clone();
+        view.access = access.access;
+        view.tables = access.tables.clone();
+        Ok(view)
+    }
+
+    fn password_from(&self, secret: &Option<String>, env: &Option<String>) -> Result<String, String> {
+        match (secret, env) {
+            (Some(name), _) => self
+                .secret(name)?
+                .ok_or_else(|| format!("secret '{name}' is not set")),
+            (None, Some(env)) => std::env::var(env).map_err(|_| format!("{env} is not set")),
+            (None, None) => Ok(String::new()),
         }
     }
 

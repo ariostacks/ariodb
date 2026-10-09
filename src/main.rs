@@ -12,6 +12,10 @@ mod exec;
 mod gate;
 mod doctor;
 mod journal;
+mod mysql_journal;
+mod mysql_proxy;
+mod mysql_sql;
+mod mysql_undo;
 mod mcp;
 mod pgoutput;
 mod policy;
@@ -190,7 +194,18 @@ async fn main() -> ExitCode {
             Ok(())
         }
         Command::Classify { .. } => unreachable!("handled above"),
-        Command::Setup => with_tunnels(&config, journal::setup(&config)).await,
+        Command::Setup => {
+            with_tunnels(&config, async {
+                if config.journal.enabled {
+                    journal::setup(&config).await?;
+                }
+                if !config.mysql.listen.is_empty() && config.mysql.journal {
+                    mysql_journal::setup(&config).await?;
+                }
+                Ok(())
+            })
+            .await
+        }
         Command::Doctor => {
             with_tunnels(&config, async {
                 let report = doctor::run(&config).await;
@@ -356,7 +371,21 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
             eprintln!("ariodb: dashboard stopped: {e}");
         }
     });
+    let mysql_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = mysql_proxy::serve(mysql_state).await {
+            eprintln!("ariodb: MySQL proxy stopped: {e}");
+        }
+    });
     let config = state.config();
+    if !config.mysql.listen.is_empty() && config.mysql.journal {
+        let mysql_config = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mysql_journal::run(&mysql_config).await {
+                eprintln!("ariodb: MySQL journal stopped: {e}");
+            }
+        });
+    }
     if !config.proxy.listen.is_empty() || config.journal.enabled {
         // Say once, at startup, which guarantees this database supports.
         let doctor_config = config.clone();
@@ -491,7 +520,8 @@ fn secret_command(config: &Config, action: SecretAction) -> Result<(), String> {
 }
 
 fn sessions_command(config: &Config) -> Result<(), String> {
-    let records = journal::read_all(config)?;
+    let mut records = journal::read_all(config)?;
+    records.extend(mysql_journal::read_all(config)?);
     let sessions = undo::sessions(&records);
     if sessions.is_empty() {
         println!("no agent changes recorded yet");
@@ -522,6 +552,12 @@ async fn undo_command(
     apply: bool,
     skip_conflicts: bool,
 ) -> Result<(), String> {
+    let mysql_records = mysql_journal::read_all(config)?;
+    if mysql_records.iter().any(|r| r.session.as_deref() == Some(session)) {
+        let text = mysql_undo::undo(config, &mysql_records, session, apply, skip_conflicts).await?;
+        print!("{text}");
+        return Ok(());
+    }
     let records = journal::read_all(config)?;
     let mut client = undo::connect(config).await?;
     let plan = undo::plan(&client, &records, session).await?;

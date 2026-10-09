@@ -51,25 +51,7 @@ pub async fn serve_http(state: Arc<State>) -> Result<(), String> {
 
 /// The agent as ClickHouse sees it: its ClickHouse access and tables.
 pub fn clickhouse_agent(config: &Config, name: &str, token: &str) -> Result<Agent, &'static str> {
-    let agent = config.agent(name).ok_or("unknown agent")?;
-    let expected = config.agent_token(agent).ok_or("unknown agent")?;
-    let ok = expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0, |a, (x, y)| a | (x ^ y))
-            == 0;
-    if !ok {
-        return Err("wrong token");
-    }
-    let ch = agent
-        .clickhouse
-        .as_ref()
-        .ok_or("this agent has no ClickHouse access")?;
-    let mut view = agent.clone();
-    view.access = ch.access;
-    view.tables = ch.tables.clone();
-    Ok(view)
+    config.engine_agent("clickhouse", name, token)
 }
 
 /// ClickHouse-style error text, which clients show as-is.
