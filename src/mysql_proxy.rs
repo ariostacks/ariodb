@@ -148,7 +148,9 @@ async fn connect_upstream(config: &Config, caps: u32, charset: u8) -> Result<Ups
 /// The host part of host:port, without IPv6 brackets.
 fn host_of(addr: &str) -> String {
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-    host.trim_start_matches('[').trim_end_matches(']').to_string()
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string()
 }
 
 /// The session settings every agent connection runs under: the statement
@@ -225,12 +227,15 @@ async fn handle(
     shared: Arc<Shared>,
 ) -> Result<(), String> {
     let id = shared.next_id.fetch_add(1, SeqCst);
-    let login = match tokio::time::timeout(LOGIN_TIMEOUT, login(socket, &state, acceptor, id, &shared)).await {
-        Err(_) => return Ok(()), // too slow to log in
-        Ok(Err(e)) => return Err(e),
-        Ok(Ok(None)) => return Ok(()),
-        Ok(Ok(Some(l))) => l,
-    };
+    let login =
+        match tokio::time::timeout(LOGIN_TIMEOUT, login(socket, &state, acceptor, id, &shared))
+            .await
+        {
+            Err(_) => return Ok(()), // too slow to log in
+            Ok(Err(e)) => return Err(e),
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(l))) => l,
+        };
     let LoggedIn {
         mut io,
         agent,
@@ -240,19 +245,30 @@ async fn handle(
         sha2,
     } = login;
     let config = state.config();
-    let up = match connect_upstream(&config, caps & w::RELAYED_CAPS, w::safe_collation(charset)).await {
-        Ok(up) => up,
-        Err(e) => {
-            let msg = format!("ariodb: cannot connect to MySQL: {e}");
-            let _ = w::write_packet(&mut io, &mut seq, &w::err_packet(ER_UNKNOWN_ERROR, "08S01", &msg)).await;
-            return Ok(());
-        }
-    };
+    let up =
+        match connect_upstream(&config, caps & w::RELAYED_CAPS, w::safe_collation(charset)).await {
+            Ok(up) => up,
+            Err(e) => {
+                let msg = format!("ariodb: cannot connect to MySQL: {e}");
+                let _ = w::write_packet(
+                    &mut io,
+                    &mut seq,
+                    &w::err_packet(ER_UNKNOWN_ERROR, "08S01", &msg),
+                )
+                .await;
+                return Ok(());
+            }
+        };
     *shared.version.lock().expect("version lock") = up.version.clone();
     if sha2 {
         w::write_packet(&mut io, &mut seq, &[0x01, 0x03]).await?;
     }
-    w::write_packet(&mut io, &mut seq, &w::ok_packet(w::SERVER_STATUS_AUTOCOMMIT)).await?;
+    w::write_packet(
+        &mut io,
+        &mut seq,
+        &w::ok_packet(w::SERVER_STATUS_AUTOCOMMIT),
+    )
+    .await?;
 
     let live = Arc::new(Liveness::default());
     let kill = Arc::new(Notify::new());
@@ -340,7 +356,8 @@ async fn login(
     if acceptor.is_some() {
         caps |= w::CLIENT_SSL;
     }
-    // utf8mb4: MySQL 8's default collation, or MariaDB's, which MySQL lacks.
+    // utf8mb4: MySQL 8's default collation, or for MariaDB, which may not
+    // know that one, utf8mb4_general_ci.
     let charset = if version.contains("MariaDB") { 45 } else { 255 };
     let mut seq = 0u8;
     let hello = w::handshake_packet(&w::ServerHello {
@@ -369,16 +386,27 @@ async fn login(
         (Box::new(socket), s, first, false)
     };
     seq = s.wrapping_add(1);
-    let refuse = |code: u16, sqlstate: &str, msg: &str| w::err_packet(code, sqlstate, &format!("ariodb: {msg}"));
+    let refuse = |code: u16, sqlstate: &str, msg: &str| {
+        w::err_packet(code, sqlstate, &format!("ariodb: {msg}"))
+    };
     if config.mysql.require_tls && !tls {
-        let p = refuse(ER_SECURE_TRANSPORT_REQUIRED, "HY000", "connections must use TLS (for example --ssl-mode=REQUIRED)");
+        let p = refuse(
+            ER_SECURE_TRANSPORT_REQUIRED,
+            "HY000",
+            "connections must use TLS (for example --ssl-mode=REQUIRED)",
+        );
         let _ = w::write_packet(&mut io, &mut seq, &p).await;
         return Ok(None);
     }
     let hello = match w::parse_client_hello(&payload) {
         Ok(h) => h,
         Err(e) => {
-            let _ = w::write_packet(&mut io, &mut seq, &refuse(ER_HANDSHAKE_ERROR, "08S01", &e.to_string())).await;
+            let _ = w::write_packet(
+                &mut io,
+                &mut seq,
+                &refuse(ER_HANDSHAKE_ERROR, "08S01", &e.to_string()),
+            )
+            .await;
             return Ok(None);
         }
     };
@@ -390,7 +418,12 @@ async fn login(
     if hello.caps & w::CLIENT_PLUGIN_AUTH == 0 {
         plugin = w::NATIVE.to_string();
     } else if plugin != w::CACHING_SHA2 && plugin != w::NATIVE {
-        w::write_packet(&mut io, &mut seq, &w::auth_switch_packet(w::CACHING_SHA2, &nonce)).await?;
+        w::write_packet(
+            &mut io,
+            &mut seq,
+            &w::auth_switch_packet(w::CACHING_SHA2, &nonce),
+        )
+        .await?;
         let (s, p) = w::read_logical(&mut io, w::MAX_LOGIN_PACKET).await?;
         seq = s.wrapping_add(1);
         plugin = w::CACHING_SHA2.to_string();
@@ -407,14 +440,23 @@ async fn login(
     let agent = match verdict {
         Ok(a) => a,
         Err(why) => {
-            let p = refuse(ER_ACCESS_DENIED, "28000", &format!("access denied for agent '{user}': {why}"));
+            let p = refuse(
+                ER_ACCESS_DENIED,
+                "28000",
+                &format!("access denied for agent '{user}': {why}"),
+            );
             let _ = w::write_packet(&mut io, &mut seq, &p).await;
             return Ok(None);
         }
     };
     if !hello.database.is_empty() && hello.database != config.mysql.database {
         let msg = format!("agents may only use database '{}'", config.mysql.database);
-        let _ = w::write_packet(&mut io, &mut seq, &refuse(ER_DB_ACCESS_DENIED, "42000", &msg)).await;
+        let _ = w::write_packet(
+            &mut io,
+            &mut seq,
+            &refuse(ER_DB_ACCESS_DENIED, "42000", &msg),
+        )
+        .await;
         return Ok(None);
     }
     Ok(Some(LoggedIn {
@@ -447,7 +489,9 @@ impl Out {
     /// Relay one packet from the server, renumbered.
     async fn physical(&mut self, p: &[u8]) -> Result<(), WireError> {
         let len = (p.len() as u32).to_le_bytes();
-        self.w.write_all(&[len[0], len[1], len[2], self.seq]).await?;
+        self.w
+            .write_all(&[len[0], len[1], len[2], self.seq])
+            .await?;
         self.w.write_all(p).await?;
         self.seq = self.seq.wrapping_add(1);
         Ok(())
@@ -459,7 +503,8 @@ impl Out {
     }
 
     async fn server_error(&mut self, e: &ServerError) -> Result<(), WireError> {
-        self.packet(&w::err_packet(e.code, &e.state, &e.message)).await
+        self.packet(&w::err_packet(e.code, &e.state, &e.message))
+            .await
     }
 
     async fn flush(&mut self) -> Result<(), WireError> {
@@ -509,9 +554,22 @@ impl Conn {
                 Some(Err(WireError::TooLarge(n))) => {
                     // The reply follows the last of the packets the command took.
                     self.out.seq = (n / w::MAX_PHYSICAL + 1) as u8;
-                    self.audit("<too large>", &[], "refused", None, Some("command over 16 MiB"), None, Instant::now());
-                    let msg = format!("command of {n} bytes is over the {} MiB limit", MAX_COMMAND >> 20);
-                    self.out.error(ER_NET_PACKET_TOO_LARGE, "08S01", &msg).await?;
+                    self.audit(
+                        "<too large>",
+                        &[],
+                        "refused",
+                        None,
+                        Some("command over 16 MiB"),
+                        None,
+                        Instant::now(),
+                    );
+                    let msg = format!(
+                        "command of {n} bytes is over the {} MiB limit",
+                        MAX_COMMAND >> 20
+                    );
+                    self.out
+                        .error(ER_NET_PACKET_TOO_LARGE, "08S01", &msg)
+                        .await?;
                     self.out.flush().await?;
                     continue;
                 }
@@ -525,10 +583,17 @@ impl Conn {
                 return Ok(());
             }
             if let Err(e) = self.command(&cmd).await {
+                if self.live.gone.load(SeqCst) {
+                    return Ok(()); // the agent left mid-reply
+                }
                 // The server connection broke; tell the agent if it is listening.
                 let _ = self
                     .out
-                    .error(ER_UNKNOWN_ERROR, "08S01", &format!("lost the connection to MySQL: {e}"))
+                    .error(
+                        ER_UNKNOWN_ERROR,
+                        "08S01",
+                        &format!("lost the connection to MySQL: {e}"),
+                    )
                     .await;
                 let _ = self.out.flush().await;
                 return Err(e.to_string());
@@ -539,7 +604,10 @@ impl Conn {
 
     async fn command(&mut self, cmd: &[u8]) -> Result<(), WireError> {
         let Some(&code) = cmd.first() else {
-            return self.out.error(ER_UNKNOWN_ERROR, "08S01", "empty command").await;
+            return self
+                .out
+                .error(ER_UNKNOWN_ERROR, "08S01", "empty command")
+                .await;
         };
         let body = &cmd[1..];
         match code {
@@ -576,7 +644,9 @@ impl Conn {
             w::COM_PING => self.relay_single(cmd).await,
             w::COM_INIT_DB => {
                 if body == self.database.as_bytes() {
-                    self.out.packet(&w::ok_packet(w::SERVER_STATUS_AUTOCOMMIT)).await
+                    self.out
+                        .packet(&w::ok_packet(w::SERVER_STATUS_AUTOCOMMIT))
+                        .await
                 } else {
                     let msg = format!("agents may only use database '{}'", self.database);
                     self.out.error(ER_DB_ACCESS_DENIED, "42000", &msg).await
@@ -588,7 +658,11 @@ impl Conn {
                     self.relay_single(cmd).await
                 } else {
                     self.out
-                        .error(ER_REFUSED, "42000", "multiple statements per query are not supported through ariodb")
+                        .error(
+                            ER_REFUSED,
+                            "42000",
+                            "multiple statements per query are not supported through ariodb",
+                        )
                         .await
                 }
             }
@@ -627,7 +701,11 @@ impl Conn {
 
     async fn unknown_statement(&mut self) -> Result<(), WireError> {
         self.out
-            .error(ER_UNKNOWN_STMT_HANDLER, "HY000", "unknown prepared statement")
+            .error(
+                ER_UNKNOWN_STMT_HANDLER,
+                "HY000",
+                "unknown prepared statement",
+            )
             .await
     }
 
@@ -641,7 +719,11 @@ impl Conn {
     }
 
     /// Read SQL text from a command, refusing what ariodb will not judge.
-    async fn sql_text(&mut self, body: &[u8], started: Instant) -> Result<Option<String>, WireError> {
+    async fn sql_text(
+        &mut self,
+        body: &[u8],
+        started: Instant,
+    ) -> Result<Option<String>, WireError> {
         let reason = if body.len() > MAX_SQL {
             "statement over the 1 MiB inspection limit"
         } else {
@@ -680,7 +762,15 @@ impl Conn {
         r: &Refusal,
         started: Instant,
     ) -> Result<(), WireError> {
-        self.audit(sql, statements, "refused", None, Some(&r.message), r.rule.as_deref(), started);
+        self.audit(
+            sql,
+            statements,
+            "refused",
+            None,
+            Some(&r.message),
+            r.rule.as_deref(),
+            started,
+        );
         self.out.error(ER_REFUSED, "42000", &r.message).await
     }
 
@@ -696,13 +786,15 @@ impl Conn {
             Ok(s) => s,
             Err(e) => return self.refuse(&sql, &[], &Refusal::new(e), started).await,
         };
-        let (plan, approved) = match gate::check_detailed(&self.state, &self.ctx(), &statements).await {
-            Ok(p) => p,
-            Err(r) => return self.refuse(&sql, &statements, &r, started).await,
-        };
+        let (plan, approved) =
+            match gate::check_detailed(&self.state, &self.ctx(), &statements).await {
+                Ok(p) => p,
+                Err(r) => return self.refuse(&sql, &statements, &r, started).await,
+            };
         let mut cmd = vec![w::COM_QUERY];
         cmd.extend_from_slice(body);
-        self.run_statement(&cmd, &sql, &statements, plan, approved, started).await
+        self.run_statement(&cmd, &sql, &statements, plan, approved, started)
+            .await
     }
 
     async fn prepare(&mut self, body: &[u8]) -> Result<(), WireError> {
@@ -725,7 +817,15 @@ impl Conn {
         let (_, mut first) = self.up.read().await?;
         if first.first() != Some(&0x00) {
             let e = w::parse_err(&first);
-            self.audit(&sql, &statements, "failed", None, Some(&e.message), None, started);
+            self.audit(
+                &sql,
+                &statements,
+                "failed",
+                None,
+                Some(&e.message),
+                None,
+                started,
+            );
             return self.out.physical(&first).await;
         }
         let (upstream, _, _, tail) = w::prepare_ok_tail(&first, self.up.deprecate_eof())?;
@@ -769,7 +869,10 @@ impl Conn {
 
     async fn execute(&mut self, cmd: &[u8]) -> Result<(), WireError> {
         let started = Instant::now();
-        let Some(id) = cmd.get(1..5).map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes"))) else {
+        let Some(id) = cmd
+            .get(1..5)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        else {
             return self.unknown_statement().await;
         };
         let Some(p) = self.statements.get(&id) else {
@@ -781,13 +884,15 @@ impl Conn {
             let r = Refusal::new("cursors (COM_STMT_FETCH) are not supported through ariodb");
             return self.refuse(&sql, &statements, &r, started).await;
         }
-        let (plan, approved) = match gate::check_detailed(&self.state, &self.ctx(), &statements).await {
-            Ok(p) => p,
-            Err(r) => return self.refuse(&sql, &statements, &r, started).await,
-        };
+        let (plan, approved) =
+            match gate::check_detailed(&self.state, &self.ctx(), &statements).await {
+                Ok(p) => p,
+                Err(r) => return self.refuse(&sql, &statements, &r, started).await,
+            };
         let mut c = cmd.to_vec();
         c[1..5].copy_from_slice(&upstream.to_le_bytes());
-        self.run_statement(&c, &sql, &statements, plan, approved, started).await
+        self.run_statement(&c, &sql, &statements, plan, approved, started)
+            .await
     }
 
     /// Run one allowed statement in ariodb's own transaction.
@@ -805,7 +910,15 @@ impl Conn {
             Plan::Write => "START TRANSACTION",
         };
         if let Err(e) = self.up.query(begin).await? {
-            self.audit(sql, statements, "failed", None, Some(&e.message), None, started);
+            self.audit(
+                sql,
+                statements,
+                "failed",
+                None,
+                Some(&e.message),
+                None,
+                started,
+            );
             return self.out.server_error(&e).await;
         }
         if plan == Plan::Write && self.tagging {
@@ -845,7 +958,15 @@ impl Conn {
         }
         if let Some(e) = &r.failed {
             self.end(false).await?;
-            self.audit(sql, statements, "failed", None, Some(&e.message), None, started);
+            self.audit(
+                sql,
+                statements,
+                "failed",
+                None,
+                Some(&e.message),
+                None,
+                started,
+            );
             for p in &r.held {
                 self.out.physical(p).await?;
             }
@@ -853,7 +974,15 @@ impl Conn {
         }
         if plan == Plan::Read {
             self.end(true).await?;
-            self.audit(sql, statements, "allowed", None, None, approved.as_deref(), started);
+            self.audit(
+                sql,
+                statements,
+                "allowed",
+                None,
+                None,
+                approved.as_deref(),
+                started,
+            );
             return Ok(());
         }
 
@@ -881,10 +1010,26 @@ impl Conn {
             return self.out.error(ER_REFUSED, "42000", &refusal.message).await;
         }
         if let Err(e) = self.up.query("COMMIT").await? {
-            self.audit(sql, statements, "failed", Some(rows), Some(&e.message), None, started);
+            self.audit(
+                sql,
+                statements,
+                "failed",
+                Some(rows),
+                Some(&e.message),
+                None,
+                started,
+            );
             return self.out.server_error(&e).await;
         }
-        self.audit(sql, statements, "allowed", Some(rows), None, approved.as_deref(), started);
+        self.audit(
+            sql,
+            statements,
+            "allowed",
+            Some(rows),
+            None,
+            approved.as_deref(),
+            started,
+        );
         for p in &r.held {
             self.out.physical(p).await?;
         }
@@ -911,7 +1056,10 @@ impl Conn {
                 Seen::Err => {
                     r.failed.get_or_insert_with(|| w::parse_err(&p));
                 }
-                Seen::End { affected, status_at } => {
+                Seen::End {
+                    affected,
+                    status_at,
+                } => {
                     r.reported += affected;
                     w::clear_trans_status(&mut p, status_at);
                 }
@@ -936,7 +1084,10 @@ impl Conn {
     }
 
     async fn end(&mut self, commit: bool) -> Result<(), WireError> {
-        let _ = self.up.query(if commit { "COMMIT" } else { "ROLLBACK" }).await?;
+        let _ = self
+            .up
+            .query(if commit { "COMMIT" } else { "ROLLBACK" })
+            .await?;
         Ok(())
     }
 
@@ -988,7 +1139,9 @@ impl Conn {
             Kill::Query(n) => (n, true),
             Kill::Connection(n) => (n, false),
             Kill::Other => {
-                let r = Refusal::new("only KILL QUERY <id> and KILL <id> are allowed, for the agent's own connections");
+                let r = Refusal::new(
+                    "only KILL QUERY <id> and KILL <id> are allowed, for the agent's own connections",
+                );
                 return self.refuse(sql, &[], &r, started).await;
             }
         };
@@ -1003,10 +1156,22 @@ impl Conn {
         });
         let Some(entry) = entry else {
             // Other agents' connections look the same as ones that do not exist.
-            self.audit(sql, &[], "refused", None, Some("no such connection of this agent"), None, started);
+            self.audit(
+                sql,
+                &[],
+                "refused",
+                None,
+                Some("no such connection of this agent"),
+                None,
+                started,
+            );
             return self
                 .out
-                .error(ER_NO_SUCH_THREAD, "HY000", &format!("unknown thread id: {target}"))
+                .error(
+                    ER_NO_SUCH_THREAD,
+                    "HY000",
+                    &format!("unknown thread id: {target}"),
+                )
                 .await;
         };
         // A statement waiting for approval is withdrawn; one running on the
@@ -1024,14 +1189,19 @@ impl Conn {
                     if let Ok(Err(e)) = up.query(&format!("{what} {thread}")).await
                         && e.code != ER_NO_SUCH_THREAD
                     {
-                        eprintln!("ariodb: could not stop MySQL thread {thread}: {}", e.message);
+                        eprintln!(
+                            "ariodb: could not stop MySQL thread {thread}: {}",
+                            e.message
+                        );
                     }
                 }
                 Err(e) => eprintln!("ariodb: could not stop MySQL thread {thread}: {e}"),
             }
         }
         self.audit(sql, &[], "allowed", None, None, None, started);
-        self.out.packet(&w::ok_packet(w::SERVER_STATUS_AUTOCOMMIT)).await
+        self.out
+            .packet(&w::ok_packet(w::SERVER_STATUS_AUTOCOMMIT))
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1046,11 +1216,12 @@ impl Conn {
         started: Instant,
     ) {
         let tables = gate::tables(statements);
-        let kind = if statements.is_empty() && sql.trim_start().to_ascii_lowercase().starts_with("kill") {
-            "session".to_string()
-        } else {
-            gate::kinds(statements)
-        };
+        let kind =
+            if statements.is_empty() && sql.trim_start().to_ascii_lowercase().starts_with("kill") {
+                "session".to_string()
+            } else {
+                gate::kinds(statements)
+            };
         self.state.audit.record(&crate::audit::Entry {
             session: &self.session,
             agent: &self.agent.name,
@@ -1149,11 +1320,15 @@ mod tests {
     #[test]
     fn quoting_modes_are_removed_from_sql_mode() {
         assert_eq!(
-            safe_sql_mode("ONLY_FULL_GROUP_BY,ANSI_QUOTES,STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"),
+            safe_sql_mode(
+                "ONLY_FULL_GROUP_BY,ANSI_QUOTES,STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"
+            ),
             "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES"
         );
         assert_eq!(
-            safe_sql_mode("REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI"),
+            safe_sql_mode(
+                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI"
+            ),
             "REAL_AS_FLOAT,PIPES_AS_CONCAT,IGNORE_SPACE,ONLY_FULL_GROUP_BY"
         );
         assert_eq!(safe_sql_mode(""), "");

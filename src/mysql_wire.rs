@@ -58,8 +58,11 @@ const _: () = assert!(AGENT_CAPS & (CLIENT_LOCAL_FILES | CLIENT_MULTI_STATEMENTS
 
 /// The agent's choices that change what the server sends back, so they are
 /// asked for upstream too.
-pub const RELAYED_CAPS: u32 =
-    CLIENT_FOUND_ROWS | CLIENT_LONG_FLAG | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS | CLIENT_DEPRECATE_EOF;
+pub const RELAYED_CAPS: u32 = CLIENT_FOUND_ROWS
+    | CLIENT_LONG_FLAG
+    | CLIENT_MULTI_RESULTS
+    | CLIENT_PS_MULTI_RESULTS
+    | CLIENT_DEPRECATE_EOF;
 
 pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
@@ -263,7 +266,9 @@ impl<'a> Buf<'a> {
     pub fn lenenc_bytes(&mut self) -> Result<Option<&'a [u8]>, WireError> {
         match self.lenenc()? {
             None => Ok(None),
-            Some(n) => self.bytes(usize::try_from(n).map_err(|_| protocol("field too long"))?).map(Some),
+            Some(n) => self
+                .bytes(usize::try_from(n).map_err(|_| protocol("field too long"))?)
+                .map(Some),
         }
     }
     /// Bytes up to a NUL (or the end), without the NUL.
@@ -358,7 +363,10 @@ pub enum Seen {
     Data,
     /// An OK packet, or the OK or EOF that ends a result set. `status_at`
     /// is where its two status bytes are.
-    End { affected: u64, status_at: usize },
+    End {
+        affected: u64,
+        status_at: usize,
+    },
     Err,
     LocalInfile,
 }
@@ -734,7 +742,10 @@ impl Upstream {
         let _ = tcp.set_nodelay(true);
         let (seq, hello) = read_logical(&mut tcp, MAX_LOGIN_PACKET).await?;
         if hello.first() == Some(&0xFF) {
-            return Err(format!("MySQL refused the connection: {}", parse_err(&hello).message));
+            return Err(format!(
+                "MySQL refused the connection: {}",
+                parse_err(&hello).message
+            ));
         }
         let mut b = Buf::new(&hello);
         if b.u8()? != 10 {
@@ -836,7 +847,10 @@ impl Upstream {
             match p.first() {
                 Some(0x00) => break,
                 Some(0xFF) => {
-                    return Err(format!("MySQL refused ariodb's login: {}", parse_err(&p).message));
+                    return Err(format!(
+                        "MySQL refused ariodb's login: {}",
+                        parse_err(&p).message
+                    ));
                 }
                 Some(0xFE) => {
                     // AuthSwitchRequest: another plugin, and a fresh nonce.
@@ -931,7 +945,9 @@ impl Upstream {
             let (seq, p) = self.read().await?;
             if p.len() == MAX_PHYSICAL {
                 // ariodb never asks for values this long.
-                return Err(protocol("unexpectedly long reply to ariodb's own statement"));
+                return Err(protocol(
+                    "unexpectedly long reply to ariodb's own statement",
+                ));
             }
             match reply.feed(&p)? {
                 Seen::Err => error = Some(parse_err(&p)),
@@ -1003,8 +1019,18 @@ mod tests {
         assert!(!check_scramble(NATIVE, b"other-test-only-pw", &nonce, &s));
         let s2 = sha2_scramble(b"local-test-only-pw", b"abcdefghijklmnopqrst");
         assert_eq!(s2.len(), 32);
-        assert!(check_scramble(CACHING_SHA2, b"local-test-only-pw", b"abcdefghijklmnopqrst", &s2));
-        assert!(!check_scramble(CACHING_SHA2, b"local-test-only-pw", b"abcdefghijklmnopqrsu", &s2));
+        assert!(check_scramble(
+            CACHING_SHA2,
+            b"local-test-only-pw",
+            b"abcdefghijklmnopqrst",
+            &s2
+        ));
+        assert!(!check_scramble(
+            CACHING_SHA2,
+            b"local-test-only-pw",
+            b"abcdefghijklmnopqrsu",
+            &s2
+        ));
         // An empty password never matches anything.
         assert!(!check_scramble(NATIVE, b"", &nonce, &[]));
         assert!(!check_scramble("client_ed25519", b"x", &nonce, &s));
@@ -1032,7 +1058,9 @@ mod tests {
     #[test]
     fn rsa_password_decrypts_to_the_password_xor_nonce() {
         use aws_lc_rs::encoding::AsDer;
-        use aws_lc_rs::rsa::{KeySize, OAEP_SHA1_MGF1SHA1, OaepPrivateDecryptingKey, PrivateDecryptingKey};
+        use aws_lc_rs::rsa::{
+            KeySize, OAEP_SHA1_MGF1SHA1, OaepPrivateDecryptingKey, PrivateDecryptingKey,
+        };
         use base64::Engine;
         let private = PrivateDecryptingKey::generate(KeySize::Rsa2048).unwrap();
         let der = private.public_key().as_der().unwrap();
@@ -1042,8 +1070,14 @@ mod tests {
         let secret = rsa_encrypt_password(b"gw-local-test-only", nonce, pem.as_bytes()).unwrap();
         let key = OaepPrivateDecryptingKey::new(private).unwrap();
         let mut out = vec![0u8; key.min_output_size()];
-        let plain = key.decrypt(&OAEP_SHA1_MGF1SHA1, &secret, &mut out, None).unwrap();
-        let unmasked: Vec<u8> = plain.iter().enumerate().map(|(i, b)| b ^ nonce[i % 20]).collect();
+        let plain = key
+            .decrypt(&OAEP_SHA1_MGF1SHA1, &secret, &mut out, None)
+            .unwrap();
+        let unmasked: Vec<u8> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ nonce[i % 20])
+            .collect();
         assert_eq!(unmasked, b"gw-local-test-only\0");
         assert!(rsa_encrypt_password(b"x", nonce, b"not a key").is_err());
     }
@@ -1090,7 +1124,13 @@ mod tests {
         assert_eq!(r.feed(b"\x01a\x01b").unwrap(), Seen::Data);
         assert!(!r.done());
         let end = r.feed(&[0xFE, 0, 0, 0x01, 0]).unwrap();
-        assert_eq!(end, Seen::End { affected: 0, status_at: 3 });
+        assert_eq!(
+            end,
+            Seen::End {
+                affected: 0,
+                status_at: 3
+            }
+        );
         assert!(r.done());
 
         // CLIENT_DEPRECATE_EOF: no EOF after columns; an OK with 0xFE ends it.
@@ -1102,7 +1142,13 @@ mod tests {
         let mut ok = vec![0xFE, 0, 0];
         ok.extend_from_slice(&(SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT).to_le_bytes());
         ok.extend_from_slice(&[0, 0]);
-        assert_eq!(r.feed(&ok).unwrap(), Seen::End { affected: 0, status_at: 3 });
+        assert_eq!(
+            r.feed(&ok).unwrap(),
+            Seen::End {
+                affected: 0,
+                status_at: 3
+            }
+        );
         clear_trans_status(&mut ok, 3);
         assert_eq!(u16::from_le_bytes([ok[3], ok[4]]), SERVER_STATUS_AUTOCOMMIT);
         assert!(r.done());
@@ -1110,8 +1156,12 @@ mod tests {
         // An OK for a write, with its affected rows.
         let mut r = Reply::new(true);
         assert_eq!(
-            r.feed(&[0x00, 0xFC, 0x2C, 0x01, 0x00, 0x02, 0x00, 0, 0]).unwrap(),
-            Seen::End { affected: 300, status_at: 5 }
+            r.feed(&[0x00, 0xFC, 0x2C, 0x01, 0x00, 0x02, 0x00, 0, 0])
+                .unwrap(),
+            Seen::End {
+                affected: 300,
+                status_at: 5
+            }
         );
         assert!(r.done());
 
@@ -1209,6 +1259,9 @@ mod tests {
         assert_eq!(b.u32().unwrap(), 42);
         assert_eq!(b.bytes(8).unwrap(), &n[..8]);
         assert!(p.ends_with(b"caching_sha2_password\0"));
-        assert_eq!(AGENT_CAPS & (CLIENT_LOCAL_FILES | CLIENT_MULTI_STATEMENTS), 0);
+        assert_eq!(
+            AGENT_CAPS & (CLIENT_LOCAL_FILES | CLIENT_MULTI_STATEMENTS),
+            0
+        );
     }
 }
