@@ -531,7 +531,6 @@ impl LoginLimiter {
     }
 }
 
-
 /// Start a session; returns its cookie and CSRF token. `sso` carries what
 /// the identity provider said, for single sign-on sessions.
 pub(crate) fn new_session(
@@ -836,13 +835,14 @@ async fn hook_confirm(
             LinkUser::Refused(why) => {
                 return hook_page(
                     StatusCode::FORBIDDEN,
-                    format!("<p>You may not decide this request: {}.</p>", html_escape(&why)),
+                    format!(
+                        "<p>You may not decide this request: {}.</p>",
+                        html_escape(&why)
+                    ),
                 );
             }
             LinkUser::Nobody => {
-                let cross_site = headers
-                    .get("sec-fetch-site")
-                    .and_then(|v| v.to_str().ok())
+                let cross_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok())
                     == Some("cross-site");
                 if cross_site && q.again.is_none() {
                     let again = format!("{link}&again=1");
@@ -948,7 +948,10 @@ async fn hook_decide(
             LinkUser::Refused(why) => {
                 return hook_page(
                     StatusCode::FORBIDDEN,
-                    format!("<p>You may not decide this request: {}.</p>", html_escape(&why)),
+                    format!(
+                        "<p>You may not decide this request: {}.</p>",
+                        html_escape(&why)
+                    ),
                 );
             }
             LinkUser::Nobody => return sign_in_page(&config, &q.path(&id)),

@@ -144,7 +144,10 @@ impl Checks {
 
 /// A column, or its type's default when it is missing or of another type:
 /// Postgres-compatible databases differ in the types they return.
-fn col<'a, T: tokio_postgres::types::FromSql<'a> + Default>(row: &'a tokio_postgres::Row, i: usize) -> T {
+fn col<'a, T: tokio_postgres::types::FromSql<'a> + Default>(
+    row: &'a tokio_postgres::Row,
+    i: usize,
+) -> T {
     row.try_get(i).unwrap_or_default()
 }
 
@@ -351,7 +354,8 @@ async fn check_login(
         );
         Ok(())
     } else if let Some(name) = cannot_measure {
-        let why = format!("{name} does not count changes to its tables in pg_stat_xact_user_tables");
+        let why =
+            format!("{name} does not count changes to its tables in pg_stat_xact_user_tables");
         checks.fail(format!(
             "{why}, so ariodb rolls back every write. Set [database] write_check = \"reported\" to allow writes with a weaker check"
         ));
@@ -376,14 +380,14 @@ async fn describe_server(client: &Client) -> String {
         Ok(r) => col(&r, 0),
         Err(e) => return format!("server version unknown: {}", message(&e)),
     };
-    let short = full.split(" on ").next().unwrap_or(&full).trim().to_string();
+    let short = full
+        .split(" on ")
+        .next()
+        .unwrap_or(&full)
+        .trim()
+        .to_string();
     let probe = |sql: &'static str| async move {
-        client
-            .query_opt(sql, &[])
-            .await
-            .ok()
-            .flatten()
-            .is_some()
+        client.query_opt(sql, &[]).await.ok().flatten().is_some()
     };
     let mut also = Vec::new();
     if probe("SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'").await {
@@ -474,8 +478,7 @@ async fn check_effects(client: &Client, checks: &mut Checks) -> Result<(), Strin
     match rows {
         Ok(rows) => {
             let seen = rows.iter().any(|r| {
-                col::<Option<String>>(r, 0)
-                    .is_some_and(|t| t.ends_with(".ariodb_doctor"))
+                col::<Option<String>>(r, 0).is_some_and(|t| t.ends_with(".ariodb_doctor"))
                     && col::<Option<i64>>(r, 1) == Some(3)
             });
             if seen {
@@ -544,10 +547,14 @@ async fn check_tables(config: &Config, label: &str, client: &Client, checks: &mu
                 )
                 .await;
             let Ok(row) = row else { continue };
-            let (exists, can_read, can_write): (bool, bool, bool) = (col(&row, 0), col(&row, 1), col(&row, 2));
+            let (exists, can_read, can_write): (bool, bool, bool) =
+                (col(&row, 0), col(&row, 1), col(&row, 2));
             if !exists {
                 problems += 1;
-                checks.warn(format!("agent '{}': table '{table}' does not exist", agent.name));
+                checks.warn(format!(
+                    "agent '{}': table '{table}' does not exist",
+                    agent.name
+                ));
             } else if !can_read {
                 problems += 1;
                 checks.warn(format!(
@@ -675,7 +682,10 @@ async fn check_journal(config: &Config, url: &str, checks: &mut Checks) -> Resul
             let missing: Vec<&String> = protected.iter().filter(|t| !listed.contains(t)).collect();
             if rows.is_empty()
                 && client
-                    .query_opt("SELECT 1 FROM pg_publication WHERE pubname = $1", &[publication])
+                    .query_opt(
+                        "SELECT 1 FROM pg_publication WHERE pubname = $1",
+                        &[publication],
+                    )
                     .await
                     .ok()
                     .flatten()
@@ -688,14 +698,20 @@ async fn check_journal(config: &Config, url: &str, checks: &mut Checks) -> Resul
                     "not set up (run ariodb setup)",
                 );
             } else if missing.is_empty() {
-                checks.ok(format!("publication '{publication}' covers every table agents may change"));
+                checks.ok(format!(
+                    "publication '{publication}' covers every table agents may change"
+                ));
             } else {
                 fail(
                     checks,
                     &mut undo,
                     format!(
                         "publication '{publication}' leaves out {}; run `ariodb setup` again",
-                        missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        missing
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                     "some tables are not journalled (run ariodb setup)",
                 );
@@ -899,16 +915,22 @@ async fn check_mysql_gateway(
         Ok(p) => p,
         Err(e) => return fail_both(checks, e),
     };
-    let mut conn = match crate::mysql_journal::connect_as(config, &config.mysql.user, &password).await {
-        Ok(c) => c,
-        Err(e) => return fail_both(checks, e),
-    };
+    let mut conn =
+        match crate::mysql_journal::connect_as(config, &config.mysql.user, &password).await {
+            Ok(c) => c,
+            Err(e) => return fail_both(checks, e),
+        };
     let cipher: Option<(String, String)> = conn
         .query_first("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
         .await
         .ok()
         .flatten();
-    let host = config.mysql.addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+    let host = config
+        .mysql
+        .addr
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or("");
     match cipher {
         Some((_, c)) if !c.is_empty() => checks.ok("connected over TLS"),
         _ if host == "localhost" || host.starts_with("127.") || host == "[::1]" => {
@@ -924,12 +946,17 @@ async fn check_mysql_gateway(
         Ok(None) => checks.warn("server version unknown"),
         Err(e) => checks.warn(format!("server version unknown: {}", message(&e))),
     }
-    let _ = conn.query_drop("SET SESSION innodb_lock_wait_timeout = 3").await;
+    let _ = conn
+        .query_drop("SET SESSION innodb_lock_wait_timeout = 3")
+        .await;
 
     // ariodb compares table names without regard to case. Where the server
     // does not, tables whose names differ only by case are told apart by
     // the server but not by ariodb's allow-lists.
-    if let Ok(Some(0)) = conn.query_first::<i64, _>("SELECT @@lower_case_table_names").await {
+    if let Ok(Some(0)) = conn
+        .query_first::<i64, _>("SELECT @@lower_case_table_names")
+        .await
+    {
         let clashes: Vec<String> = conn
             .exec(
                 "SELECT GROUP_CONCAT(table_name ORDER BY table_name SEPARATOR ', ')
@@ -1014,7 +1041,9 @@ async fn check_mysql_gateway(
         )
         .await
         .is_none();
-        made && mysql_error(&mut conn, "INSERT INTO ariodb_doctor VALUES (1)").await.is_none()
+        made && mysql_error(&mut conn, "INSERT INTO ariodb_doctor VALUES (1)")
+            .await
+            .is_none()
     };
     // InnoDB refreshes innodb_trx at most every 0.1 seconds after a read.
     tokio::time::sleep(Duration::from_millis(110)).await;
@@ -1024,7 +1053,9 @@ async fn check_mysql_gateway(
         )
         .await;
     let _ = conn.query_drop("ROLLBACK").await;
-    let _ = conn.query_drop("DROP TEMPORARY TABLE IF EXISTS ariodb_doctor").await;
+    let _ = conn
+        .query_drop("DROP TEMPORARY TABLE IF EXISTS ariodb_doctor")
+        .await;
     match counted {
         Ok(Some(n)) if wrote && n >= 1 => checks.ok(format!(
             "writes are counted before commit, triggers and cascades included (a 1-row test write counted {n})"

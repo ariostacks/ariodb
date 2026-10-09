@@ -362,8 +362,8 @@ mod tests {
     /// arrives, with the connection, still open, that the answer streams on.
     async fn ask(port: u16) -> (String, TcpStream) {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let auth = base64::engine::general_purpose::STANDARD
-            .encode("analyst:agent-token-local-test-only");
+        let auth =
+            base64::engine::general_purpose::STANDARD.encode("analyst:agent-token-local-test-only");
         let sql = "SELECT count() FROM events";
         s.write_all(
             format!(

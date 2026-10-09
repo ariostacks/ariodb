@@ -15,8 +15,8 @@
 //! External tables are refused.
 
 use crate::chsql;
-use crate::clickhouse_blocks::{Frames, MAX_HELD, Problem, read_data};
 use crate::classify::Kind;
+use crate::clickhouse_blocks::{Frames, MAX_HELD, Problem, read_data};
 use crate::gate::{self, Ctx, State};
 use crate::limits::{Admission, Limiter};
 use std::sync::Arc;
@@ -522,10 +522,17 @@ where
                         match countable {
                             Err(e) => Err((None, e, "unsupported", Vec::new())),
                             Ok(()) => {
-                                let ctx = Ctx { agent, session, database, live: None };
+                                let ctx = Ctx {
+                                    agent,
+                                    session,
+                                    database,
+                                    live: None,
+                                };
                                 gate::check_detailed(state, &ctx, std::slice::from_ref(s))
                                     .await
-                                    .map_err(|r| (r.rule.clone(), r.message, "refused", r.decided_by))
+                                    .map_err(|r| {
+                                        (r.rule.clone(), r.message, "refused", r.decided_by)
+                                    })
                             }
                         }
                     }
@@ -571,25 +578,54 @@ where
                 out.extend_from_slice(&data.expect("checked above"));
                 up.write_all(&out).await.map_err(|e| e.to_string())?;
                 if !insert {
-                    record("allowed", None, None, approved.rule.as_deref(), &approved.by);
+                    record(
+                        "allowed",
+                        None,
+                        None,
+                        approved.rule.as_deref(),
+                        &approved.by,
+                    );
                     continue;
                 }
                 let limit = agent
                     .max_rows_per_write
                     .unwrap_or(config.limits.max_rows_per_write);
                 match relay_insert(c, up, &mut frames, rev, limit).await {
-                    Insert::Sent(rows) => {
-                        record("allowed", Some(rows), None, approved.rule.as_deref(), &approved.by)
-                    }
-                    Insert::Abandoned { reason, next: after } => {
-                        record("failed", None, Some(reason), approved.rule.as_deref(), &approved.by);
+                    Insert::Sent(rows) => record(
+                        "allowed",
+                        Some(rows),
+                        None,
+                        approved.rule.as_deref(),
+                        &approved.by,
+                    ),
+                    Insert::Abandoned {
+                        reason,
+                        next: after,
+                    } => {
+                        record(
+                            "failed",
+                            None,
+                            Some(reason),
+                            approved.rule.as_deref(),
+                            &approved.by,
+                        );
                         match after {
                             Some(p) => next = Some(p),
                             None => return Ok(None),
                         }
                     }
-                    Insert::Stopped { outcome, message, rows } => {
-                        record(outcome, rows, Some(&message), approved.rule.as_deref(), &approved.by);
+                    Insert::Stopped {
+                        outcome,
+                        message,
+                        rows,
+                    } => {
+                        record(
+                            outcome,
+                            rows,
+                            Some(&message),
+                            approved.rule.as_deref(),
+                            &approved.by,
+                        );
                         return Ok(Some(message));
                     }
                 }
@@ -855,7 +891,11 @@ fn rebuild_query(q: &Query, timeout_seconds: u64, read_only: bool) -> Vec<u8> {
     } else {
         // Type names as text, as ariodb reads them. Not marked important,
         // so servers without the setting ignore it.
-        ours.push(("input_format_native_decode_types_in_binary_format", "0".to_string(), 0));
+        ours.push((
+            "input_format_native_decode_types_in_binary_format",
+            "0".to_string(),
+            0,
+        ));
     }
     for (name, value, flags) in ours {
         put_string(&mut out, name);

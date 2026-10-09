@@ -1769,8 +1769,14 @@ mod tests {
     fn optimizer_hints_are_harmless_unless_they_change_limits() {
         let s = one("SELECT /*+ NO_INDEX(orders) */ * FROM orders");
         assert_eq!((s.kind, s.tables), (Kind::Read, vec!["orders".to_string()]));
-        assert_eq!(kind_of("SELECT /*+ MAX_EXECUTION_TIME(1000000) */ * FROM orders"), Kind::Unknown);
-        assert_eq!(kind_of("SELECT /*+ RESOURCE_GROUP(batch) */ * FROM orders"), Kind::Unknown);
+        assert_eq!(
+            kind_of("SELECT /*+ MAX_EXECUTION_TIME(1000000) */ * FROM orders"),
+            Kind::Unknown
+        );
+        assert_eq!(
+            kind_of("SELECT /*+ RESOURCE_GROUP(batch) */ * FROM orders"),
+            Kind::Unknown
+        );
         assert_eq!(
             kind_of("UPDATE /*+ NO_RANGE_OPTIMIZATION(orders) */ orders SET a = 1 WHERE id = 1"),
             Kind::Write

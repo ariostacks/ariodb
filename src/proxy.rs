@@ -10,8 +10,8 @@
 //! portals are untouched.
 
 use crate::classify::{self, Statement};
-use crate::exec::{Session, Sink};
 use crate::config::Agent;
+use crate::exec::{Session, Sink};
 use crate::gate::{self, Plan, Refusal, State};
 use crate::limits::{Admission, Limiter};
 use crate::tls::Io;
@@ -1027,9 +1027,12 @@ mod tests {
     /// SQLSTATE and message of the error that ends the connection.
     async fn startup(port: u16, user: &str, token: Option<&str>) -> (String, String) {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        s.write_all(&wire::startup_message(&[("user", user), ("database", "app")]))
-            .await
-            .unwrap();
+        s.write_all(&wire::startup_message(&[
+            ("user", user),
+            ("database", "app"),
+        ]))
+        .await
+        .unwrap();
         loop {
             let f = match wire::read_frame(&mut s).await {
                 Ok(f) => f,
@@ -1122,7 +1125,10 @@ mod tests {
         // ...so its second is over its own limit.
         let (code, message) = startup(port, "bot", token).await;
         assert_eq!(code, "53300", "{message}");
-        assert!(message.contains("too many connections for agent \"bot\""), "{message}");
+        assert!(
+            message.contains("too many connections for agent \"bot\""),
+            "{message}"
+        );
 
         // A silent client takes the listener's last place, so the next
         // client is refused once its startup arrives...

@@ -21,10 +21,10 @@
 
 use crate::config::Limits;
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -133,7 +133,9 @@ impl Limiter {
         }
         self.open.fetch_sub(1, SeqCst);
         self.note_refusal("", || {
-            format!("refusing new connections: {max} are open, the limit ([limits] max_connections)")
+            format!(
+                "refusing new connections: {max} are open, the limit ([limits] max_connections)"
+            )
         });
         if self.refusing.fetch_add(1, SeqCst) < MAX_REFUSING {
             Admission::Refuse(Refusing(self.clone()))
@@ -275,10 +277,12 @@ pub async fn serve_http(
         let (tls, app, timeout) = (tls.clone(), app.clone(), limiter.handshake_timeout());
         tokio::spawn(async move {
             let io: Box<dyn crate::tls::Io> = match tls {
-                Some(acceptor) => match tokio::time::timeout(timeout, acceptor.accept(socket)).await {
-                    Ok(Ok(stream)) => Box::new(stream),
-                    _ => return,
-                },
+                Some(acceptor) => {
+                    match tokio::time::timeout(timeout, acceptor.accept(socket)).await {
+                        Ok(Ok(stream)) => Box::new(stream),
+                        _ => return,
+                    }
+                }
                 None => Box::new(socket),
             };
             let io = hyper_util::rt::TokioIo::new(WriteDeadline::new(io, timeout));
@@ -402,7 +406,11 @@ impl<T> WriteDeadline<T> {
     }
 
     /// What a write returned, unless it has waited too long.
-    fn check<R>(&mut self, cx: &mut Context<'_>, polled: Poll<std::io::Result<R>>) -> Poll<std::io::Result<R>> {
+    fn check<R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        polled: Poll<std::io::Result<R>>,
+    ) -> Poll<std::io::Result<R>> {
         if polled.is_ready() {
             self.stalled = None;
             return polled;
@@ -622,7 +630,9 @@ mod tests {
     }
 
     /// Serve `app` with room for one connection and a 300 ms timeout.
-    async fn one_place(app: axum::Router) -> (SocketAddr, Arc<Limiter>, tokio::task::JoinHandle<()>) {
+    async fn one_place(
+        app: axum::Router,
+    ) -> (SocketAddr, Arc<Limiter>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let limiter = Limiter::new("test", &limits(1, 1, 300));
@@ -671,11 +681,16 @@ mod tests {
         slow.write_all(b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\nSELECT")
             .await
             .unwrap();
-        assert!(place_given_back(&limiter).await, "the slow body still holds the place");
+        assert!(
+            place_given_back(&limiter).await,
+            "the slow body still holds the place"
+        );
         let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi")
-            .await
-            .unwrap();
+        s.write_all(
+            b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi",
+        )
+        .await
+        .unwrap();
         let mut out = String::new();
         let _ = s.read_to_string(&mut out).await;
         assert!(out.contains("got 2"), "{out}");
@@ -711,7 +726,10 @@ mod tests {
     async fn a_client_that_stops_reading_its_answer_is_cut_off() {
         let big = "x".repeat(32 << 20);
         let app = axum::Router::new()
-            .route("/big", axum::routing::get(move || async move { big.clone() }))
+            .route(
+                "/big",
+                axum::routing::get(move || async move { big.clone() }),
+            )
             .route("/", axum::routing::get(|| async { "small" }));
         let (addr, limiter, server) = one_place(app).await;
         // Asks for a large answer and never reads it.
@@ -720,7 +738,10 @@ mod tests {
             .write_all(b"GET /big HTTP/1.1\r\nhost: x\r\n\r\n")
             .await
             .unwrap();
-        assert!(place_given_back(&limiter).await, "the unread answer still holds the place");
+        assert!(
+            place_given_back(&limiter).await,
+            "the unread answer still holds the place"
+        );
         assert!(http_get(addr).await.contains("small"));
         drop(stuck);
         server.abort();

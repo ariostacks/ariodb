@@ -455,7 +455,8 @@ impl Config {
     fn check(&self) -> Result<(), ConfigError> {
         if !self.mysql.listen.is_empty() && self.mysql.journal && self.mysql.server_id == 0 {
             return Err(ConfigError::Problem(
-                "[mysql] server_id must not be 0: the journal registers with it as a replica".to_string(),
+                "[mysql] server_id must not be 0: the journal registers with it as a replica"
+                    .to_string(),
             ));
         }
         if !self.mysql.listen.is_empty() && self.mysql.database.is_empty() {
@@ -609,7 +610,12 @@ impl Config {
     /// TLS mode to the MySQL server, defaulting as for Postgres.
     pub fn mysql_tls_mode(&self) -> TlsMode {
         self.mysql.tls.unwrap_or_else(|| {
-            let host = self.mysql.addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+            let host = self
+                .mysql
+                .addr
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or("");
             if host == "localhost" || host.starts_with("127.") || host == "[::1]" {
                 TlsMode::Disable
             } else {
@@ -630,7 +636,12 @@ impl Config {
     /// An agent's view for another engine: its name and token checked, and
     /// its access and tables replaced by that engine's block. `engine` is
     /// `clickhouse` or `mysql`.
-    pub fn engine_agent(&self, engine: &str, name: &str, token: &str) -> Result<Agent, &'static str> {
+    pub fn engine_agent(
+        &self,
+        engine: &str,
+        name: &str,
+        token: &str,
+    ) -> Result<Agent, &'static str> {
         let agent = self.agent(name).ok_or("unknown agent")?;
         let expected = self.agent_token(agent).ok_or("unknown agent")?;
         let ok = expected.len() == token.len()
@@ -643,8 +654,14 @@ impl Config {
             return Err("wrong token");
         }
         let access = match engine {
-            "clickhouse" => agent.clickhouse.as_ref().ok_or("this agent has no ClickHouse access")?,
-            "mysql" => agent.mysql.as_ref().ok_or("this agent has no MySQL access")?,
+            "clickhouse" => agent
+                .clickhouse
+                .as_ref()
+                .ok_or("this agent has no ClickHouse access")?,
+            "mysql" => agent
+                .mysql
+                .as_ref()
+                .ok_or("this agent has no MySQL access")?,
             _ => return Err("unknown engine"),
         };
         let mut view = agent.clone();
@@ -654,7 +671,11 @@ impl Config {
         Ok(view)
     }
 
-    fn password_from(&self, secret: &Option<String>, env: &Option<String>) -> Result<String, String> {
+    fn password_from(
+        &self,
+        secret: &Option<String>,
+        env: &Option<String>,
+    ) -> Result<String, String> {
         match (secret, env) {
             (Some(name), _) => self
                 .secret(name)?
@@ -714,7 +735,9 @@ impl Config {
             (Some(env), _) => std::env::var(env)
                 .map_err(|_| format!("credential '{name}': set {env} to its postgres:// URL"))?,
             (None, Some(secret)) => self.secret(secret)?.ok_or_else(|| {
-                format!("credential '{name}': secret '{secret}' is not set (ariodb secret set {secret})")
+                format!(
+                    "credential '{name}': secret '{secret}' is not set (ariodb secret set {secret})"
+                )
             })?,
             (None, None) => return Err(format!("credential '{name}' needs url_env or secret")),
         };

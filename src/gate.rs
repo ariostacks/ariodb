@@ -359,7 +359,11 @@ pub fn effects_since(rows: &[Vec<Option<String>>]) -> Vec<Effect> {
     parse_effects(&now)
         .into_iter()
         .filter_map(|mut e| {
-            let earlier: i64 = before.iter().filter(|b| b.table == e.table).map(|b| b.rows).sum();
+            let earlier: i64 = before
+                .iter()
+                .filter(|b| b.table == e.table)
+                .map(|b| b.rows)
+                .sum();
             e.rows -= earlier;
             (e.rows > 0).then_some(e)
         })
@@ -507,17 +511,27 @@ mod tests {
             row("public.customers", "1"),
         ]);
         let got: Vec<(String, i64)> = effects.into_iter().map(|e| (e.table, e.rows)).collect();
-        assert_eq!(got, vec![("orders".to_string(), 1), ("customers".to_string(), 1)]);
+        assert_eq!(
+            got,
+            vec![("orders".to_string(), 1), ("customers".to_string(), 1)]
+        );
     }
 
     #[test]
     fn a_measurement_short_of_the_reported_rows_is_refused() {
         // CockroachDB: the stats view answers but stays empty.
         let r = judge_measurement(&[], 5).unwrap_err();
-        assert!(r.message.contains("reported 5 changed rows but ariodb measured 0"), "{}", r.message);
+        assert!(
+            r.message
+                .contains("reported 5 changed rows but ariodb measured 0"),
+            "{}",
+            r.message
+        );
         assert!(judge_measurement(&[effect("public.orders", 3)], 4).is_err());
         // Cascades and triggers make the measurement larger, never smaller.
-        assert!(judge_measurement(&[effect("public.orders", 3), effect("public.log", 3)], 3).is_ok());
+        assert!(
+            judge_measurement(&[effect("public.orders", 3), effect("public.log", 3)], 3).is_ok()
+        );
         assert!(judge_measurement(&[], 0).is_ok());
     }
 

@@ -170,7 +170,9 @@ pub fn default_database(config: &Config, engine: &str) -> String {
         "mysql" => return config.mysql.database.clone(),
         _ => {}
     }
-    config.database_url().and_then(|url| crate::upstream::Target::from_url(&url, config.database.tls, None))
+    config
+        .database_url()
+        .and_then(|url| crate::upstream::Target::from_url(&url, config.database.tls, None))
         .map(|t| t.database)
         .unwrap_or_default()
 }
@@ -253,10 +255,11 @@ pub fn load_fixtures(path: &Path) -> Result<Vec<(String, Fixture)>, String> {
 /// Run fixtures; returns (passed, drifted).
 pub fn run(config: &Config, fixtures: &[(String, Fixture)]) -> Result<(usize, usize), String> {
     let rules = RuleSet::compile(&config.rules)?;
-    let default_db =
-        config.database_url().and_then(|url| crate::upstream::Target::from_url(&url, config.database.tls, None))
-            .map(|t| t.database)
-            .unwrap_or_default();
+    let default_db = config
+        .database_url()
+        .and_then(|url| crate::upstream::Target::from_url(&url, config.database.tls, None))
+        .map(|t| t.database)
+        .unwrap_or_default();
     let (mut passed, mut drifted) = (0, 0);
     for (label, f) in fixtures {
         let engine = f.action.engine.as_deref().unwrap_or("postgres");

@@ -420,7 +420,11 @@ fn decider_kind_condition(kind: &str) -> Result<&'static str, String> {
         "person" => {
             "value NOT LIKE 'model:%' AND value NOT LIKE 'plugin:%' AND value != 'ariodb' AND value NOT LIKE 'ariodb:%'"
         }
-        _ => return Err(format!("decided_by_kind must be person, model or plugin, not '{kind}'")),
+        _ => {
+            return Err(format!(
+                "decided_by_kind must be person, model or plugin, not '{kind}'"
+            ));
+        }
     })
 }
 
@@ -683,10 +687,17 @@ mod tests {
         decide("s1", Some("ask"), &by(&["dashboard:root", "slack:sam"]));
         decide("s2", Some("ask"), &by(&["model:openai/gpt-test"]));
         decide("s2", None, &[]);
-        decide("s3", Some("ask"), &by(&["ariodb:failed-open:model:openai/gpt-test"]));
+        decide(
+            "s3",
+            Some("ask"),
+            &by(&["ariodb:failed-open:model:openai/gpt-test"]),
+        );
         let all = query(&dir, &Filter::default()).unwrap();
         // Newest first.
-        assert_eq!(all[0].decided_by, by(&["ariodb:failed-open:model:openai/gpt-test"]));
+        assert_eq!(
+            all[0].decided_by,
+            by(&["ariodb:failed-open:model:openai/gpt-test"])
+        );
         assert!(all[1].decided_by.is_empty());
         assert_eq!(all[2].decided_by, by(&["model:openai/gpt-test"]));
         assert_eq!(all[3].decided_by, by(&["dashboard:root", "slack:sam"]));
@@ -761,18 +772,28 @@ mod tests {
         // and the decisions list and its filters must still work.
         for (id, text) in [(1, "not json"), (1, "[]"), (2, "[\"dashboard:root\"] ")] {
             let before: String = conn
-                .query_row("SELECT decided_by FROM decisions WHERE id = ?1", [id], |r| r.get(0))
+                .query_row(
+                    "SELECT decided_by FROM decisions WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            conn.execute("UPDATE decisions SET decided_by = ?1 WHERE id = ?2", rusqlite::params![text, id])
-                .unwrap();
+            conn.execute(
+                "UPDATE decisions SET decided_by = ?1 WHERE id = ?2",
+                rusqlite::params![text, id],
+            )
+            .unwrap();
             assert!(verify(&dir).unwrap_err().contains("edited"), "{text}");
             let by_root = Filter {
                 decided_by: Some("dashboard:root".into()),
                 ..Default::default()
             };
             assert!(query(&dir, &by_root).is_ok(), "{text}");
-            conn.execute("UPDATE decisions SET decided_by = ?1 WHERE id = ?2", rusqlite::params![before, id])
-                .unwrap();
+            conn.execute(
+                "UPDATE decisions SET decided_by = ?1 WHERE id = ?2",
+                rusqlite::params![before, id],
+            )
+            .unwrap();
         }
         assert_eq!(verify(&dir), Ok(2));
         let _ = std::fs::remove_dir_all(&dir);

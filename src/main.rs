@@ -10,22 +10,22 @@ mod config;
 mod dashboard;
 mod dashboard_api;
 mod dashboard_files;
+mod doctor;
 mod exec;
 mod gate;
-mod doctor;
 mod journal;
 mod limits;
 mod llm;
+mod mcp;
 mod mysql_binlog;
 mod mysql_journal;
 mod mysql_proxy;
 mod mysql_sql;
 mod mysql_undo;
 mod mysql_wire;
-mod plugins;
-mod mcp;
 mod oidc;
 mod pgoutput;
+mod plugins;
 mod policy;
 #[cfg(test)]
 mod proptests;
@@ -302,12 +302,7 @@ async fn main() -> ExitCode {
                 std::io::stdin()
                     .read_line(&mut password)
                     .map_err(|e| e.to_string())?;
-                dashboard::set_password(
-                    &db,
-                    &user,
-                    password.trim_end_matches(['\n', '\r']),
-                    role,
-                )?;
+                dashboard::set_password(&db, &user, password.trim_end_matches(['\n', '\r']), role)?;
                 println!("password set for '{user}'");
                 Ok(())
             })
@@ -458,13 +453,18 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
             }
         });
     }
-    if !config.proxy.listen.is_empty() || config.journal.enabled || !config.mysql.listen.is_empty() {
+    if !config.proxy.listen.is_empty() || config.journal.enabled || !config.mysql.listen.is_empty()
+    {
         // Say once, at startup, which guarantees this database supports.
         let doctor_config = config.clone();
         tokio::spawn(async move {
             let report = doctor::run(&doctor_config).await;
             for section in &report.sections {
-                for f in section.findings.iter().filter(|f| f.status != doctor::Status::Ok) {
+                for f in section
+                    .findings
+                    .iter()
+                    .filter(|f| f.status != doctor::Status::Ok)
+                {
                     eprintln!("ariodb: {}: {}", section.title, f.text);
                 }
             }
@@ -626,7 +626,10 @@ async fn undo_command(
     skip_conflicts: bool,
 ) -> Result<(), String> {
     let mysql_records = mysql_journal::read_all(config)?;
-    if mysql_records.iter().any(|r| r.session.as_deref() == Some(session)) {
+    if mysql_records
+        .iter()
+        .any(|r| r.session.as_deref() == Some(session))
+    {
         // Notifiers hear about the undo, as for Postgres sessions below.
         let plugins = if apply {
             Some(start_plugins(config, plugins::Roles { audit_sink: false }).await)
@@ -798,7 +801,11 @@ fn print_summary(config: &Config) {
                 Access::ReadOnly => "read only",
                 Access::ReadWrite => "read and write",
             };
-            println!("  mysql                {access:<15} {:<10} {}", "", m.tables.join(", "));
+            println!(
+                "  mysql                {access:<15} {:<10} {}",
+                "",
+                m.tables.join(", ")
+            );
         }
     }
 }

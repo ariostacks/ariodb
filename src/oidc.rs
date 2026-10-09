@@ -9,7 +9,7 @@
 //! groups the token names; no matching group means no access.
 
 use crate::config::Config;
-use crate::dashboard::{html_escape, hook_page};
+use crate::dashboard::{hook_page, html_escape};
 use crate::gate::State;
 use crate::store::Role;
 use axum::extract::{Query, State as AxState};
@@ -435,11 +435,7 @@ pub fn identity(
         groups_value = groups_value.and_then(|v| v.get(part));
     }
     let groups: Vec<String> = match groups_value {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(clean)
-            .collect(),
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(clean).collect(),
         Some(Value::String(one)) => vec![clean(one)],
         _ => Vec::new(),
     };
@@ -1105,11 +1101,7 @@ mod tests {
             &keys,
             "another client",
         );
-        refused(
-            &t(with(|c| c["nonce"] = json!("replayed"))),
-            &keys,
-            "nonce",
-        );
+        refused(&t(with(|c| c["nonce"] = json!("replayed"))), &keys, "nonce");
         refused(
             &t(with(|c| {
                 c.as_object_mut().unwrap().remove("nonce");
@@ -1217,7 +1209,13 @@ mod tests {
             check(&sign(&rotated, Some("k2"), &claims()), &set(&[&k])),
             Err(TokenError::UnknownKey("k2".into()))
         );
-        assert!(check(&sign(&rotated, Some("k2"), &claims()), &set(&[&k, &rotated])).is_ok());
+        assert!(
+            check(
+                &sign(&rotated, Some("k2"), &claims()),
+                &set(&[&k, &rotated])
+            )
+            .is_ok()
+        );
         refused(
             &sign(&k, None, &claims()),
             &set(&[&k, &rotated]),
@@ -1303,11 +1301,7 @@ viewer_groups = ["ariodb-viewers"]
         o.allowed_email_domains = vec!["Example.test".into()];
         let ok = identity(&o, &map(claims())).unwrap();
         assert_eq!(admit(&o, &ok), Ok(Role::Approver));
-        let other = identity(
-            &o,
-            &map(with(|c| c["email"] = json!("pat@elsewhere.test"))),
-        )
-        .unwrap();
+        let other = identity(&o, &map(with(|c| c["email"] = json!("pat@elsewhere.test")))).unwrap();
         assert!(admit(&o, &other).unwrap_err().contains("not in a domain"));
     }
 
@@ -1353,7 +1347,10 @@ viewer_groups = ["ariodb-viewers"]
         );
         assert!(
             check_metadata(
-                &meta(&format!("{ISSUER}/certs"), "http://login.example.test/token"),
+                &meta(
+                    &format!("{ISSUER}/certs"),
+                    "http://login.example.test/token"
+                ),
                 ISSUER
             )
             .is_err()

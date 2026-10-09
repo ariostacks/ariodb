@@ -249,12 +249,17 @@ fn safe_isolation(sql: &str) -> bool {
     };
     let value = value.trim();
     let unquoted = match value.as_bytes() {
-        [q @ (b'\'' | b'"'), .., last] if q == last && value.len() >= 2 => &value[1..value.len() - 1],
+        [q @ (b'\'' | b'"'), .., last] if q == last && value.len() >= 2 => {
+            &value[1..value.len() - 1]
+        }
         _ => value,
     };
     let level = unquoted.to_uppercase().replace(['-', '_'], " ");
     let level = level.split_whitespace().collect::<Vec<_>>().join(" ");
-    matches!(level.as_str(), "READ COMMITTED" | "REPEATABLE READ" | "SERIALIZABLE")
+    matches!(
+        level.as_str(),
+        "READ COMMITTED" | "REPEATABLE READ" | "SERIALIZABLE"
+    )
 }
 
 /// connection ids and the current database are the proxy's to manage.
@@ -325,17 +330,63 @@ const MYSQL_CATALOGUE: &[&str] = &[
 /// subscription, authentication and file views, and `pg_sequences`
 /// (current sequence values).
 const PG_CATALOGUE: &[&str] = &[
-    "pg_aggregate", "pg_am", "pg_amop", "pg_amproc", "pg_attrdef", "pg_attribute",
-    "pg_auth_members", "pg_available_extension_versions", "pg_available_extensions",
-    "pg_cast", "pg_class", "pg_collation", "pg_constraint", "pg_conversion", "pg_cursors",
-    "pg_database", "pg_default_acl", "pg_depend", "pg_description", "pg_enum",
-    "pg_extension", "pg_index", "pg_indexes", "pg_inherits", "pg_language", "pg_matviews",
-    "pg_namespace", "pg_opclass", "pg_operator", "pg_opfamily", "pg_partitioned_table",
-    "pg_policies", "pg_policy", "pg_prepared_statements", "pg_proc", "pg_range",
-    "pg_rewrite", "pg_roles", "pg_rules", "pg_sequence", "pg_settings", "pg_shdescription",
-    "pg_statistic_ext", "pg_tables", "pg_tablespace", "pg_timezone_abbrevs",
-    "pg_timezone_names", "pg_transform", "pg_trigger", "pg_ts_config", "pg_ts_config_map",
-    "pg_ts_dict", "pg_ts_parser", "pg_ts_template", "pg_type", "pg_user", "pg_views",
+    "pg_aggregate",
+    "pg_am",
+    "pg_amop",
+    "pg_amproc",
+    "pg_attrdef",
+    "pg_attribute",
+    "pg_auth_members",
+    "pg_available_extension_versions",
+    "pg_available_extensions",
+    "pg_cast",
+    "pg_class",
+    "pg_collation",
+    "pg_constraint",
+    "pg_conversion",
+    "pg_cursors",
+    "pg_database",
+    "pg_default_acl",
+    "pg_depend",
+    "pg_description",
+    "pg_enum",
+    "pg_extension",
+    "pg_index",
+    "pg_indexes",
+    "pg_inherits",
+    "pg_language",
+    "pg_matviews",
+    "pg_namespace",
+    "pg_opclass",
+    "pg_operator",
+    "pg_opfamily",
+    "pg_partitioned_table",
+    "pg_policies",
+    "pg_policy",
+    "pg_prepared_statements",
+    "pg_proc",
+    "pg_range",
+    "pg_rewrite",
+    "pg_roles",
+    "pg_rules",
+    "pg_sequence",
+    "pg_settings",
+    "pg_shdescription",
+    "pg_statistic_ext",
+    "pg_tables",
+    "pg_tablespace",
+    "pg_timezone_abbrevs",
+    "pg_timezone_names",
+    "pg_transform",
+    "pg_trigger",
+    "pg_ts_config",
+    "pg_ts_config_map",
+    "pg_ts_dict",
+    "pg_ts_parser",
+    "pg_ts_template",
+    "pg_type",
+    "pg_user",
+    "pg_views",
 ];
 
 /// System tables refused even to an agent with `tables = ["*"]`, which
@@ -430,7 +481,11 @@ mod tests {
             "SELECT * FROM information_schema.columns",
             "SELECT typname FROM pg_type",
         ] {
-            assert_eq!(decide_sql(Access::ReadOnly, sql), Decision::Allow(Mode::ReadOnly), "{sql}");
+            assert_eq!(
+                decide_sql(Access::ReadOnly, sql),
+                Decision::Allow(Mode::ReadOnly),
+                "{sql}"
+            );
         }
         for sql in [
             "SELECT * FROM pg_stats",
@@ -444,13 +499,18 @@ mod tests {
             "SELECT * FROM pg_secret_notes",
             "SELECT * FROM public.pg_class",
         ] {
-            assert!(matches!(decide_sql(Access::ReadOnly, sql), Decision::Deny(_)), "{sql}");
+            assert!(
+                matches!(decide_sql(Access::ReadOnly, sql), Decision::Deny(_)),
+                "{sql}"
+            );
         }
     }
 
     #[test]
     fn rules_see_catalogue_functions_without_their_schema() {
-        let stmt = classify("SELECT pg_catalog.pg_read_file('/etc/passwd')").unwrap().remove(0);
+        let stmt = classify("SELECT pg_catalog.pg_read_file('/etc/passwd')")
+            .unwrap()
+            .remove(0);
         assert_eq!(stmt.functions, vec!["pg_read_file".to_string()]);
     }
 
@@ -552,9 +612,15 @@ mod tests {
         let mut wide = agent(Access::ReadWrite);
         wide.tables = vec!["*".into()];
         let pg = |sql: &str| decide(&wide, &classify(sql).unwrap().remove(0));
-        assert!(denied(pg("SELECT query FROM pg_stat_activity")), "pg_stat_activity");
+        assert!(
+            denied(pg("SELECT query FROM pg_stat_activity")),
+            "pg_stat_activity"
+        );
         assert!(denied(pg("SELECT * FROM pg_catalog.pg_stats")), "pg_stats");
-        assert_eq!(pg("SELECT * FROM anything_at_all"), Decision::Allow(Mode::ReadOnly));
+        assert_eq!(
+            pg("SELECT * FROM anything_at_all"),
+            Decision::Allow(Mode::ReadOnly)
+        );
         let my = |sql: &str| {
             let mut stmts = crate::mysql_sql::classify(sql).unwrap();
             crate::mysql_sql::scope_to_database(&mut stmts, "app");

@@ -85,7 +85,9 @@ async fn decisions(
 ) -> Result<Json<Value>, ApiError> {
     require_user(&state, &headers)?;
     let items = audit::query(&state_dir(&state), &f).map_err(bad)?;
-    Ok(Json(json!({ "decisions": items, "deciders": state.db.deciders()? })))
+    Ok(Json(
+        json!({ "decisions": items, "deciders": state.db.deciders()? }),
+    ))
 }
 
 async fn decision_fixture(

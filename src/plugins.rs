@@ -1977,7 +1977,11 @@ for line in sys.stdin:
         uninstall();
         host.stop().await;
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(verdict.as_ref().ok(), Some(&vec!["plugin:n".to_string()]), "{verdict:?}");
+        assert_eq!(
+            verdict.as_ref().ok(),
+            Some(&vec!["plugin:n".to_string()]),
+            "{verdict:?}"
+        );
         assert!(text.contains("approval_requested"), "{text}");
         assert!(!text.contains("not-a-real-card-4242"), "{text}");
     }

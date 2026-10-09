@@ -130,7 +130,8 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
             Admission::Refuse(refusing) => {
                 // As MySQL does: the error instead of the handshake.
                 tokio::spawn(async move {
-                    let p = w::err_packet(ER_CON_COUNT_ERROR, "08004", "ariodb: too many connections");
+                    let p =
+                        w::err_packet(ER_CON_COUNT_ERROR, "08004", "ariodb: too many connections");
                     let _ = tokio::time::timeout(timeout, async {
                         let _ = w::write_packet(&mut socket, &mut 0, &p).await;
                         let _ = socket.shutdown().await;
@@ -256,14 +257,13 @@ async fn handle(
     timeout: Duration,
 ) -> Result<(), String> {
     let id = shared.next_id.fetch_add(1, SeqCst);
-    let login = match tokio::time::timeout(timeout, login(socket, &state, acceptor, id, &shared))
-        .await
-    {
-        Err(_) => return Ok(()), // too slow to log in
-        Ok(Err(e)) => return Err(e),
-        Ok(Ok(None)) => return Ok(()),
-        Ok(Ok(Some(l))) => l,
-    };
+    let login =
+        match tokio::time::timeout(timeout, login(socket, &state, acceptor, id, &shared)).await {
+            Err(_) => return Ok(()), // too slow to log in
+            Ok(Err(e)) => return Err(e),
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(l))) => l,
+        };
     let LoggedIn {
         mut io,
         agent,
