@@ -545,12 +545,18 @@ impl Session {
             "name": name,
         });
         let (id, rx) = self.link.request("initialize", params)?;
-        let answer = tokio::select! {
-            a = self.link.answer(id, rx, HANDSHAKE_TIMEOUT) => a,
-            status = self.child.wait() => Err(match status {
-                Ok(s) => format!("plugin '{name}' {} before it answered initialize", crate::tunnels::describe(s)),
-                Err(e) => e.to_string(),
-            }),
+        // A plugin that exits early ends its output too: report how it exited.
+        let answer = match self.link.answer(id, rx, HANDSHAKE_TIMEOUT).await {
+            Err(e) => {
+                match tokio::time::timeout(Duration::from_millis(500), self.child.wait()).await {
+                    Ok(Ok(status)) => Err(format!(
+                        "plugin '{name}' {} before it answered initialize",
+                        crate::tunnels::describe(status)
+                    )),
+                    _ => Err(e),
+                }
+            }
+            ok => ok,
         };
         let hello = parse_hello(&answer?).map_err(|e| format!("plugin '{name}': {e}"))?;
         let _ = self.link.hello.set(hello);
@@ -1011,7 +1017,8 @@ async fn supervise(plugin: Arc<Plugin>, state_dir: PathBuf, mut stop: watch::Rec
                 if let Some(h) = &hello {
                     let caps = h.capabilities.names();
                     eprintln!(
-                        "ariodb: plugin '{name}' is running ({} {}; {})",
+                        "ariodb: plugin '{name}' is running (pid {}; {} {}; {})",
+                        session.child.id().unwrap_or(0),
                         h.name,
                         h.version,
                         if caps.is_empty() {
@@ -1026,10 +1033,14 @@ async fn supervise(plugin: Arc<Plugin>, state_dir: PathBuf, mut stop: watch::Rec
                         Ok(s) => crate::tunnels::describe(s),
                         Err(e) => e.to_string(),
                     },
-                    r = &mut session.reader => match r {
-                        Ok(why) => why,
-                        Err(e) => e.to_string(),
-                    },
+                    r = &mut session.reader => {
+                        let why = r.unwrap_or_else(|e| e.to_string());
+                        // Output usually ends because the process did: say how.
+                        match tokio::time::timeout(Duration::from_millis(500), session.child.wait()).await {
+                            Ok(Ok(status)) => crate::tunnels::describe(status),
+                            _ => why,
+                        }
+                    }
                     _ = stop.changed() => {
                         plugin.set_link(None);
                         plugin.status.lock().expect("status").state = "stopped";
