@@ -43,8 +43,8 @@ it changed, and lets a person undo one agent session later.
 - **Keeps credentials away from agents.** Agents log in with their own
   tokens. Database passwords live in environment variables or an encrypted
   secret store, and each agent can run as its own database role.
-- **ClickHouse too.** A proxy for ClickHouse's HTTP interface (reads and
-  `INSERT`) and its native protocol (reads), with the same rules and
+- **ClickHouse too.** A proxy for ClickHouse's HTTP interface and its
+  native protocol (reads and `INSERT` on both), with the same rules and
   approvals.
 - **Plugins.** Any program that speaks JSON-RPC over stdin and stdout can
   approve statements, supply facts for rules, receive notifications or
@@ -297,6 +297,7 @@ matches everything. A condition that fails to evaluate counts as a deny.
 | `sql.database` | string | The database the agent is using |
 | `sql.engine` | string | `postgres` or `clickhouse` |
 | `agent.name`, `agent.access` | string | Who is asking |
+| `agent.credential` | string | The [`[[credentials]]`](#credentials) login the agent's Postgres queries run as, or `""` for `[database]` |
 | `effects.rows` | int | Rows changed (after-stage only) |
 | `effects.tables` | list | Tables changed, including by triggers and cascades (after-stage only) |
 | `plugin.<name>.<key>` | any | Facts from a [plugin](#plugins) (before-stage only) |
@@ -527,6 +528,24 @@ reach outside the server (`url`, `s3`, `file`, `remote` and others) and ones
 that read tables named in strings (`merge`, `dictionary`, `cluster`,
 `dictGet`, `joinGet`) are refused. One statement per request.
 
+Inserts need `access = "read_write"` in `[agents.clickhouse]` and a table on
+its list. Over the native protocol (`clickhouse-client`), `INSERT ... VALUES`
+and `INSERT ... FORMAT <format>` work, with the rows given inline or on
+stdin: the client sends them as data blocks, which ariodb reads, counting
+rows against `max_rows_per_write` (the agent's own, or `[limits]`). ariodb
+holds the blocks back until the last one has arrived and sends them to
+ClickHouse only if the total is within the limit, because ClickHouse writes
+each block as it arrives and cannot take it back. An insert over the limit
+is refused with nothing inserted, and the connection closes. Held data is
+capped at 64 MiB per insert. ariodb reads columns of the common types
+(numbers, strings, dates and times, decimals, UUIDs, IP addresses, enums,
+`Nullable`, `Array`, `Map`, `Tuple`, `LowCardinality`); an insert into a
+column of another type (`JSON`, `Variant`, `Dynamic`, `AggregateFunction`)
+is refused. Over the native protocol `INSERT ... SELECT`, a `SETTINGS`
+clause in an `INSERT`, and external tables (`--external`) are refused:
+ClickHouse would act on them before ariodb could count anything. The audit
+log records each native insert with its row count.
+
 With `tls_cert` and `tls_key` set, both listeners accept TLS only, as
 ClickHouse's own secure ports do: agents use `https://` and
 `clickhouse-client --secure`.
@@ -662,9 +681,11 @@ and `E2E_NAME` keep parallel runs of the scripts apart.
 
 ## Limitations
 
-- **ClickHouse native `INSERT` is refused** (as are external tables): use
-  the HTTP interface for inserts. ClickHouse writes cannot be rolled back or
-  undone; rules and approvals are the only control.
+- **ClickHouse writes cannot be rolled back or undone.** Rules, approvals
+  and, over the native protocol, the row limit (checked before any row is
+  sent on) are the controls. HTTP inserts are not counted against the row
+  limit, and over HTTP `INSERT ... SELECT` is allowed; native
+  `INSERT ... SELECT` is refused.
 - **Undo needs Postgres 14 or later** with logical replication. YugabyteDB
   and CockroachDB have no undo, and need `write_check = "reported"` for
   writes (see [docs/compatibility.md](docs/compatibility.md)).

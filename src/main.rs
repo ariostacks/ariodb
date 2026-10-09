@@ -3,6 +3,7 @@ mod audit;
 mod chsql;
 mod classify;
 mod clickhouse;
+mod clickhouse_blocks;
 mod clickhouse_native;
 mod config;
 mod dashboard;

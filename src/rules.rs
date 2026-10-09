@@ -12,6 +12,7 @@
 //! | `sql.database` | string | The database the agent connected to |
 //! | `sql.engine` | string | `postgres`, `clickhouse` or `mysql` (MySQL and MariaDB) |
 //! | `agent.name`, `agent.access` | string | Who is asking |
+//! | `agent.credential` | string | The `[[credentials]]` login the agent's Postgres queries run as, or `""` for `[database]` |
 //! | `effects.rows` | int | Rows actually changed (after-stage rules only) |
 //! | `effects.tables` | list | Tables actually changed, including by triggers (after-stage only) |
 //! | `plugin.<name>.<key>` | any | Facts from a `[[plugins]]` entry (before-stage only) |
@@ -502,7 +503,11 @@ fn context_for(
         crate::config::Access::ReadOnly => "read_only",
         crate::config::Access::ReadWrite => "read_write",
     };
-    let agent_value = map(vec![("name", s(&agent.name)), ("access", s(access))]);
+    let agent_value = map(vec![
+        ("name", s(&agent.name)),
+        ("access", s(access)),
+        ("credential", s(agent.credential.as_deref().unwrap_or(""))),
+    ]);
 
     let mut ctx = Context::default();
     ctx.add_variable_from_value("sql", sql);
@@ -632,6 +637,45 @@ mod tests {
         );
         assert_eq!(v("  (SELECT 1)"), "select");
         assert_eq!(v("TRUNCATE t"), "truncate");
+    }
+
+    #[test]
+    fn rules_can_test_the_database_login() {
+        let set = rules(
+            r#"
+            [[rules]]
+            name = "reporting-reads-only"
+            condition = "agent.credential == 'reporting' && sql.kind != 'read'"
+            verdict = "deny"
+
+            [[rules]]
+            name = "default-login"
+            condition = "agent.credential == ''"
+            verdict = "allow"
+        "#,
+        );
+        let update = classify("UPDATE t SET a = 1 WHERE id = 1")
+            .unwrap()
+            .remove(0);
+        let judge = |credential: Option<&str>| {
+            let mut a = agent();
+            a.credential = credential.map(str::to_string);
+            set.evaluate(&Facts {
+                agent: &a,
+                statement: &update,
+                database: "app",
+            })
+        };
+        assert!(
+            matches!(judge(Some("reporting")), Outcome::Deny { rule, .. } if rule == "reporting-reads-only")
+        );
+        assert_eq!(judge(Some("writer")), Outcome::NoMatch);
+        assert_eq!(
+            judge(None),
+            Outcome::Allow {
+                rule: "default-login".into()
+            }
+        );
     }
 
     #[test]

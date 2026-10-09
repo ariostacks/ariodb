@@ -1,5 +1,4 @@
-//! ClickHouse's native TCP protocol (what clickhouse-client speaks), for
-//! reads.
+//! ClickHouse's native TCP protocol (what clickhouse-client speaks).
 //!
 //! ariodb terminates the handshake on both sides: the agent logs in with
 //! its name and token, and ariodb logs in to ClickHouse with its own
@@ -8,12 +7,15 @@
 //! replies are relayed byte for byte.
 //!
 //! Each Query packet is parsed, judged like any other statement, and
-//! forwarded with `readonly = 2` and a time limit added to its settings.
-//! Native INSERTs and external tables are refused: their data blocks would
-//! have to be decoded to be relayed safely. Use the HTTP interface for
-//! inserts.
+//! forwarded with a time limit added to its settings, and reads with
+//! `readonly = 2`. An INSERT's rows follow the query as data blocks: ariodb
+//! reads every block (`clickhouse_blocks`), counts the rows against the
+//! write limit, and holds the blocks back until the last has arrived, so an
+//! insert over the limit is stopped before ClickHouse has any of it.
+//! External tables are refused.
 
 use crate::chsql;
+use crate::clickhouse_blocks::{Frames, MAX_HELD, Problem, read_data};
 use crate::classify::Kind;
 use crate::gate::{self, Ctx, State};
 use std::sync::Arc;
@@ -83,19 +85,20 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Reading and writing ClickHouse's basic encodings.
 
-struct Rd<R> {
-    inner: R,
-    /// Every byte read since `mark`, so a packet can be forwarded as read.
-    taken: Vec<u8>,
+pub(crate) struct Rd<R> {
+    pub(crate) inner: R,
+    /// Every byte read since the last `take`, so a packet can be forwarded
+    /// as read.
+    pub(crate) taken: Vec<u8>,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> Rd<R> {
-    async fn u8(&mut self) -> Result<u8, String> {
+    pub(crate) async fn u8(&mut self) -> Result<u8, String> {
         let b = self.inner.read_u8().await.map_err(|e| e.to_string())?;
         self.taken.push(b);
         Ok(b)
     }
-    async fn bytes(&mut self, n: usize) -> Result<Vec<u8>, String> {
+    pub(crate) async fn bytes(&mut self, n: usize) -> Result<Vec<u8>, String> {
         if n > 64 << 20 {
             return Err("field too large".into());
         }
@@ -107,9 +110,11 @@ impl<R: tokio::io::AsyncRead + Unpin> Rd<R> {
         self.taken.extend_from_slice(&buf);
         Ok(buf)
     }
+    /// At most nine bytes, all any client sends. A longer one is refused
+    /// rather than risk reading it differently from ClickHouse.
     async fn varint(&mut self) -> Result<u64, String> {
         let mut out = 0u64;
-        for shift in (0..64).step_by(7) {
+        for shift in (0..63).step_by(7) {
             let b = self.u8().await?;
             out |= ((b & 0x7f) as u64) << shift;
             if b & 0x80 == 0 {
@@ -123,22 +128,19 @@ impl<R: tokio::io::AsyncRead + Unpin> Rd<R> {
         Ok(String::from_utf8_lossy(&self.bytes(n).await?).into_owned())
     }
     /// A string from before the client has logged in: at most 64 KiB.
-    async fn short_string(&mut self) -> Result<String, String> {
+    pub(crate) async fn short_string(&mut self) -> Result<String, String> {
         let n = self.varint().await? as usize;
         if n > 64 << 10 {
             return Err("login field too large".into());
         }
         Ok(String::from_utf8_lossy(&self.bytes(n).await?).into_owned())
     }
-    fn mark(&mut self) -> usize {
-        self.taken.len()
-    }
     fn take(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.taken)
     }
 }
 
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let byte = (v & 0x7f) as u8;
         v >>= 7;
@@ -150,7 +152,7 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn put_string(out: &mut Vec<u8>, s: &str) {
+pub(crate) fn put_string(out: &mut Vec<u8>, s: &str) {
     put_varint(out, s.len() as u64);
     out.extend_from_slice(s.as_bytes());
 }
@@ -391,9 +393,31 @@ where
     )
     .await;
     relay.abort();
-    result
+    let _ = relay.await;
+    drop(up_write); // abandons any insert at ClickHouse
+    match result? {
+        Some(message) => {
+            // An insert was stopped: tell the client, then let it read that
+            // before the connection closes.
+            send(exception_packet(497, &message)).await?;
+            let _ = client_write.lock().await.shutdown().await;
+            let mut sink = vec![0u8; 64 << 10];
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Ok(n) = c.inner.read(&mut sink).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            })
+            .await;
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }
 
+/// Judge and relay the client's packets. Returns the message to refuse an
+/// insert with, when one is stopped part way; the connection then closes.
 #[allow(clippy::too_many_arguments)]
 async fn client_loop<R, F, Fut>(
     c: &mut Rd<R>,
@@ -404,24 +428,34 @@ async fn client_loop<R, F, Fut>(
     session: &str,
     database: &str,
     rev: u64,
-) -> Result<(), String>
+) -> Result<Option<String>, String>
 where
     R: tokio::io::AsyncRead + Unpin,
     F: Fn(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
+    // A packet already read (its bytes still in `c.taken`) by an insert
+    // that ended without data.
+    let mut next: Option<u64> = None;
     loop {
-        c.take();
-        let packet = match c.varint().await {
-            Ok(p) => p,
-            Err(_) => return Ok(()), // client went away
+        let packet = match next.take() {
+            Some(p) => p,
+            None => {
+                c.take();
+                match c.varint().await {
+                    Ok(p) => p,
+                    Err(_) => return Ok(None), // client went away
+                }
+            }
         };
         match packet {
             1 => {
                 let started = Instant::now();
                 let q = read_query(c, rev).await?;
-                // The external-tables terminator always follows a Query.
-                let data = read_empty_data(c, q.compression).await;
+                // The external-tables terminator always follows a Query. The
+                // decompression state carries on into an insert's data.
+                let mut frames = Frames::new(q.compression == 1);
+                let data = read_terminator(c, &mut frames, rev).await;
                 let stmt = chsql::classify(&q.sql).map(|mut s| {
                     chsql::scope_to_database(&mut s, database);
                     s
@@ -432,16 +466,20 @@ where
                 let decision = match (&stmt, &data) {
                     (_, Err(e)) => Err((None, e.clone(), "unsupported")),
                     (Err(e), _) => Err((None, e.clone(), "refused")),
-                    (Ok(s), _) if s.kind == Kind::Write => Err((
-                        None,
-                        "native-protocol INSERTs are not supported; use ariodb's ClickHouse HTTP interface".to_string(),
-                        "unsupported",
-                    )),
                     (Ok(s), _) => {
-                        let ctx = Ctx { agent, session, database, live: None };
-                        gate::check_detailed(state, &ctx, std::slice::from_ref(s))
-                            .await
-                            .map_err(|r| (r.rule.clone(), r.message, "refused"))
+                        let countable = match s.kind {
+                            Kind::Write => chsql::insert_from_client(&q.sql),
+                            _ => Ok(()),
+                        };
+                        match countable {
+                            Err(e) => Err((None, e, "unsupported")),
+                            Ok(()) => {
+                                let ctx = Ctx { agent, session, database, live: None };
+                                gate::check_detailed(state, &ctx, std::slice::from_ref(s))
+                                    .await
+                                    .map_err(|r| (r.rule.clone(), r.message, "refused"))
+                            }
+                        }
                     }
                 };
                 let kind = stmt
@@ -449,7 +487,7 @@ where
                     .map(|s| s.kind.to_string())
                     .unwrap_or_else(|_| "unknown".into());
                 let tables = stmt.as_ref().map(|s| s.tables.clone()).unwrap_or_default();
-                let record = |outcome: &str, reason: Option<&str>, rule: Option<&str>| {
+                let record = |outcome: &str, rows: Option<u64>, reason: Option<&str>, rule: Option<&str>| {
                     state.audit.record(&crate::audit::Entry {
                         session,
                         agent: &agent.name,
@@ -457,7 +495,7 @@ where
                         kind: kind.clone(),
                         tables: &tables,
                         outcome,
-                        rows: None,
+                        rows,
                         reason,
                         rule,
                         latency_ms: Some(started.elapsed().as_millis() as u64),
@@ -465,23 +503,39 @@ where
                         database,
                     });
                 };
-                match decision {
+                let (_, approved) = match decision {
                     Err((rule, message, outcome)) => {
-                        record(outcome, Some(&message), rule.as_deref());
+                        record(outcome, None, Some(&message), rule.as_deref());
                         send(exception_packet(497, &message)).await?;
+                        continue;
                     }
-                    Ok((_, approved)) => {
-                        record("allowed", None, approved.as_deref());
-                        let timeout = state
-                            .config()
-                            .limits
-                            .statement_timeout_ms
-                            .div_ceil(1000)
-                            .max(1);
-                        let packet = rebuild_query(&q, rev, timeout);
-                        let mut out = packet;
-                        out.extend_from_slice(&data.expect("checked above"));
-                        up.write_all(&out).await.map_err(|e| e.to_string())?;
+                    Ok(d) => d,
+                };
+                let config = state.config();
+                let timeout = config.limits.statement_timeout_ms.div_ceil(1000).max(1);
+                let insert = matches!(&stmt, Ok(s) if s.kind == Kind::Write);
+                let mut out = rebuild_query(&q, timeout, !insert);
+                out.extend_from_slice(&data.expect("checked above"));
+                up.write_all(&out).await.map_err(|e| e.to_string())?;
+                if !insert {
+                    record("allowed", None, None, approved.as_deref());
+                    continue;
+                }
+                let limit = agent
+                    .max_rows_per_write
+                    .unwrap_or(config.limits.max_rows_per_write);
+                match relay_insert(c, up, &mut frames, rev, limit).await {
+                    Insert::Sent(rows) => record("allowed", Some(rows), None, approved.as_deref()),
+                    Insert::Abandoned { reason, next: after } => {
+                        record("failed", None, Some(reason), approved.as_deref());
+                        match after {
+                            Some(p) => next = Some(p),
+                            None => return Ok(None),
+                        }
+                    }
+                    Insert::Stopped { outcome, message, rows } => {
+                        record(outcome, rows, Some(&message), approved.as_deref());
+                        return Ok(Some(message));
                     }
                 }
             }
@@ -496,7 +550,7 @@ where
                     "data outside a query is not supported through ariodb",
                 ))
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
             other => {
                 send(exception_packet(
@@ -504,10 +558,115 @@ where
                     &format!("client packet {other} is not supported through ariodb"),
                 ))
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
         }
     }
+}
+
+/// How an insert's data ended.
+enum Insert {
+    /// All of it went to ClickHouse: this many rows.
+    Sent(u64),
+    /// None of it did, and the client stopped sending: ClickHouse refused
+    /// the insert, or the client cancelled it or left. `next` is the packet
+    /// the client sent instead, if any.
+    Abandoned {
+        reason: &'static str,
+        next: Option<u64>,
+    },
+    /// ariodb refused it part way. None of it went to ClickHouse.
+    Stopped {
+        outcome: &'static str,
+        message: String,
+        rows: Option<u64>,
+    },
+}
+
+/// Hold back an insert's data blocks, counting their rows, and send them to
+/// ClickHouse only once the last has arrived and the total is within the
+/// limit. ClickHouse writes each block as it arrives and cannot roll back,
+/// so holding them is what makes a stopped insert insert nothing.
+async fn relay_insert<R: tokio::io::AsyncRead + Unpin>(
+    c: &mut Rd<R>,
+    up: &mut tokio::net::tcp::OwnedWriteHalf,
+    frames: &mut Frames,
+    rev: u64,
+    limit: u64,
+) -> Insert {
+    let mut held = Vec::new();
+    let mut rows = 0u64;
+    loop {
+        c.take();
+        let packet = match c.varint().await {
+            Ok(p) => p,
+            Err(_) => {
+                return Insert::Abandoned {
+                    reason: "the agent disconnected during the insert; nothing was inserted",
+                    next: None,
+                };
+            }
+        };
+        match packet {
+            2 => {}
+            // The client gave up: pass the Cancel on, as nothing was sent.
+            3 => {
+                return Insert::Abandoned {
+                    reason: "the agent cancelled the insert; nothing was inserted",
+                    next: Some(3),
+                };
+            }
+            // ClickHouse refused the insert before asking for data, and the
+            // client moved on.
+            p if held.is_empty() => {
+                return Insert::Abandoned {
+                    reason: "no data was sent; ClickHouse refused the insert",
+                    next: Some(p),
+                };
+            }
+            p => {
+                return Insert::Stopped {
+                    outcome: "unsupported",
+                    message: format!("client packet {p} arrived in the middle of an insert"),
+                    rows: None,
+                };
+            }
+        }
+        match read_data(c, frames, rev, limit - rows, MAX_HELD - held.len()).await {
+            Ok(block) => {
+                held.extend(c.take());
+                if block.columns == 0 {
+                    break;
+                }
+                rows += block.rows;
+            }
+            Err(Problem::TooManyRows(n)) => {
+                let total = rows + n;
+                return Insert::Stopped {
+                    outcome: "rolled_back",
+                    message: format!(
+                        "nothing was inserted: the insert sends at least {total} rows; the limit is {limit}"
+                    ),
+                    rows: Some(total),
+                };
+            }
+            Err(Problem::Unreadable(e)) => {
+                return Insert::Stopped {
+                    outcome: "unsupported",
+                    message: format!("nothing was inserted: {e}"),
+                    rows: None,
+                };
+            }
+        }
+    }
+    if let Err(e) = up.write_all(&held).await {
+        return Insert::Stopped {
+            outcome: "failed",
+            message: format!("cannot reach ClickHouse: {e}"),
+            rows: None,
+        };
+    }
+    Insert::Sent(rows)
 }
 
 /// A parsed Query packet, kept as raw pieces so it can be rebuilt with
@@ -618,24 +777,34 @@ async fn read_query<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// The Query packet to send upstream: the client's own settings, minus any
-/// that could widen access, plus read-only mode and a time limit.
-fn rebuild_query(q: &Query, _rev: u64, timeout_seconds: u64) -> Vec<u8> {
+/// that could widen access or change how ariodb and ClickHouse read data
+/// blocks, plus a time limit and, for reads, read-only mode.
+fn rebuild_query(q: &Query, timeout_seconds: u64, read_only: bool) -> Vec<u8> {
     let mut out = q.head.clone();
     for (name, flags, value) in &q.settings {
         let lower = name.to_lowercase();
-        if lower == "readonly" || lower.starts_with("allow_") || lower == "max_execution_time" {
+        if lower == "readonly"
+            || lower.starts_with("allow_")
+            || lower == "max_execution_time"
+            || lower.starts_with("input_format_native_")
+        {
             continue;
         }
         put_string(&mut out, name);
         put_varint(&mut out, *flags);
         put_string(&mut out, value);
     }
-    for (name, value) in [
-        ("readonly", "2".to_string()),
-        ("max_execution_time", timeout_seconds.to_string()),
-    ] {
+    let mut ours = vec![("max_execution_time", timeout_seconds.to_string(), 1)];
+    if read_only {
+        ours.push(("readonly", "2".to_string(), 1));
+    } else {
+        // Type names as text, as ariodb reads them. Not marked important,
+        // so servers without the setting ignore it.
+        ours.push(("input_format_native_decode_types_in_binary_format", "0".to_string(), 0));
+    }
+    for (name, value, flags) in ours {
         put_string(&mut out, name);
-        put_varint(&mut out, 1); // important
+        put_varint(&mut out, flags);
         put_string(&mut out, &value);
     }
     put_string(&mut out, ""); // end of settings
@@ -645,52 +814,24 @@ fn rebuild_query(q: &Query, _rev: u64, timeout_seconds: u64) -> Vec<u8> {
 
 /// Read the Data packet that ends the external tables after a Query, and
 /// check it is empty. Returns its raw bytes.
-async fn read_empty_data<R: tokio::io::AsyncRead + Unpin>(
+async fn read_terminator<R: tokio::io::AsyncRead + Unpin>(
     c: &mut Rd<R>,
-    compression: u64,
+    frames: &mut Frames,
+    rev: u64,
 ) -> Result<Vec<u8>, String> {
-    let start = c.mark();
     let packet = c.varint().await?;
     if packet != 2 {
         return Err(format!(
             "expected a Data packet after the query, got {packet}"
         ));
     }
-    c.string().await?; // table name
-    if compression == 1 {
-        c.bytes(16).await?; // checksum
-        let _method = c.u8().await?;
-        let compressed = u32::from_le_bytes(c.bytes(4).await?.try_into().unwrap()) as usize;
-        let decompressed = u32::from_le_bytes(c.bytes(4).await?.try_into().unwrap());
-        if compressed < 9 {
-            return Err("malformed compressed block".into());
+    match read_data(c, frames, rev, 0, MAX_HELD).await {
+        Ok(block) if block.columns == 0 => Ok(c.take()),
+        Ok(_) | Err(Problem::TooManyRows(_)) => {
+            Err("external tables are not supported through ariodb".into())
         }
-        c.bytes(compressed - 9).await?;
-        if decompressed > 64 {
-            return Err("external tables are not supported through ariodb".into());
-        }
-    } else {
-        // Block info: numbered fields until 0, then column and row counts.
-        loop {
-            match c.varint().await? {
-                0 => break,
-                1 => {
-                    c.u8().await?;
-                }
-                2 => {
-                    c.bytes(4).await?;
-                }
-                other => return Err(format!("unknown block info field {other}")),
-            }
-        }
-        let columns = c.varint().await?;
-        let rows = c.varint().await?;
-        if columns != 0 || rows != 0 {
-            return Err("external tables are not supported through ariodb".into());
-        }
+        Err(Problem::Unreadable(e)) => Err(e),
     }
-    let raw = c.taken[start..].to_vec();
-    Ok(raw)
 }
 
 #[cfg(test)]
