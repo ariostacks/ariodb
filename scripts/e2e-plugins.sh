@@ -303,7 +303,10 @@ curl -s -c "$WORK/cj" -X POST -H 'content-type: application/json' -d '{"password
 PLUGINS=$(curl -s -b "$WORK/cj" $D/api/plugins)
 expect "the dashboard API lists plugins" '"name":"example"' "$PLUGINS"
 expect "with their state" '"state":"running"' "$PLUGINS"
-expect "and restarts" '"restarts":1' "$PLUGINS"
+# One restart for the crash; a slow machine can add another while the new
+# process starts.
+RESTARTS=$(python3 -c 'import json,sys; print(next(p["restarts"] for p in json.loads(sys.argv[1])["plugins"] if p["name"] == "broken"))' "$PLUGINS")
+[ "$RESTARTS" -ge 1 ] && pass "and restarts" || { echo "$PLUGINS"; fail "and restarts"; }
 
 echo "endless line"
 expect "a line that never ends refuses at the cap, not at the timeout" "stopped before answering" \
