@@ -34,7 +34,7 @@ pub struct Fixture {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Action {
     pub agent: String,
-    /// `postgres` (the default) or `clickhouse`.
+    /// `postgres` (the default), `clickhouse` or `mysql`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
     pub sql: SqlAction,
@@ -79,8 +79,23 @@ pub fn preview(
     let Some(agent) = config.agent(agent_name) else {
         return deny(format!("unknown agent '{agent_name}'"));
     };
-    // ClickHouse statements are judged against the agent's ClickHouse access.
-    let (agent, statements) = if engine == "clickhouse" {
+    // ClickHouse and MySQL statements are judged against the agent's access
+    // to that engine.
+    let (agent, statements) = if engine == "mysql" {
+        let Some(my) = &agent.mysql else {
+            return deny("this agent has no MySQL access".into());
+        };
+        let mut view = agent.clone();
+        view.access = my.access;
+        view.tables = my.tables.clone();
+        match crate::mysql_sql::classify(sql) {
+            Ok(mut s) => {
+                crate::mysql_sql::scope_to_database(&mut s, database);
+                (view, s)
+            }
+            Err(e) => return deny(e.to_string()),
+        }
+    } else if engine == "clickhouse" {
         let Some(ch) = &agent.clickhouse else {
             return deny("this agent has no ClickHouse access".into());
         };
@@ -150,8 +165,10 @@ pub fn preview(
 
 /// The database name statements run in when none is given.
 pub fn default_database(config: &Config, engine: &str) -> String {
-    if engine == "clickhouse" {
-        return "default".to_string();
+    match engine {
+        "clickhouse" => return "default".to_string(),
+        "mysql" => return config.mysql.database.clone(),
+        _ => {}
     }
     crate::upstream::Target::from_url(&config.database_url(), config.database.tls, None)
         .map(|t| t.database)
@@ -243,10 +260,10 @@ pub fn run(config: &Config, fixtures: &[(String, Fixture)]) -> Result<(usize, us
     let (mut passed, mut drifted) = (0, 0);
     for (label, f) in fixtures {
         let engine = f.action.engine.as_deref().unwrap_or("postgres");
-        let fallback = if engine == "clickhouse" {
-            "default".to_string()
-        } else {
-            default_db.clone()
+        let fallback = match engine {
+            "clickhouse" => "default".to_string(),
+            "mysql" => config.mysql.database.clone(),
+            _ => default_db.clone(),
         };
         let database = f.action.sql.database.clone().unwrap_or(fallback);
         let got = preview(
