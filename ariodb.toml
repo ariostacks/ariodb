@@ -6,6 +6,20 @@ on_failure = "closed"
 [database]
 url = "postgres://ariodb:not-a-real-password@localhost:5432/app"
 
+# Reach the database through a side process that ariodb starts and keeps
+# running, such as cloud-sql-proxy or an SSH port-forward. Connections that
+# name the tunnel dial its listen address; user, password, database and TLS
+# still come from the URL.
+# tunnel = "cloudsql"
+#
+# [[tunnels]]
+# name = "cloudsql"
+# command = ["cloud-sql-proxy", "--port", "5433", "my-project:europe-west2:app-db"]
+# listen = "127.0.0.1:5433"
+# ready_probe = "tcp"
+# ready_timeout_seconds = 30
+# restart = true
+
 [limits]
 max_rows_per_write = 500
 statement_timeout_ms = 5000

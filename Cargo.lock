@@ -121,6 +121,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "libc",
  "pg_query",
  "postgres-protocol",
  "rand",

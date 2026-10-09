@@ -20,6 +20,7 @@ mod secrets;
 mod store;
 mod testing;
 mod tls;
+mod tunnels;
 mod undo;
 mod upstream;
 mod wire;
@@ -181,13 +182,13 @@ async fn main() -> ExitCode {
             Ok(())
         }
         Command::Classify { .. } => unreachable!("handled above"),
-        Command::Setup => journal::setup(&config).await,
+        Command::Setup => with_tunnels(&config, journal::setup(&config)).await,
         Command::Serve => match make_state(&config, &cli.config) {
             Ok(state) => serve(state).await,
             Err(e) => Err(e),
         },
         Command::Mcp { agent } => match make_state(&config, &cli.config) {
-            Ok(state) => mcp::serve(state, &agent).await,
+            Ok(state) => with_tunnels(&config, mcp::serve(state, &agent)).await,
             Err(e) => Err(e),
         },
         Command::Sessions => sessions_command(&config),
@@ -195,7 +196,13 @@ async fn main() -> ExitCode {
             session,
             apply,
             skip_conflicts,
-        } => undo_command(&config, &session, apply, skip_conflicts).await,
+        } => {
+            with_tunnels(
+                &config,
+                undo_command(&config, &session, apply, skip_conflicts),
+            )
+            .await
+        }
         Command::Test { .. } => unreachable!("handled above"),
         Command::Secret { action } => secret_command(&config, action),
         Command::Approvals { all } => approvals_command(&config, all),
@@ -255,7 +262,43 @@ fn make_state(config: &Config, path: &Path) -> Result<Arc<gate::State>, String> 
     gate::State::new(fresh, path.to_path_buf(), audit)
 }
 
+/// Run a one-off command that needs the database, starting any tunnel it
+/// needs that is not already up (`ariodb serve` may be running it).
+async fn with_tunnels(
+    config: &Config,
+    work: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    let mut tunnels = tunnels::Supervisor::start(&config.tunnels, true).await?;
+    let result = work.await;
+    tunnels.stop().await;
+    result
+}
+
+/// Wait for Ctrl-C or SIGTERM, so tunnels can be stopped on the way out.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 async fn serve(state: Arc<gate::State>) -> Result<(), String> {
+    // Tunnels first: agents, the journal and ClickHouse may all need them.
+    // Tunnel changes in a reloaded config need a restart, like listen addresses.
+    let mut tunnels = tunnels::Supervisor::start(&state.config().tunnels, false).await?;
     tokio::spawn(gate::watch_config(state.clone()));
     let prune_state = state.clone();
     tokio::spawn(async move {
@@ -299,9 +342,15 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
             }
         });
     }
-    proxy::serve(state)
-        .await
-        .map_err(|e| format!("proxy stopped: {e}"))
+    let result = tokio::select! {
+        r = proxy::serve(state) => r.map_err(|e| format!("proxy stopped: {e}")),
+        _ = shutdown_signal() => {
+            println!("ariodb: shutting down");
+            Ok(())
+        }
+    };
+    tunnels.stop().await;
+    result
 }
 
 fn classify_command(sql: &str) -> ExitCode {
@@ -467,10 +516,23 @@ fn print_summary(config: &Config) {
         FailureMode::Open => "let queries through (fail open)",
     };
 
+    let via = |tunnel: &Option<String>| {
+        tunnel
+            .as_deref()
+            .map(|t| format!("  (through tunnel '{t}')"))
+            .unwrap_or_default()
+    };
     println!(
-        "database      {}",
-        config::redact_url(&config.database_url())
+        "database      {}{}",
+        config::redact_url(&config.database_url()),
+        via(&config.database.tunnel)
     );
+    for c in config.credentials.iter().filter(|c| c.tunnel.is_some()) {
+        println!("credential    {}{}", c.name, via(&c.tunnel));
+    }
+    if let Some(t) = &config.clickhouse.tunnel {
+        println!("clickhouse    through tunnel '{t}'");
+    }
     println!(
         "row limit     {} rows per write",
         config.limits.max_rows_per_write
@@ -485,6 +547,24 @@ fn print_summary(config: &Config) {
     println!("journal       {journal}");
     println!("if checks fail, {on_failure}");
     println!();
+
+    for t in &config.tunnels {
+        let restart = if t.restart {
+            "restarted if it exits"
+        } else {
+            "not restarted"
+        };
+        println!(
+            "tunnel {:<15} {:<21} ready within {} s, {restart}: {}",
+            t.name,
+            t.listen,
+            t.ready_timeout_seconds,
+            t.command.join(" ")
+        );
+    }
+    if !config.tunnels.is_empty() {
+        println!();
+    }
 
     if config.agents.is_empty() {
         println!("no agents configured: every agent will be refused");

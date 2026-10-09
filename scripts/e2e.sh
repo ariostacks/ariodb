@@ -456,4 +456,100 @@ expect "TLS connection works" "SSL connection" "$(docker run --rm -e PGPASSWORD=
 expect "queries work over TLS" "(1 row)" "$(tls_agent require "SELECT 1")"
 expect "plaintext refused when TLS required" "requires TLS" "$(tls_agent disable "SELECT 1")"
 
+echo "tunnels"
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null || true
+TUN=$((56433 + OFF))
+# A tiny TCP forwarder standing in for cloud-sql-proxy or an SSH port-forward.
+cat > "$WORK/forward.py" <<'PY'
+import os, socket, sys, threading
+listen, target = sys.argv[1], sys.argv[2]
+def addr(a):
+    host, port = a.rsplit(":", 1)
+    return host, int(port)
+def pipe(a, b):
+    try:
+        while data := a.recv(65536):
+            b.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (a, b):
+            try: s.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(addr(listen))
+srv.listen()
+print(f"forwarder pid {os.getpid()} on {listen}", flush=True)
+while True:
+    client, _ = srv.accept()
+    upstream = socket.create_connection(addr(target))
+    print("forwarding a connection", flush=True)
+    threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+    threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+PY
+cat > "$WORK/tunnel.toml" <<EOF
+[database]
+url = "postgres://ariodb_gw:gw-local-test-only@127.0.0.1:$PORT/app"
+tls = "require"
+tunnel = "pg"
+
+[[tunnels]]
+name = "pg"
+command = ["python3", "-I", "-u", "$WORK/forward.py", "127.0.0.1:$TUN", "127.0.0.1:$PORT"]
+listen = "127.0.0.1:$TUN"
+ready_probe = "tcp"
+ready_timeout_seconds = 10
+
+[proxy]
+listen = "127.0.0.1:$PROXY"
+
+[journal]
+enabled = false
+dir = "$WORK/tunnel-state"
+
+[dashboard]
+listen = ""
+
+[[agents]]
+name = "coding-agent"
+access = "read_write"
+tables = ["orders", "customers"]
+token_env = "E2E_AGENT_TOKEN"
+EOF
+TCFG=(--config "$WORK/tunnel.toml")
+expect "check lists the tunnel" "tunnel pg" "$($BIN "${TCFG[@]}" check)"
+expect "check shows the database goes through it" "through tunnel 'pg'" "$($BIN "${TCFG[@]}" check)"
+sed 's/^tunnel = "pg"$/tunnel = "nope"/' "$WORK/tunnel.toml" > "$WORK/tunnel-bad.toml"
+expect "an unknown tunnel name is refused" "uses tunnel 'nope', which is not defined" \
+  "$($BIN --config "$WORK/tunnel-bad.toml" check 2>&1 || true)"
+$BIN "${TCFG[@]}" serve >"$WORK/serve-tunnel.log" 2>&1 &
+SERVE_PID=$!
+wait_for_proxy
+expect "serve waited for the tunnel" "tunnel 'pg' is ready" "$(cat "$WORK/serve-tunnel.log")"
+expect "an agent query works through the tunnel" "ariodb_gw" "$(agent coding-agent $T "SELECT current_user")"
+expect "TLS from the URL is kept through the tunnel" "| t" \
+  "$(agent coding-agent $T "SELECT 'ssl', ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")"
+expect "tunnel output is logged with its name" "tunnel pg: forwarding a connection" "$(cat "$WORK/serve-tunnel.log")"
+forwarder_pid() { sed -n 's/^tunnel pg: forwarder pid \([0-9]*\) .*/\1/p' "$WORK/serve-tunnel.log" | tail -1; }
+FWD=$(forwarder_pid)
+[ -n "$FWD" ] || fail "no forwarder pid in the log"
+kill -9 "$FWD"
+for _ in $(seq 1 50); do
+  [ "$(grep -c "tunnel 'pg' is ready" "$WORK/serve-tunnel.log")" -ge 2 ] && break
+  sleep 0.2
+done
+expect "a killed tunnel is noticed" "tunnel 'pg' was stopped" "$(cat "$WORK/serve-tunnel.log")"
+expect "and restarted with backoff" "restarting in 1 s" "$(cat "$WORK/serve-tunnel.log")"
+FWD2=$(forwarder_pid)
+[ -n "$FWD2" ] && [ "$FWD2" != "$FWD" ] && pass "a new tunnel process is running" || fail "tunnel was not restarted"
+expect "queries work again after the restart" "(1 row)" "$(agent coding-agent $T "SELECT count(*) FROM orders")"
+kill $SERVE_PID; wait $SERVE_PID 2>/dev/null || true
+kill -0 "$FWD2" 2>/dev/null && fail "tunnel process outlived ariodb" || pass "stopping ariodb stops the tunnel"
+sed -e 's|^command = .*|command = ["sleep", "30"]|' -e 's/^ready_timeout_seconds = 10$/ready_timeout_seconds = 1/' \
+  "$WORK/tunnel.toml" > "$WORK/tunnel-slow.toml"
+expect "a tunnel that never listens stops serve with a clear error" \
+  "did not accept connections on 127.0.0.1:$TUN within 1 s" \
+  "$($BIN --config "$WORK/tunnel-slow.toml" serve 2>&1 || true)"
+
 echo "all end-to-end checks passed"

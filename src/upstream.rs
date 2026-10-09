@@ -18,6 +18,17 @@ pub struct Target {
     pub database: String,
     pub tls: TlsMode,
     pub ca_file: Option<String>,
+    /// Set when the connection goes through a tunnel: dial this instead of
+    /// `host:port`. `host` is still used for TLS, so the certificate is
+    /// checked against the real database's name.
+    pub via: Option<Via>,
+}
+
+/// A tunnel a connection goes through.
+#[derive(Debug, Clone)]
+pub struct Via {
+    pub tunnel: String,
+    pub addr: std::net::SocketAddr,
 }
 
 impl Target {
@@ -55,7 +66,36 @@ impl Target {
             database,
             tls,
             ca_file,
+            via: None,
         })
+    }
+
+    /// Send this connection through a tunnel's local address.
+    pub fn through(mut self, tunnel: &crate::tunnels::TunnelConfig) -> Result<Target, String> {
+        self.via = Some(Via {
+            tunnel: tunnel.name.clone(),
+            addr: tunnel.addr()?,
+        });
+        Ok(self)
+    }
+
+    /// The address to open a TCP connection to.
+    pub fn dial_addr(&self) -> String {
+        match &self.via {
+            Some(via) => via.addr.to_string(),
+            None => format!("{}:{}", self.host, self.port),
+        }
+    }
+
+    /// The address for error messages, naming the tunnel if there is one.
+    pub fn describe(&self) -> String {
+        match &self.via {
+            Some(via) => format!(
+                "{}:{} through tunnel '{}' ({})",
+                self.host, self.port, via.tunnel, via.addr
+            ),
+            None => format!("{}:{}", self.host, self.port),
+        }
     }
 }
 
@@ -79,8 +119,8 @@ pub struct DbError {
 
 impl Upstream {
     pub async fn connect(target: &Target, application_name: &str) -> Result<Upstream, String> {
-        let addr = format!("{}:{}", target.host, target.port);
-        let mut stream = TcpStream::connect(&addr)
+        let addr = target.describe();
+        let mut stream = TcpStream::connect(target.dial_addr())
             .await
             .map_err(|e| format!("cannot reach {addr}: {e}"))?;
         let _ = stream.set_nodelay(true);
@@ -248,8 +288,7 @@ async fn authenticate(io: &mut Box<dyn Io>, target: &Target) -> Result<(), Strin
 
 /// Ask the database to cancel a running query.
 pub async fn cancel(target: &Target, key: (i32, i32)) {
-    let addr = format!("{}:{}", target.host, target.port);
-    if let Ok(mut s) = TcpStream::connect(&addr).await {
+    if let Ok(mut s) = TcpStream::connect(target.dial_addr()).await {
         let mut msg = Vec::with_capacity(16);
         msg.extend(16i32.to_be_bytes());
         msg.extend(wire::CANCEL_REQUEST.to_be_bytes());
@@ -260,13 +299,14 @@ pub async fn cancel(target: &Target, key: (i32, i32)) {
 }
 
 /// A tokio-postgres client for ariodb's admin work (setup, journal, undo),
-/// using the same TLS settings as the agents' connections.
-pub async fn admin_client(
-    target_tls: TlsMode,
-    url: &str,
-) -> Result<tokio_postgres::Client, String> {
+/// using the same TLS settings (and tunnel) as the agents' connections.
+pub async fn admin_client(target: &Target, url: &str) -> Result<tokio_postgres::Client, String> {
+    let target_tls = target.tls;
     let mut config =
         tokio_postgres::Config::from_str(url).map_err(|e| format!("bad database URL: {e}"))?;
+    if let Some(via) = &target.via {
+        config = reroute(&config, target, via);
+    }
     let err = |e: tokio_postgres::Error| format!("cannot connect: {e}");
     if target_tls == TlsMode::Disable {
         config.ssl_mode(tokio_postgres::config::SslMode::Disable);
@@ -284,4 +324,30 @@ pub async fn admin_client(
         });
         Ok(client)
     }
+}
+
+/// The same login, dialled at the tunnel. `hostaddr` is where the socket
+/// goes; `host` stays the real name, which TLS verifies.
+fn reroute(from: &tokio_postgres::Config, target: &Target, via: &Via) -> tokio_postgres::Config {
+    let mut to = tokio_postgres::Config::new();
+    to.host(&target.host)
+        .hostaddr(via.addr.ip())
+        .port(via.addr.port())
+        .dbname(&target.database);
+    if let Some(user) = from.get_user() {
+        to.user(user);
+    }
+    if let Some(password) = from.get_password() {
+        to.password(password);
+    }
+    if let Some(options) = from.get_options() {
+        to.options(options);
+    }
+    if let Some(name) = from.get_application_name() {
+        to.application_name(name);
+    }
+    if let Some(timeout) = from.get_connect_timeout() {
+        to.connect_timeout(*timeout);
+    }
+    to
 }

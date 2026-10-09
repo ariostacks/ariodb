@@ -62,6 +62,36 @@ ariodb audit                                   # check the audit log is intact
 ariodb classify "EXPLAIN ANALYZE DELETE FROM users"
 ```
 
+## Tunnels
+
+When the database is only reachable through a side process (cloud-sql-proxy,
+an IAP tunnel, an SSH port-forward), let ariodb run it:
+
+```toml
+[database]
+url = "postgres://ariodb_gw:...@10.20.0.5:5432/app"
+tunnel = "cloudsql"
+
+[[tunnels]]
+name = "cloudsql"
+command = ["cloud-sql-proxy", "--port", "5433", "my-project:europe-west2:app-db"]
+listen = "127.0.0.1:5433"     # where the process listens
+ready_timeout_seconds = 30    # how long to wait for that port to accept connections
+restart = true                # start it again, with backoff, if it exits
+```
+
+`ariodb serve` starts every tunnel before it accepts agents and refuses to
+start if one does not come up in time. A tunnel that exits is restarted after
+1 s, doubling to 30 s; its output appears in ariodb's log prefixed with
+`tunnel <name>:`. Stopping ariodb (Ctrl-C or SIGTERM) stops the tunnels.
+
+A connection that names a tunnel (`[database]`, any `[[credentials]]`, or
+`[clickhouse]`) dials the tunnel's `listen` address; the user, password,
+database and TLS settings still come from its URL, so TLS is checked against
+the real host name. `ariodb setup`, `undo` and `mcp` use a tunnel that
+`ariodb serve` is already running, or start their own for the duration.
+Tunnel changes need a restart.
+
 ## Database roles
 
 - **Gateway role** (`ARIODB_DATABASE_URL`): ordinary privileges on the tables

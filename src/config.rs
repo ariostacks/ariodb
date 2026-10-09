@@ -38,6 +38,10 @@ pub struct Config {
     pub audit: crate::audit::Settings,
     #[serde(default)]
     pub clickhouse: ClickHouse,
+    /// Side processes (cloud-sql-proxy, SSH port-forwards) that carry
+    /// connections to the database. Started by `ariodb serve`.
+    #[serde(default)]
+    pub tunnels: Vec<crate::tunnels::TunnelConfig>,
 }
 
 /// ClickHouse: ariodb fronts its HTTP interface and its native protocol.
@@ -58,6 +62,9 @@ pub struct ClickHouse {
     pub password_secret: Option<String>,
     /// For https:// upstreams with a private CA.
     pub accept_invalid_certificate: bool,
+    /// Reach ClickHouse (both interfaces) through this tunnel. The tunnel
+    /// must forward to whichever port is used, HTTP or native.
+    pub tunnel: Option<String>,
 }
 
 impl Default for ClickHouse {
@@ -71,6 +78,7 @@ impl Default for ClickHouse {
             password_env: None,
             password_secret: None,
             accept_invalid_certificate: false,
+            tunnel: None,
         }
     }
 }
@@ -138,6 +146,8 @@ pub struct Credential {
     pub secret: Option<String>,
     pub tls: Option<TlsMode>,
     pub ca_file: Option<String>,
+    /// Connect through this tunnel instead of the URL's host and port.
+    pub tunnel: Option<String>,
 }
 
 /// Where and how ariodb records every row an agent changes.
@@ -174,6 +184,9 @@ pub struct Database {
     pub tls: Option<TlsMode>,
     /// Extra trusted CA certificate (PEM) for `verify`.
     pub ca_file: Option<String>,
+    /// Connect through this tunnel instead of the URL's host and port.
+    /// Also used by setup, the journal and undo.
+    pub tunnel: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,6 +309,26 @@ impl Config {
             ));
         }
         crate::rules::RuleSet::compile(&self.rules).map_err(ConfigError::Problem)?;
+        crate::tunnels::validate(&self.tunnels).map_err(ConfigError::Problem)?;
+        let uses = std::iter::once(("[database]".to_string(), &self.database.tunnel))
+            .chain(
+                self.credentials
+                    .iter()
+                    .map(|c| (format!("credential '{}'", c.name), &c.tunnel)),
+            )
+            .chain(std::iter::once((
+                "[clickhouse]".to_string(),
+                &self.clickhouse.tunnel,
+            )));
+        for (who, tunnel) in uses {
+            if let Some(name) = tunnel
+                && !self.tunnels.iter().any(|t| &t.name == name)
+            {
+                return Err(ConfigError::Problem(format!(
+                    "{who} uses tunnel '{name}', which is not defined in [[tunnels]]"
+                )));
+            }
+        }
         crate::approvals::validate(&self.approvers, &self.rules).map_err(ConfigError::Problem)?;
         let mut names = std::collections::HashSet::new();
         for agent in &self.agents {
@@ -375,10 +408,13 @@ impl Config {
     /// Where an agent's queries go, and as which database login.
     pub fn target_for(&self, agent: &Agent) -> Result<Target, String> {
         match &agent.credential {
-            None => Target::from_url(
-                &self.database_url(),
-                self.database.tls,
-                self.database.ca_file.clone(),
+            None => self.through(
+                Target::from_url(
+                    &self.database_url(),
+                    self.database.tls,
+                    self.database.ca_file.clone(),
+                )?,
+                &self.database.tunnel,
             ),
             Some(name) => {
                 let cred = self
@@ -394,14 +430,66 @@ impl Config {
                     })?,
                     (None, None) => return Err(format!("credential '{name}' needs url_env or secret")),
                 };
-                Target::from_url(&url, cred.tls.or(self.database.tls), cred.ca_file.clone())
+                let target =
+                    Target::from_url(&url, cred.tls.or(self.database.tls), cred.ca_file.clone())?;
+                self.through(target, &cred.tunnel)
             }
         }
     }
 
-    /// The admin connection (setup, journal, undo) uses the default database settings.
+    /// The admin connection (setup, journal, undo) uses the default database
+    /// settings, including its tunnel.
     pub fn admin_target(&self, url: &str) -> Result<Target, String> {
-        Target::from_url(url, self.database.tls, self.database.ca_file.clone())
+        let target = Target::from_url(url, self.database.tls, self.database.ca_file.clone())?;
+        self.through(target, &self.database.tunnel)
+    }
+
+    /// Route a connection through the named tunnel, if any.
+    fn through(&self, target: Target, tunnel: &Option<String>) -> Result<Target, String> {
+        match tunnel {
+            None => Ok(target),
+            Some(name) => target.through(crate::tunnels::find(&self.tunnels, name)?),
+        }
+    }
+
+    /// The tunnel ClickHouse traffic goes through, if any.
+    fn clickhouse_tunnel(&self) -> Result<Option<&crate::tunnels::TunnelConfig>, String> {
+        self.clickhouse
+            .tunnel
+            .as_deref()
+            .map(|name| crate::tunnels::find(&self.tunnels, name))
+            .transpose()
+    }
+
+    /// Where to open the native-protocol connection to ClickHouse.
+    pub fn clickhouse_native_addr(&self) -> Result<String, String> {
+        Ok(match self.clickhouse_tunnel()? {
+            Some(t) => t.listen.clone(),
+            None => self.clickhouse.native_addr.clone(),
+        })
+    }
+
+    /// The ClickHouse HTTP URL, and, through a tunnel, the name to resolve
+    /// to the tunnel's address. Resolving rather than rewriting the host
+    /// keeps the real name for TLS.
+    pub fn clickhouse_http_url(
+        &self,
+    ) -> Result<(reqwest::Url, Option<(String, std::net::SocketAddr)>), String> {
+        let mut url = reqwest::Url::parse(&self.clickhouse.http_url)
+            .map_err(|e| format!("bad clickhouse.http_url: {e}"))?;
+        let Some(tunnel) = self.clickhouse_tunnel()? else {
+            return Ok((url, None));
+        };
+        let addr = tunnel.addr()?;
+        let bad = |_| "clickhouse.http_url cannot be sent through a tunnel".to_string();
+        url.set_port(Some(addr.port())).map_err(bad)?;
+        match url.domain().map(str::to_string) {
+            Some(domain) => Ok((url, Some((domain, addr)))),
+            None => {
+                url.set_ip_host(addr.ip()).map_err(bad)?;
+                Ok((url, None))
+            }
+        }
     }
 
     pub fn agent(&self, name: &str) -> Option<&Agent> {
@@ -485,6 +573,88 @@ mod tests {
             Config::from_toml(&text),
             Err(ConfigError::Invalid(_))
         ));
+    }
+
+    const TUNNELLED: &str = r#"
+        [database]
+        url = "postgres://gw:not-a-real-password@db.internal.example:5432/app"
+        tls = "verify"
+        tunnel = "pg"
+
+        [[tunnels]]
+        name = "pg"
+        command = ["cloud-sql-proxy", "--port", "5433", "project:region:instance"]
+        listen = "127.0.0.1:5433"
+
+        [[agents]]
+        name = "coding-agent"
+        access = "read_write"
+        tables = ["orders"]
+        token_env = "ARIODB_TOKEN_TEST"
+    "#;
+
+    #[test]
+    fn a_tunnel_changes_where_to_dial_and_nothing_else() {
+        let config = Config::from_toml(TUNNELLED).expect("config should load");
+        let t = &config.tunnels[0];
+        assert_eq!(t.ready_timeout_seconds, 30);
+        assert!(t.restart);
+        let target = config.target_for(&config.agents[0]).unwrap();
+        assert_eq!(target.dial_addr(), "127.0.0.1:5433");
+        assert_eq!(target.host, "db.internal.example");
+        assert_eq!(target.port, 5432);
+        assert_eq!(target.user, "gw");
+        assert_eq!(target.password.as_deref(), Some("not-a-real-password"));
+        assert_eq!(target.database, "app");
+        assert_eq!(target.tls, TlsMode::Verify);
+        let admin = config
+            .admin_target("postgres://admin@db.internal.example/app")
+            .unwrap();
+        assert_eq!(admin.dial_addr(), "127.0.0.1:5433");
+    }
+
+    #[test]
+    fn unknown_and_duplicate_tunnels_are_refused() {
+        let unknown = TUNNELLED.replace("tunnel = \"pg\"", "tunnel = \"nope\"");
+        let err = Config::from_toml(&unknown).err().unwrap().to_string();
+        assert!(err.contains("[database] uses tunnel 'nope'"), "{err}");
+
+        let twice = format!(
+            "{TUNNELLED}\n[[tunnels]]\nname = \"pg\"\ncommand = [\"x\"]\nlisten = \"127.0.0.1:5434\"\n"
+        );
+        let err = Config::from_toml(&twice).err().unwrap().to_string();
+        assert!(err.contains("listed twice"), "{err}");
+
+        let empty = TUNNELLED.replace(
+            r#"command = ["cloud-sql-proxy", "--port", "5433", "project:region:instance"]"#,
+            "command = []",
+        );
+        let err = Config::from_toml(&empty).err().unwrap().to_string();
+        assert!(err.contains("needs a command"), "{err}");
+
+        let cred = format!(
+            "{TUNNELLED}\n[[credentials]]\nname = \"ro\"\nurl_env = \"X\"\ntunnel = \"other\"\n"
+        );
+        let err = Config::from_toml(&cred).err().unwrap().to_string();
+        assert!(err.contains("credential 'ro' uses tunnel 'other'"), "{err}");
+    }
+
+    #[test]
+    fn clickhouse_through_a_tunnel_keeps_its_name_for_tls() {
+        let text = format!(
+            "{TUNNELLED}\n[clickhouse]\nhttp_url = \"https://ch.internal.example:8443\"\ntunnel = \"pg\"\n"
+        );
+        let config = Config::from_toml(&text).unwrap();
+        let (url, resolve) = config.clickhouse_http_url().unwrap();
+        assert_eq!(url.as_str(), "https://ch.internal.example:5433/");
+        assert_eq!(
+            resolve,
+            Some((
+                "ch.internal.example".to_string(),
+                "127.0.0.1:5433".parse().unwrap()
+            ))
+        );
+        assert_eq!(config.clickhouse_native_addr().unwrap(), "127.0.0.1:5433");
     }
 
     #[test]
