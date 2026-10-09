@@ -107,6 +107,8 @@ Make sure agents can reach the database only through ariodb.
 |---|---|
 | Insert, update, delete, including cascades and trigger effects | Undone |
 | `TRUNCATE`, `DROP`, schema changes | Refused for agents, so never need undoing |
+| Rows someone else changed after the session first did | Reported as conflicts; left alone with `--skip-conflicts`, otherwise nothing is undone |
+| Undo steps that would cascade (or trigger updates and deletes) into rows the session never touched | Refused; nothing is undone |
 | Rows in tables without a primary key | Reported as not undoable |
 | Sequence values | Not rewound; gaps in IDs are harmless |
 | Anything outside the database (emails, payments) | Out of scope |
@@ -121,9 +123,17 @@ roadmap in the design document.
 ## Testing
 
 ```bash
-cargo test            # unit tests
-./scripts/e2e.sh      # end-to-end against Postgres in Docker
+cargo test                      # unit and property tests (PROPTEST_CASES=100000 for a longer hunt)
+./scripts/e2e.sh                # end-to-end against Postgres in Docker
+./scripts/e2e-clickhouse.sh     # end-to-end against ClickHouse in Docker
+./scripts/sim-undo.sh           # seeded random agent and human writes, then undo, checked against a model
+SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh   # other seeds, longer runs
 ```
+
+The undo simulation brackets every write with a snapshot of the database,
+predicts each undo from those snapshots alone, and fails with the seed, the
+plan, what changed and the history of the rows involved when ariodb
+disagrees. The same seed always produces the same workload.
 
 ## Licence
 
