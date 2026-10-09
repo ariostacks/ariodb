@@ -7,7 +7,7 @@
 //! (and its seed, in `proptest-regressions/`) when one breaks.
 
 use crate::classify::{self, Kind};
-use crate::{chsql, pgoutput, wire};
+use crate::{chsql, mysql_sql, pgoutput, wire};
 use proptest::prelude::*;
 
 fn config() -> ProptestConfig {
@@ -216,6 +216,242 @@ proptest! {
     fn outside_table_functions_are_never_reads(sql in ch_reaching_query()) {
         if let Ok(s) = chsql::classify(&sql) {
             prop_assert_ne!(s.kind, Kind::Read, "{} ({})", sql, s.reason);
+        }
+    }
+}
+
+// ------------------------------------------------------------------- MySQL
+
+/// Table spellings and what each must be reported as.
+fn my_table() -> impl Strategy<Value = (&'static str, &'static str)> {
+    prop::sample::select(vec![
+        ("orders", "orders"),
+        ("Orders", "orders"),
+        ("`orders`", "orders"),
+        ("app.orders", "app.orders"),
+        ("`App`.`Orders`", "app.orders"),
+        ("app . orders", "app.orders"),
+        ("secrets", "secrets"),
+        ("`Secrets`", "secrets"),
+        ("db2.secrets", "db2.secrets"),
+        ("`weird-name`", "weird-name"),
+        ("`ünïcode`", "ünïcode"),
+        ("`it's`", "it's"),
+        ("`a\"b`", "a\"b"),
+        ("`back``tick`", "back`tick"),
+        ("`--x`", "--x"),
+    ])
+}
+
+/// Queries naming two tables in the places tables hide, each with the
+/// tables it must be seen to name.
+fn my_query() -> impl Strategy<Value = (String, Vec<&'static str>)> {
+    (my_table(), my_table(), 0..19usize).prop_map(|((a, ra), (b, rb), how)| {
+        let sql = match how {
+            0 => format!("SELECT * FROM {a}, {b}"),
+            1 => format!("SELECT * FROM {a} JOIN {b} ON 1 = 1"),
+            2 => format!("SELECT * FROM {a} WHERE id IN (SELECT id FROM {b})"),
+            3 => format!("SELECT (SELECT max(x) FROM {b}) FROM {a}"),
+            4 => format!("SELECT * FROM {a} WHERE EXISTS (SELECT 1 FROM {b})"),
+            5 => format!("SELECT * FROM {a} UNION ALL SELECT * FROM {b}"),
+            6 => format!("WITH c AS (SELECT * FROM {b}) SELECT * FROM {a}, c"),
+            7 => format!("INSERT INTO {a} SELECT * FROM {b}"),
+            8 => format!("INSERT INTO {a} (x) VALUES ((SELECT x FROM {b} LIMIT 1))"),
+            9 => format!("UPDATE {a} SET x = (SELECT x FROM {b} LIMIT 1) WHERE id = 1"),
+            10 => format!("UPDATE {a} JOIN {b} ON 1 = 1 SET x = 1 WHERE id = 1"),
+            11 => format!("DELETE FROM {a} WHERE id IN (SELECT id FROM {b})"),
+            12 => format!("DELETE {a} FROM {a} JOIN {b} ON 1 = 1 WHERE 1 = 1"),
+            13 => format!("REPLACE INTO {a} SELECT * FROM {b}"),
+            14 => format!("EXPLAIN SELECT * FROM {a} JOIN {b} ON 1 = 1"),
+            15 => format!("SET @x = (SELECT max(id) FROM {a} JOIN {b} ON 1 = 1)"),
+            16 => format!("SHOW TABLES WHERE (SELECT 1 FROM {a}, {b} LIMIT 1) = 1"),
+            17 => format!("SELECT * FROM {a} LEFT JOIN ({b} CROSS JOIN dual_t) ON 1 = 1"),
+            _ => format!("SELECT * FROM {a} FOR UPDATE; TABLE {b}"),
+        };
+        let mut expected = vec![ra, rb];
+        if how == 17 {
+            expected.push("dual_t");
+        }
+        (sql, expected)
+    })
+}
+
+/// Separators that change nothing for the server: spaces, newlines and
+/// comments full of quotes and semicolons.
+fn my_gap() -> impl Strategy<Value = &'static str> {
+    prop::sample::select(vec![
+        " ",
+        "\n  ",
+        "\t",
+        " /* ' ; \" ` */ ",
+        "/**/",
+        " /*+ hint */ ",
+        "\n-- ' ; DROP TABLE x\n",
+        "\n# \" ; DELETE FROM x\n",
+        " -- `\n",
+    ])
+}
+
+/// Join a query's words with harmless separators.
+fn my_respell(sql: &str, gaps: &[&str]) -> String {
+    let mut out = String::new();
+    for (i, word) in sql.split(' ').enumerate() {
+        if i > 0 {
+            out.push_str(gaps[i % gaps.len()]);
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+/// A MySQL string literal holding exactly `text`, quoted one of the ways the
+/// server accepts.
+fn my_quote(text: &str, double: bool, doubling: bool) -> String {
+    let q = if double { '"' } else { '\'' };
+    let mut out = String::from(q);
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            c if c == q && doubling => {
+                out.push(q);
+                out.push(q);
+            }
+            c if c == q => {
+                out.push('\\');
+                out.push(q);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(q);
+    out
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    #[test]
+    fn mysql_classify_never_panics_on_any_text(sql in ".{0,200}") {
+        let _ = mysql_sql::classify(&sql);
+    }
+
+    #[test]
+    fn mysql_classify_never_panics_on_tricky_text(
+        parts in prop::collection::vec(prop::sample::select(vec![
+            "SELECT", "FROM", "orders", "(", ")", ".", "'", "\\", "`", "\"", "/*", "*/", "/*!",
+            "/*M!", "/*+", "--", "-- ", "#", "\n", ";", "@", "@@", "SET", "SHOW", "EXPLAIN",
+            "ANALYZE", "WITH", "x", "AS", "INTO", "UPDATE", "DELETE", "WHERE", "=", ":=", ",",
+            "1", "0x1F", "x'", "N'", "_utf8mb4'", "\u{a0}", "KILL", "USE", "TABLE",
+        ]), 0..40)
+    ) {
+        let _ = mysql_sql::classify(&parts.concat());
+        let _ = mysql_sql::classify(&parts.join(" "));
+    }
+
+    /// The allow-list depends on this: every table a query names is found,
+    /// however it is spelt and whatever comments sit between the words.
+    #[test]
+    fn mysql_never_finds_fewer_tables_than_named(
+        (sql, expected) in my_query(),
+        gaps in prop::collection::vec(my_gap(), 1..6),
+    ) {
+        let sql = my_respell(&sql, &gaps);
+        let statements = mysql_sql::classify(&sql)
+            .map_err(|e| TestCaseError::fail(format!("generated SQL should parse: {e}\n{sql}")))?;
+        let found: Vec<&String> = statements.iter().flat_map(|s| &s.tables).collect();
+        for table in expected {
+            prop_assert!(
+                found.iter().any(|t| *t == table),
+                "{} not found in {:?}\n{}", table, found, sql
+            );
+        }
+    }
+
+    /// Whatever a string literal holds, it hides neither a statement nor a
+    /// table: quoted properly, it is one value and nothing more. (NUL bytes
+    /// are refused outright; drivers send them escaped.)
+    #[test]
+    fn mysql_a_string_hides_nothing(
+        text in "[^\u{0}]{0,40}",
+        double in any::<bool>(),
+        doubling in any::<bool>(),
+    ) {
+        let sql = format!(
+            "SELECT {} FROM orders; DELETE FROM secrets",
+            my_quote(&text, double, doubling)
+        );
+        let statements = mysql_sql::classify(&sql)
+            .map_err(|e| TestCaseError::fail(format!("should parse: {e}\n{sql}")))?;
+        prop_assert_eq!(statements.len(), 2, "{}", sql);
+        prop_assert_eq!(&statements[0].tables, &vec!["orders".to_string()], "{}", sql);
+        prop_assert_eq!(statements[0].kind, Kind::Read, "{}", sql);
+        prop_assert_eq!(statements[1].kind, Kind::Destructive, "{}", sql);
+    }
+
+    /// A quoted name is one table, whatever it holds; one with a dot in it
+    /// is refused rather than read as database.table.
+    #[test]
+    fn mysql_a_quoted_name_is_one_table(text in "[^\u{0}]{1,30}") {
+        let quoted = format!("`{}`", text.replace('`', "``"));
+        let sql = format!("SELECT * FROM {quoted} WHERE 1 = 1; DELETE FROM secrets");
+        match mysql_sql::classify(&sql) {
+            Ok(statements) => {
+                prop_assert!(!text.contains('.'), "{}", sql);
+                prop_assert_eq!(statements.len(), 2, "{}", sql);
+                prop_assert_eq!(&statements[0].tables, &vec![text.to_lowercase()], "{}", sql);
+            }
+            Err(_) => prop_assert!(text.contains('.') || text.trim().is_empty(), "{}", sql),
+        }
+    }
+
+    /// However a write is wrapped or spelt, it is never mistaken for a read.
+    #[test]
+    fn mysql_a_wrapped_write_is_never_a_read(
+        (table, _) in my_table(),
+        how in 0..6usize,
+        outer in 0..5usize,
+        gaps in prop::collection::vec(my_gap(), 1..6),
+    ) {
+        let write = match how {
+            0 => format!("DELETE FROM {table} WHERE id = 1"),
+            1 => format!("UPDATE {table} SET a = 1"),
+            2 => format!("INSERT INTO {table} (a) VALUES ('x;SELECT/*1*/')"),
+            3 => format!("WITH c AS (SELECT 1 AS id) DELETE FROM {table} WHERE id IN (SELECT id FROM c)"),
+            4 => format!("SELECT * FROM {table} LOCK IN SHARE MODE"),
+            _ => format!("REPLACE INTO {table} SET a = 1"),
+        };
+        let sql = match outer {
+            0 => format!("EXPLAIN ANALYZE {write}"),
+            1 => format!("ANALYZE {write}"),
+            2 => format!("SELECT 1; {write}"),
+            // An escaped backslash: the string ends before the write.
+            3 => format!("SELECT 'a\\\\' AS x; {write}"),
+            _ => write,
+        };
+        let sql = my_respell(&sql, &gaps);
+        let statements = mysql_sql::classify(&sql)
+            .map_err(|e| TestCaseError::fail(format!("generated SQL should parse: {e}\n{sql}")))?;
+        prop_assert!(
+            statements.iter().any(|s| s.kind >= Kind::Write),
+            "{} was read as {:?}", sql, statements.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// An executable comment anywhere makes its statement Unknown.
+    #[test]
+    fn mysql_executable_comments_are_never_trusted(
+        body in "[^*]{0,30}",
+        prefix in prop::sample::select(vec!["/*!", "/*!50000", "/*M!", "/*M!100100"]),
+        at in 0..3usize,
+    ) {
+        let comment = format!("{prefix}{body}*/");
+        let sql = match at {
+            0 => format!("{comment} SELECT 1"),
+            1 => format!("SELECT {comment} 1 FROM orders"),
+            _ => format!("SELECT 1 FROM orders {comment}"),
+        };
+        if let Ok(statements) = mysql_sql::classify(&sql) {
+            prop_assert!(statements.iter().any(|s| s.kind == Kind::Unknown), "{}", sql);
         }
     }
 }
