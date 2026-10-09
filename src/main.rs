@@ -16,6 +16,7 @@ mod mysql_journal;
 mod mysql_proxy;
 mod mysql_sql;
 mod mysql_undo;
+mod plugins;
 mod mcp;
 mod pgoutput;
 mod policy;

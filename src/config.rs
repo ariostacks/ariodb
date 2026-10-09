@@ -40,6 +40,10 @@ pub struct Config {
     pub clickhouse: ClickHouse,
     #[serde(default)]
     pub mysql: MySql,
+    /// Programs that extend ariodb: approvers, rule facts, notifiers and
+    /// audit sinks. See docs/plugins.md.
+    #[serde(default)]
+    pub plugins: Vec<crate::plugins::PluginConfig>,
     /// Side processes (cloud-sql-proxy, SSH port-forwards) that carry
     /// connections to the database. Started by `ariodb serve`.
     #[serde(default)]

@@ -69,11 +69,19 @@ pub struct ApproverConfig {
     pub hmac_secret_secret: Option<String>,
     pub hmac_secret_env: Option<String>,
     // llm
+    /// `anthropic` (default), `openai`, `gemini`, `azure_openai` or
+    /// `openai_compatible`.
+    pub provider: Option<String>,
+    /// The API's address, for `openai_compatible` and `azure_openai`.
+    pub base_url: Option<String>,
     pub model: Option<String>,
     pub policy: Option<String>,
     pub api_key_secret: Option<String>,
     pub api_key_env: Option<String>,
     pub effort: Option<String>,
+    // plugin
+    /// The `[[plugins]]` entry that decides.
+    pub plugin: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -83,6 +91,7 @@ pub enum ApproverKind {
     Slack,
     Webhook,
     Llm,
+    Plugin,
 }
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
@@ -130,6 +139,11 @@ pub fn validate(
                     return missing("policy");
                 }
             }
+            ApproverKind::Plugin => {
+                if a.plugin.is_none() {
+                    return missing("plugin");
+                }
+            }
         }
     }
     for r in rules {
@@ -167,6 +181,9 @@ pub async fn require(
         };
         let verdict = match approver.kind {
             ApproverKind::Llm => ask_model(state, approver, ctx, statements, need).await,
+            ApproverKind::Plugin => {
+                crate::plugins::ask(state, approver, ctx, statements, need).await
+            }
             _ => ask_person(state, approver, ctx, &sql, need).await,
         };
         if let Err(why) = verdict {
@@ -784,6 +801,9 @@ mod tests {
             api_key_secret: None,
             api_key_env: None,
             effort: None,
+            provider: None,
+            base_url: None,
+            plugin: None,
         };
         let lenient = approver("Allow anything.");
         let strict = approver("Deny writes.");
