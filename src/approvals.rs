@@ -5,8 +5,11 @@
 //! Approver types:
 //! - `dashboard`: a person decides in the dashboard or with `ariodb approvals`.
 //! - `slack`: posts to a channel, optionally with Approve and Deny buttons.
-//! - `webhook`: POSTs a signed request to any URL (Discord, Telegram, PagerDuty,
-//!   your own service), which answers by following a signed link.
+//! - `webhook`: POSTs a signed request to any URL (your own service), which
+//!   answers by following a signed link.
+//! - `discord`, `telegram`, `teams`, `google_chat`, `mattermost`, `pagerduty`,
+//!   `opsgenie` and `email`: post the request to that channel with the same
+//!   kind of signed Approve and Deny links (see `channels.rs`).
 //! - `llm`: a model judges the statement against a written policy. The
 //!   providers' APIs live in `llm.rs`.
 
@@ -70,6 +73,29 @@ pub struct ApproverConfig {
     pub url: Option<String>,
     pub hmac_secret_secret: Option<String>,
     pub hmac_secret_env: Option<String>,
+    // discord, teams, google_chat, mattermost: the incoming webhook's URL,
+    // which carries its own token, so it lives with the other secrets.
+    pub url_secret: Option<String>,
+    pub url_env: Option<String>,
+    // telegram (with bot_token_*)
+    pub chat_id: Option<crate::channels::ChatId>,
+    // pagerduty
+    pub routing_key_secret: Option<String>,
+    pub routing_key_env: Option<String>,
+    /// pagerduty and opsgenie: `us` (default) or `eu`.
+    pub region: Option<String>,
+    // email
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    /// `starttls` (default, port 587), `tls` (port 465) or `none` (this
+    /// machine only, port 25).
+    pub smtp_tls: Option<String>,
+    pub smtp_user: Option<String>,
+    pub smtp_password_secret: Option<String>,
+    pub smtp_password_env: Option<String>,
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Vec<String>,
     // llm
     /// `anthropic` (default), `openai`, `gemini`, `azure_openai` or
     /// `openai_compatible`.
@@ -98,6 +124,46 @@ pub enum ApproverKind {
     Webhook,
     Llm,
     Plugin,
+    Discord,
+    Telegram,
+    Teams,
+    GoogleChat,
+    Mattermost,
+    Pagerduty,
+    Opsgenie,
+    Email,
+}
+
+impl ApproverKind {
+    /// The name the config uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            ApproverKind::Dashboard => "dashboard",
+            ApproverKind::Slack => "slack",
+            ApproverKind::Webhook => "webhook",
+            ApproverKind::Llm => "llm",
+            ApproverKind::Plugin => "plugin",
+            ApproverKind::Discord => "discord",
+            ApproverKind::Telegram => "telegram",
+            ApproverKind::Teams => "teams",
+            ApproverKind::GoogleChat => "google_chat",
+            ApproverKind::Mattermost => "mattermost",
+            ApproverKind::Pagerduty => "pagerduty",
+            ApproverKind::Opsgenie => "opsgenie",
+            ApproverKind::Email => "email",
+        }
+    }
+
+    /// Answered by following a signed decision link.
+    fn uses_links(self) -> bool {
+        !matches!(
+            self,
+            ApproverKind::Dashboard
+                | ApproverKind::Slack
+                | ApproverKind::Llm
+                | ApproverKind::Plugin
+        )
+    }
 }
 
 /// Check approver definitions when the config loads.
@@ -151,6 +217,7 @@ pub fn validate(
                     return missing("plugin");
                 }
             }
+            _ => crate::channels::validate(a)?,
         }
     }
     for r in rules {
@@ -257,18 +324,45 @@ async fn ask_person(
     state.db.insert_approval(&approval)?;
 
     let notified = match approver.kind {
+        ApproverKind::Dashboard => Ok(()),
         ApproverKind::Slack => notify_slack(&config, approver, &approval).await,
         ApproverKind::Webhook => notify_webhook(&config, approver, &approval).await,
-        _ => Ok(()),
+        _ => notify_channel(&config, approver, &approval).await,
     };
     if let Err(e) = notified {
         state.db.decide(&approval.id, false, "ariodb", Some(&e))?;
         return Err(format!("could not reach approver '{}': {e}", approver.name));
     }
 
+    let decided = wait_for_decision(state, approver, ctx, &approval.id, timeout).await;
+    if matches!(
+        approver.kind,
+        ApproverKind::Pagerduty | ApproverKind::Opsgenie
+    ) {
+        let outcome = match &decided {
+            Ok(()) => "approved".to_string(),
+            Err(why) => why.clone(),
+        };
+        let approver = approver.clone();
+        let id = approval.id.clone();
+        tokio::spawn(async move {
+            crate::channels::settle(&config, &approver, &id, &outcome).await;
+        });
+    }
+    decided
+}
+
+/// Wait until the stored request is decided, expires or is withdrawn.
+async fn wait_for_decision(
+    state: &State,
+    approver: &ApproverConfig,
+    ctx: &Ctx<'_>,
+    id: &str,
+    timeout: u64,
+) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
-        if let Some(a) = state.db.approval(&approval.id)? {
+        if let Some(a) = state.db.approval(id)? {
             match a.status.as_str() {
                 "allowed" => return Ok(()),
                 "denied" => {
@@ -281,11 +375,11 @@ async fn ask_person(
             }
         }
         if let Some(why) = ctx.live.and_then(|l| l.stopped()) {
-            state.db.withdraw(&approval.id, why)?;
+            state.db.withdraw(id, why)?;
             return Err(format!("{why}, so the request was withdrawn"));
         }
         if Instant::now() >= deadline {
-            state.db.expire(&approval.id)?;
+            state.db.expire(id)?;
             return Err(format!(
                 "no decision from '{}' within {timeout} seconds",
                 approver.name
@@ -371,14 +465,7 @@ async fn notify_webhook(
         &approver.hmac_secret_secret,
         &approver.hmac_secret_env,
     )?;
-    let base = config.dashboard.public_url.trim_end_matches('/');
-    let link = |verdict: &str| {
-        let token = sign(&key, &format!("{}:{verdict}", a.id));
-        format!(
-            "{base}/hooks/approvals/{}?verdict={verdict}&token={token}",
-            a.id
-        )
-    };
+    let link = |verdict: &str| decision_link(config, &key, &a.id, verdict);
     let body = json!({
         "id": a.id,
         "agent": a.agent,
@@ -409,6 +496,57 @@ async fn notify_webhook(
     Ok(())
 }
 
+/// Post a request to one of the chat, paging or email channels.
+async fn notify_channel(
+    config: &crate::config::Config,
+    approver: &ApproverConfig,
+    a: &Approval,
+) -> Result<(), String> {
+    let key = link_key(config)?;
+    let notice = crate::channels::Notice {
+        id: &a.id,
+        agent: &a.agent,
+        rule: &a.rule,
+        reason: &a.reason,
+        sql: &a.sql,
+        expires_in_seconds: (a.expires_ms - a.created_ms) / 1000,
+        approve_url: decision_link(config, &key, &a.id, "allow"),
+        deny_url: decision_link(config, &key, &a.id, "deny"),
+        dashboard_url: dashboard_link(config, &a.id),
+    };
+    crate::channels::notify(config, approver, &notice).await
+}
+
+/// A signed link to the dashboard page that confirms one verdict on one
+/// request.
+fn decision_link(config: &crate::config::Config, key: &str, id: &str, verdict: &str) -> String {
+    let token = sign(key, &format!("{id}:{verdict}"));
+    format!(
+        "{}/hooks/approvals/{id}?verdict={verdict}&token={token}",
+        config.dashboard.public_url.trim_end_matches('/')
+    )
+}
+
+/// The secret-store entry holding the key that signs the channels' decision
+/// links (webhooks sign theirs with their own HMAC secret). Deleting it
+/// invalidates every link already sent. The dot keeps it out of reach of
+/// the dashboard, which only stores names of letters, digits, `-` and `_`:
+/// whoever chose this key could sign links of their own.
+const LINK_KEY: &str = "ariodb.approval-link-key";
+static LINK_KEY_LOCK: Mutex<()> = Mutex::new(());
+
+/// The link-signing key, made on first use.
+fn link_key(config: &crate::config::Config) -> Result<String, String> {
+    let _held = LINK_KEY_LOCK.lock().expect("link key lock");
+    let store = crate::secrets::Store::open(std::path::Path::new(&config.journal.dir))?;
+    if let Some(key) = store.get(LINK_KEY)? {
+        return Ok(key);
+    }
+    let key = hex::encode(rand::random::<[u8; 32]>());
+    store.set(LINK_KEY, &key)?;
+    Ok(key)
+}
+
 /// HMAC-SHA256 as hex.
 pub fn sign(key: &str, message: &str) -> String {
     let mut mac =
@@ -422,7 +560,15 @@ pub fn verify_link(config: &crate::config::Config, id: &str, verdict: &str, toke
     let Some(a) = config_approver_for(config, id) else {
         return false;
     };
-    let Ok(key) = secret_value(config, &a.hmac_secret_secret, &a.hmac_secret_env) else {
+    let key = if a.kind == ApproverKind::Webhook {
+        secret_value(config, &a.hmac_secret_secret, &a.hmac_secret_env)
+    } else {
+        // Never made here: a missing key means no link was ever sent.
+        config
+            .secret(LINK_KEY)
+            .and_then(|k| k.ok_or_else(|| "no link key".to_string()))
+    };
+    let Ok(key) = key else {
         return false;
     };
     let expected = sign(&key, &format!("{id}:{verdict}"));
@@ -438,13 +584,14 @@ fn config_approver_for<'a>(
     config: &'a crate::config::Config,
     id: &str,
 ) -> Option<&'a ApproverConfig> {
-    // The approval row names its approver; links are only valid for webhooks.
+    // The approval row names its approver; links are only valid for the
+    // approvers that send them.
     let db = crate::store::Db::open(std::path::Path::new(&config.journal.dir)).ok()?;
     let row = db.approval(id).ok()??;
     config
         .approvers
         .iter()
-        .find(|a| a.name == row.approver && a.kind == ApproverKind::Webhook)
+        .find(|a| a.name == row.approver && a.kind.uses_links())
 }
 
 /// Check a Slack interactivity request: `v0=` HMAC of `v0:{timestamp}:{body}`,
@@ -669,28 +816,11 @@ mod tests {
 
     #[test]
     fn model_cache_keys_cover_the_whole_question() {
-        let approver = |policy: &str| ApproverConfig {
-            name: "judge".into(),
-            kind: ApproverKind::Llm,
-            timeout_seconds: None,
-            channel: None,
-            bot_token_secret: None,
-            bot_token_env: None,
-            signing_secret_secret: None,
-            signing_secret_env: None,
-            interactive: false,
-            url: None,
-            hmac_secret_secret: None,
-            hmac_secret_env: None,
-            model: None,
-            policy: Some(policy.into()),
-            api_key_secret: None,
-            api_key_env: None,
-            effort: None,
-            provider: None,
-            base_url: None,
-            api_version: None,
-            plugin: None,
+        let approver = |policy: &str| {
+            let mut a: ApproverConfig =
+                toml::from_str("name = \"judge\"\ntype = \"llm\"").expect("approver");
+            a.policy = Some(policy.into());
+            a
         };
         let lenient = approver("Allow anything.");
         let strict = approver("Deny writes.");
