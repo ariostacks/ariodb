@@ -250,6 +250,9 @@ expect "other tables refused"           "may not use table"      "$(agent coding
 expect "bulk write rolled back"         "the limit is 500"       "$(agent coding-agent $T "UPDATE orders SET status='void' WHERE id <= 800")"
 expect "trigger side effect rolled back" "order_log"             "$(agent coding-agent $T "UPDATE orders SET status='audited' WHERE id = 5")"
 expect "BEGIN refused"                  "own transaction"        "$(agent coding-agent $T "BEGIN")"
+expect "SQL run by query_to_xml refused" "never allowed"         "$(agent coding-agent $T "SELECT query_to_xml('SELECT * FROM secrets', true, false, '')")"
+expect "set_config refused"             "never allowed"          "$(agent coding-agent $T "SELECT set_config('search_path', 'pg_temp', false)")"
+expect "tables inside DECLARE checked"  "may not use table"      "$(agent coding-agent $T "DECLARE c CURSOR WITH HOLD FOR SELECT * FROM secrets")"
 [ "$(fingerprint)" = "$BEFORE" ] && pass "refused statements changed nothing" || fail "data changed"
 
 echo "rules"
@@ -320,6 +323,8 @@ expect "first dashboard password set from this machine" '"user":"root"' "$(cat "
 CSRF=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['csrf'])" "$WORK/setup.json")
 expect "a second first-run setup is refused" "already set" "$(curl -s -X POST -H "$JSONH" -d '{"password":"another-password-x"}' $D/api/setup)"
 expect "wrong password refused" "wrong user name or password" "$(curl -s -X POST -H "$JSONH" -d '{"password":"nope-nope-nope"}' $D/api/login)"
+for _ in 1 2 3 4; do curl -s -o /dev/null -X POST -H "$JSONH" -d '{"password":"nope-nope-nope"}' $D/api/login; done
+expect "repeated wrong passwords lock the address out" "too many failed logins" "$(curl -s -X POST -H "$JSONH" -d '{"password":"dashboard-test-only-pw"}' $D/api/login)"
 (agent coding-agent $T "SELECT /*ask-dashboard*/ count(*) + 2 FROM orders" > "$OUT") & BG=$!
 ID=$(wait_for_pending)
 expect "dashboard lists the pending request" "$ID" "$(curl -s -b "$WORK/cj" $D/api/approvals)"
@@ -333,6 +338,15 @@ expect "webhook approver: approve link followed" "(1 row)" "$(agent coding-agent
 expect "webhook approver: deny link followed" "denied by webhook" "$(agent coding-agent $T "SELECT /*ask-hook*/ 'deny-me' FROM orders")"
 expect "webhook payload is signed" '"signature": "sha256=' "$(grep '"webhook"' "$WORK/mock.log" | head -1)"
 expect "a forged webhook link is rejected" "not valid" "$(curl -s "$D/hooks/approvals/$ID?verdict=allow&token=forged")"
+(agent coding-agent $T "SELECT /*ask-hook*/ count(*), 'no-answer' FROM orders" > "$OUT") & BG=$!
+ID=$(wait_for_pending)
+for _ in $(seq 1 50); do grep -q no-answer "$WORK/mock.log" && break; sleep 0.2; done
+LINK=$(grep no-answer "$WORK/mock.log" | tail -1 | python3 -c "import json,sys;print(json.loads(sys.stdin.read())['body']['approve_url'])")
+expect "opening a webhook link only asks for confirmation" "Approve this request" "$(curl -s "$LINK")"
+expect "and decides nothing" "pending" "$($BIN "${CFG[@]}" approvals | grep "$ID")"
+expect "the confirmation button records the decision" "Recorded: approved" "$(curl -s -X POST "$LINK")"
+wait $BG
+expect "webhook-confirmed statement runs" "(1 row)" "$(cat "$OUT")"
 
 (agent coding-agent $T "SELECT /*ask-slack*/ count(*) + 4 FROM orders" > "$OUT") & BG=$!
 ID=$(wait_for_pending)
@@ -359,6 +373,10 @@ expect "Slack callback with a bad signature is rejected" "401" "$(slack_post "$I
 expect "Slack button approves" "Approved by pat" "$(slack_post "$ID" approve "$E2E_SLACK_SIGNING")"
 wait $BG
 expect "Slack-approved statement runs" "(1 row)" "$(cat "$OUT")"
+(agent coding-agent $T "SELECT /*ask-dashboard*/ count(*) + 5 FROM orders" > "$OUT") & BG=$!
+ID=$(wait_for_pending)
+expect "a Slack signature cannot decide a dashboard request" "not waiting on a Slack approver" "$(slack_post "$ID" approve "$E2E_SLACK_SIGNING")"
+$BIN "${CFG[@]}" deny "$ID" >/dev/null; wait $BG
 
 expect "model approver allows" "(1 row)" "$(agent coding-agent $T "SELECT /*ask-model*/ count(*) FROM orders")"
 expect "model approver denies with its reason" "mock judge said deny" "$(agent coding-agent $T "SELECT /*ask-model*/ 'deny-me' FROM orders")"
@@ -434,6 +452,16 @@ for mode in extended prepared; do
         -U coding-agent -n -M $mode -c 4 -t 50 -f /w/bench.sql app 2>&1 || true)
   expect "pgbench $mode: 200 transactions" "processed: 200/200" "$OUT"
 done
+
+echo "protocol tricks"
+raw() { python3 -I scripts/pg_raw.py $PROXY "$@" 2>&1 || true; }
+expect "agents cannot close ariodb's own statements" "reserved for ariodb" "$(raw coding-agent $T 'C:S:__ariodb_rollback' S)"
+expect "nor reuse their names" "reserved for ariodb" "$(raw coding-agent $T 'P:__ariodb_mine:SELECT 1' 'B::__ariodb_mine' 'E:' S)"
+OUT=$(raw coding-agent $T 'P::SELECT 1' 'B::' 'E:' S \
+  "P::UPDATE orders SET status = 'desync' WHERE id = 20" 'P:bad:SELECT no_such_column FROM orders' S \
+  "P:w:UPDATE orders SET status = 'w' WHERE id = 21" 'B:pw:w' 'E:pw' 'B::' 'E:' S)
+expect "statements from a failed batch are forgotten" "no record of portal" "$OUT"
+expect "so nothing ran under an old name" "0" "$(admin -tAc "SELECT count(*) FROM orders WHERE status = 'desync'")"
 
 echo "audit"
 expect "audit chain intact" "decisions log intact" "$($BIN "${CFG[@]}" audit)"

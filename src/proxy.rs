@@ -273,6 +273,30 @@ async fn prepare_internal(session: &mut Session) -> Result<(), String> {
     }
 }
 
+/// Statement and portal names starting with this belong to ariodb. If an
+/// agent could close `__ariodb_rollback` and parse something else under its
+/// name, ariodb's own transaction control would stop doing what it says, so
+/// any message naming one is refused.
+const RESERVED_PREFIX: &str = "__ariodb";
+
+/// The first reserved statement or portal name a message uses, if any.
+fn reserved_name(f: &Frame) -> Result<Option<String>, WireError> {
+    let names = match f.tag {
+        b'P' => vec![wire::parse_parse(&f.body)?.0],
+        b'B' => {
+            let (portal, statement) = wire::parse_bind(&f.body)?;
+            vec![portal, statement]
+        }
+        b'E' => vec![wire::parse_execute(&f.body)?],
+        // Close and Describe share a layout: a kind byte, then the name.
+        b'C' | b'D' => vec![wire::parse_close(&f.body)?.1],
+        _ => Vec::new(),
+    };
+    Ok(names
+        .into_iter()
+        .find(|n| n.to_ascii_lowercase().starts_with(RESERVED_PREFIX)))
+}
+
 /// An internal operation: Bind and Execute one hidden statement.
 fn internal_op(statement: &str, params: &[&str]) -> Vec<Out> {
     let portal = format!("{statement}_p");
@@ -511,6 +535,16 @@ impl Connection {
         let started = Instant::now();
         let batch = std::mem::take(&mut self.batch);
 
+        // 0. ariodb's own statements and portals are off limits.
+        for f in &batch {
+            if let Some(name) = reserved_name(f)? {
+                let r = Refusal::new(format!(
+                    "the name '{name}' is reserved for ariodb's own statements"
+                ));
+                return self.refuse(&r, "", &[], final_sync).await;
+            }
+        }
+
         // 1. Understand every statement the batch prepares or runs.
         let mut parsed_here: HashMap<String, Vec<Statement>> = HashMap::new();
         let mut portals = self.portals.clone();
@@ -711,6 +745,15 @@ impl Connection {
             } else {
                 portals
             };
+        } else {
+            // The database may have kept some of this batch's statements and
+            // not others, so ariodb no longer knows what these names hold.
+            // Forgetting them means a later Bind to one is refused, rather
+            // than judged as whatever the name used to mean.
+            for name in parsed_here.keys().chain(closed.iter()) {
+                self.prepared.remove(name);
+            }
+            self.portals = HashMap::new();
         }
         Ok(())
     }
@@ -824,4 +867,37 @@ struct Exchange {
     /// Held responses from before the first Execute (ParseComplete and so on).
     before_execute: Vec<Bytes>,
     internal_rows: Vec<Vec<Option<String>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame_of(raw: Bytes) -> Frame {
+        Frame {
+            tag: raw[0],
+            body: raw.slice(5..),
+            raw,
+        }
+    }
+
+    #[test]
+    fn internal_names_are_reserved() {
+        let reserved = |raw: Bytes| reserved_name(&frame_of(raw)).unwrap();
+        // Closing or describing ariodb's own statements is refused.
+        assert_eq!(
+            reserved(wire::frame(b'C', b"S__ariodb_rollback\0")).as_deref(),
+            Some("__ariodb_rollback")
+        );
+        assert!(reserved(wire::frame(b'D', b"P__ariodb_commit_p\0")).is_some());
+        // So is reusing their names, in any case.
+        assert!(reserved(wire::parse_message("__ARIODB_effects", "SELECT 1")).is_some());
+        assert!(reserved(wire::bind_with_params("", "__ariodb_begin_ro", &[])).is_some());
+        assert!(reserved(wire::bind_with_params("__ariodb_tag_p", "s1", &[])).is_some());
+        assert!(reserved(wire::execute_message("__ariodb_begin_rw_p")).is_some());
+        // The agent's own names are fine.
+        assert_eq!(reserved(wire::parse_message("s1", "SELECT 1")), None);
+        assert_eq!(reserved(wire::bind_with_params("", "", &[])), None);
+        assert_eq!(reserved(wire::frame(b'C', b"Ss1\0")), None);
+    }
 }

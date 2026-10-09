@@ -58,9 +58,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/hook":
             payload = json.loads(body)
             log({"service": "webhook", "signature": self.headers.get("x-ariodb-signature"), "body": payload})
-            # Answer like a person would: follow the approve link, shortly after.
+            # Answer like a person would: press the approve button (a POST to
+            # the link), shortly after. "no-answer" leaves it to the test.
+            if "no-answer" in payload["sql"]:
+                return self.reply(200, {"ok": True})
             url = payload["deny_url"] if "deny-me" in payload["sql"] else payload["approve_url"]
-            threading.Timer(0.5, lambda: urllib.request.urlopen(url).read()).start()
+            threading.Timer(0.5, lambda: urllib.request.urlopen(url, data=b"").read()).start()
             return self.reply(200, {"ok": True})
         self.reply(404, {"error": "unknown path"})
 

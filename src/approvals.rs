@@ -277,10 +277,10 @@ async fn notify_slack(
     let token = secret_value(config, &approver.bot_token_secret, &approver.bot_token_env)?;
     let text = format!(
         "*ariodb approval needed* ({})\nAgent `{}` wants to run:\n```{}```\nRule: {}\n<{}|Open in the dashboard>",
-        a.reason,
-        a.agent,
-        truncate(&a.sql, 2500),
-        a.rule,
+        slack_escape(&a.reason),
+        slack_escape(&a.agent),
+        slack_escape(&truncate(&a.sql, 2500)),
+        slack_escape(&a.rule),
         dashboard_link(config, &a.id)
     );
     let mut blocks = vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })];
@@ -399,33 +399,49 @@ fn config_approver_for<'a>(
 }
 
 /// Check a Slack interactivity request: `v0=` HMAC of `v0:{timestamp}:{body}`,
-/// with the timestamp within five minutes.
+/// with the timestamp within five minutes. Returns the Slack approvers whose
+/// signing secret signed it (none means the request is not genuine).
 pub fn verify_slack(
     config: &crate::config::Config,
     timestamp: &str,
     body: &str,
     signature: &str,
-) -> bool {
+) -> Vec<String> {
     let Ok(ts) = timestamp.parse::<i64>() else {
-        return false;
+        return Vec::new();
     };
     if (store::now_ms() / 1000 - ts).abs() > 300 {
-        return false;
+        return Vec::new();
     }
     config
         .approvers
         .iter()
         .filter(|a| a.kind == ApproverKind::Slack && a.interactive)
-        .filter_map(|a| secret_value(config, &a.signing_secret_secret, &a.signing_secret_env).ok())
-        .any(|key| {
-            let expected = format!("v0={}", sign(&key, &format!("v0:{timestamp}:{body}")));
-            expected.len() == signature.len()
-                && expected
-                    .bytes()
-                    .zip(signature.bytes())
-                    .fold(0, |acc, (x, y)| acc | (x ^ y))
-                    == 0
+        .filter(|a| {
+            secret_value(config, &a.signing_secret_secret, &a.signing_secret_env).is_ok_and(|key| {
+                let expected = format!("v0={}", sign(&key, &format!("v0:{timestamp}:{body}")));
+                expected.len() == signature.len()
+                    && expected
+                        .bytes()
+                        .zip(signature.bytes())
+                        .fold(0, |acc, (x, y)| acc | (x ^ y))
+                        == 0
+            })
         })
+        .map(|a| a.name.clone())
+        .collect()
+}
+
+/// Make agent-written text safe inside a Slack message. `&`, `<` and `>`
+/// are escaped as Slack asks, so the SQL cannot make links or mentions, and
+/// runs of backticks are broken up with zero-width spaces, so the SQL cannot
+/// close its code block and write the rest of the message (a fake "approve
+/// here" link, say) in Slack formatting.
+fn slack_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('`', "`\u{200b}")
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -447,9 +463,36 @@ fn http() -> reqwest::Client {
 // ---------------------------------------------------------------------------
 // Models: a Claude model judges the statement against a policy.
 
-type CacheKey = (String, String, String);
-static LLM_CACHE: Mutex<Option<HashMap<CacheKey, (Instant, Result<(), String>)>>> =
-    Mutex::new(None);
+/// A cached model decision and when it was made.
+type Cached = (Instant, Result<(), String>);
+static LLM_CACHE: Mutex<Option<HashMap<String, Cached>>> = Mutex::new(None);
+/// Past this many cached decisions, expired ones are swept out.
+const LLM_CACHE_SWEEP: usize = 1_000;
+
+/// What a cached decision may be reused for: the same question, put to the
+/// same model under the same policy. A changed policy, rule or database
+/// asks the model again rather than reusing an answer to a different
+/// question.
+fn cache_key(
+    approver: &ApproverConfig,
+    agent: &str,
+    database: &str,
+    rule: &str,
+    sql: &str,
+) -> String {
+    let parts = json!([
+        approver.name,
+        approver.model.as_deref().unwrap_or(DEFAULT_MODEL),
+        approver.policy,
+        agent,
+        database,
+        rule,
+        sql
+    ]);
+    hex::encode(<Sha256 as sha2::Digest>::digest(
+        parts.to_string().as_bytes(),
+    ))
+}
 
 async fn ask_model(
     state: &State,
@@ -464,7 +507,7 @@ async fn ask_model(
         .map(|s| s.sql.as_str())
         .collect::<Vec<_>>()
         .join("; ");
-    let key = (approver.name.clone(), ctx.agent.name.clone(), sql.clone());
+    let key = cache_key(approver, &ctx.agent.name, ctx.database, &need.rule, &sql);
     let ttl = Duration::from_secs(config.approvals.llm_cache_seconds);
     if let Some((at, verdict)) = LLM_CACHE
         .lock()
@@ -477,7 +520,11 @@ async fn ask_model(
         return verdict;
     }
 
-    let verdict = match judge(&config, approver, ctx, statements, need).await {
+    let judged = judge(&config, approver, ctx, statements, need).await;
+    // Only the model's own answers are reused. An outage (allowed under
+    // fail-open) or a setup error must not stand in for a decision.
+    let cacheable = matches!(judged, Judged::Allow | Judged::Deny(_));
+    let verdict = match judged {
         Judged::Allow => Ok(()),
         Judged::Deny(reason) => Err(format!(
             "denied by model approver '{}': {reason}",
@@ -527,11 +574,14 @@ async fn ask_model(
         decided_ms: Some(now),
     });
 
-    LLM_CACHE
-        .lock()
-        .expect("cache")
-        .get_or_insert_with(HashMap::new)
-        .insert(key, (Instant::now(), verdict.clone()));
+    if cacheable {
+        let mut cache = LLM_CACHE.lock().expect("cache");
+        let cache = cache.get_or_insert_with(HashMap::new);
+        if cache.len() >= LLM_CACHE_SWEEP {
+            cache.retain(|_, (at, _)| at.elapsed() < ttl);
+        }
+        cache.insert(key, (Instant::now(), verdict.clone()));
+    }
     verdict
 }
 
@@ -699,6 +749,45 @@ mod tests {
             parse_judgement("not json"),
             Judged::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn slack_messages_cannot_be_rewritten_by_the_sql() {
+        let sql = "SELECT 1 ``` <https://evil.example|Approve here> & <!channel>";
+        let safe = slack_escape(sql);
+        assert!(!safe.contains("```"));
+        assert!(!safe.contains('<') && !safe.contains('>'));
+        assert!(safe.contains("&lt;https://evil.example|Approve here&gt; &amp; &lt;!channel&gt;"));
+    }
+
+    #[test]
+    fn model_cache_keys_cover_the_whole_question() {
+        let approver = |policy: &str| ApproverConfig {
+            name: "judge".into(),
+            kind: ApproverKind::Llm,
+            timeout_seconds: None,
+            channel: None,
+            bot_token_secret: None,
+            bot_token_env: None,
+            signing_secret_secret: None,
+            signing_secret_env: None,
+            interactive: false,
+            url: None,
+            hmac_secret_secret: None,
+            hmac_secret_env: None,
+            model: None,
+            policy: Some(policy.into()),
+            api_key_secret: None,
+            api_key_env: None,
+            effort: None,
+        };
+        let lenient = approver("Allow anything.");
+        let strict = approver("Deny writes.");
+        let key = |a, db, rule| cache_key(a, "bot", db, rule, "UPDATE t SET a = 1 WHERE id = 1");
+        assert_eq!(key(&lenient, "app", "r1"), key(&lenient, "app", "r1"));
+        assert_ne!(key(&lenient, "app", "r1"), key(&strict, "app", "r1"));
+        assert_ne!(key(&lenient, "app", "r1"), key(&lenient, "other", "r1"));
+        assert_ne!(key(&lenient, "app", "r1"), key(&lenient, "app", "r2"));
     }
 
     #[test]

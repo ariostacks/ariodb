@@ -67,6 +67,12 @@ pub fn decide(agent: &Agent, stmt: &Statement) -> Decision {
         }
     };
 
+    if let Some(f) = blocked_function(stmt) {
+        return Decision::Deny(format!(
+            "the function '{f}' is never allowed for agents: it would get round ariodb's checks"
+        ));
+    }
+
     if stmt.copy_in {
         return Decision::Deny(
             "COPY ... FROM STDIN is not supported through ariodb; use INSERT".to_string(),
@@ -84,6 +90,55 @@ pub fn decide(agent: &Agent, stmt: &Statement) -> Decision {
     }
 
     Decision::Allow(mode)
+}
+
+/// Postgres functions refused for every agent, whatever the rules say,
+/// because they defeat ariodb's own checks rather than merely reach data:
+/// they run SQL ariodb never sees (dblink, the `*_to_xml` family, `ts_stat`),
+/// change session state that outlives the statement (`set_config`, which
+/// would undo the refusal of `SET search_path`), write where the effect
+/// check cannot measure (large objects), forge entries in the change journal
+/// (`pg_logical_emit_message`), or reach other sessions on the shared gateway
+/// login. Server file access (`pg_read_file` and so on) is a privilege
+/// question: refuse it with database grants and, if wanted, a rule.
+const BLOCKED_FUNCTIONS: &[&str] = &[
+    "set_config",
+    "ts_stat",
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "schema_to_xml",
+    "schema_to_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml",
+    "database_to_xmlschema",
+    "database_to_xml_and_xmlschema",
+    "pg_logical_emit_message",
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "loread",
+    "lowrite",
+];
+
+/// Whole families, by name prefix.
+const BLOCKED_PREFIXES: &[&str] = &["dblink", "lo_", "pg_logical_slot_", "pg_replication_"];
+
+fn blocked_function(stmt: &Statement) -> Option<&str> {
+    if stmt.engine != "postgres" {
+        return None;
+    }
+    stmt.functions.iter().map(String::as_str).find(|f| {
+        // `pg_catalog.set_config` is the same function.
+        let name = f.rsplit('.').next().unwrap_or(f);
+        BLOCKED_FUNCTIONS.contains(&name)
+            || BLOCKED_PREFIXES.iter().any(|p| name.starts_with(p))
+            || name.contains("replication_slot")
+    })
 }
 
 /// Settings that only change how results are formatted or reported.
@@ -194,6 +249,33 @@ mod tests {
             ),
             Decision::Deny(_)
         ));
+    }
+
+    #[test]
+    fn functions_that_get_round_the_checks_are_refused() {
+        for sql in [
+            "SELECT dblink_exec('dbname=app', 'DELETE FROM secrets')",
+            "SELECT * FROM public.dblink('dbname=app', 'SELECT 1') AS t(x int)",
+            "SELECT query_to_xml('SELECT * FROM secrets', true, false, '')",
+            "SELECT table_to_xml('secrets', true, false, '')",
+            "SELECT pg_catalog.set_config('search_path', 'private', false)",
+            "SELECT pg_logical_emit_message(true, 'ariodb', '{}')",
+            "SELECT lo_import('/etc/hosts')",
+            "SELECT pg_drop_replication_slot('ariodb')",
+            "SELECT * FROM orders WHERE id IN (SELECT pg_terminate_backend(1))",
+            "UPDATE orders SET status = set_config('role', 'x', false) WHERE id = 1",
+            "DECLARE c CURSOR WITH HOLD FOR SELECT dblink('a', 'b')",
+        ] {
+            assert!(
+                matches!(decide_sql(Access::ReadWrite, sql), Decision::Deny(r) if r.contains("never allowed")),
+                "{sql}"
+            );
+        }
+        // Ordinary functions are fine.
+        assert_eq!(
+            decide_sql(Access::ReadOnly, "SELECT lower(status), now() FROM orders"),
+            Decision::Allow(Mode::ReadOnly)
+        );
     }
 
     #[test]

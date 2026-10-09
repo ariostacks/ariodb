@@ -111,6 +111,14 @@ impl<R: tokio::io::AsyncRead + Unpin> Rd<R> {
         let n = self.varint().await? as usize;
         Ok(String::from_utf8_lossy(&self.bytes(n).await?).into_owned())
     }
+    /// A string from before the client has logged in: at most 64 KiB.
+    async fn short_string(&mut self) -> Result<String, String> {
+        let n = self.varint().await? as usize;
+        if n > 64 << 10 {
+            return Err("login field too large".into());
+        }
+        Ok(String::from_utf8_lossy(&self.bytes(n).await?).into_owned())
+    }
     fn mark(&mut self) -> usize {
         self.taken.len()
     }
@@ -175,15 +183,22 @@ async fn handle(socket: TcpStream, state: Arc<State>) -> Result<(), String> {
     if c.varint().await? != 0 {
         return Err("expected Hello".into());
     }
-    let hello = Hello {
-        client_name: c.string().await?,
+    // Nothing is known about the client yet, so its Hello may not make
+    // ariodb allocate much.
+    let mut hello = Hello {
+        client_name: c.short_string().await?,
         major: c.varint().await?,
         minor: c.varint().await?,
         revision: c.varint().await?,
-        database: c.string().await?,
-        user: c.string().await?,
-        password: c.string().await?,
+        database: c.short_string().await?,
+        user: c.short_string().await?,
+        password: c.short_string().await?,
     };
+    // Name the database even when the client does not, so ClickHouse
+    // resolves table names in the database ariodb judges them in.
+    if hello.database.is_empty() {
+        hello.database = "default".to_string();
+    }
     c.take();
     let send = |bytes: Vec<u8>| {
         let w = client_write.clone();
@@ -398,7 +413,10 @@ where
                 let q = read_query(c, rev).await?;
                 // The external-tables terminator always follows a Query.
                 let data = read_empty_data(c, q.compression).await;
-                let stmt = chsql::classify(&q.sql);
+                let stmt = chsql::classify(&q.sql).map(|mut s| {
+                    chsql::scope_to_database(&mut s, database);
+                    s
+                });
                 let decision = match (&stmt, &data) {
                     (_, Err(e)) => Err((None, e.clone())),
                     (Err(e), _) => Err((None, e.clone())),
@@ -657,4 +675,28 @@ async fn read_empty_data<R: tokio::io::AsyncRead + Unpin>(
     }
     let raw = c.taken[start..].to_vec();
     Ok(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn login_fields_are_capped_before_authentication() {
+        let mut huge = Vec::new();
+        put_varint(&mut huge, 50 << 20); // claims a 50 MiB client name
+        let mut c = Rd {
+            inner: &huge[..],
+            taken: Vec::new(),
+        };
+        assert_eq!(c.short_string().await.unwrap_err(), "login field too large");
+
+        let mut ok = Vec::new();
+        put_string(&mut ok, "clickhouse-client");
+        let mut c = Rd {
+            inner: &ok[..],
+            taken: Vec::new(),
+        };
+        assert_eq!(c.short_string().await.unwrap(), "clickhouse-client");
+    }
 }

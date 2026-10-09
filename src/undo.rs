@@ -357,9 +357,18 @@ fn show_key(key: &[Option<String>]) -> String {
     format!("({})", parts.join(", "))
 }
 
+/// A recorded value as SQL. The values are whatever the agent wrote, and
+/// undo runs them with the admin login, so the quoting must hold whatever
+/// the server's `standard_conforming_strings` is: a value with a backslash
+/// is written as an `E'...'` string, where backslashes mean the same either
+/// way.
 fn literal(cell: &Option<Cell>, sql_type: &str) -> Result<String, String> {
     match cell {
         None => Ok("NULL".to_string()),
+        Some(Cell::Text(t)) if t.contains('\\') => Ok(format!(
+            "E'{}'::{sql_type}",
+            t.replace('\\', "\\\\").replace('\'', "''")
+        )),
         Some(Cell::Text(t)) => Ok(format!("'{}'::{sql_type}", t.replace('\'', "''"))),
         Some(Cell::Unchanged { .. }) => Err("a large value was not recorded".to_string()),
     }
@@ -510,6 +519,20 @@ mod tests {
         assert_eq!(
             d.sql,
             r#"INSERT INTO "public"."orders" ("id", "status") OVERRIDING SYSTEM VALUE VALUES ('7'::integer, 'paid'::text)"#
+        );
+    }
+
+    #[test]
+    fn backslashes_are_quoted_for_either_string_setting() {
+        // With standard_conforming_strings off, '\' would end a plain
+        // string early and the rest of the value would run as SQL.
+        let value = r"x\'; DROP TABLE orders; --";
+        let d = inverse(&change(Op::Delete, Some(("7", value)), None), &info()).unwrap();
+        assert!(
+            d.sql
+                .ends_with(r"VALUES ('7'::integer, E'x\\''; DROP TABLE orders; --'::text)"),
+            "{}",
+            d.sql
         );
     }
 

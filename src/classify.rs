@@ -107,13 +107,25 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
         _ => (None, false),
     };
     let mut tables: Vec<String> = parsed.tables().iter().map(|t| normalise_table(t)).collect();
-    tables.sort();
-    tables.dedup();
     let mut functions: Vec<String> = parsed
         .functions()
         .iter()
         .map(|f| f.to_lowercase())
         .collect();
+    // The parser's table and function lists stop at PREPARE and DECLARE
+    // CURSOR, so a table or function named only in there would pass the
+    // allow-list and the rules unseen. Print the wrapped query back to SQL
+    // and read it on its own; if that fails, refuse.
+    if let Some(inner) = top.and_then(wrapped_query) {
+        let text = inner
+            .deparse()
+            .map_err(|e| ParseError(format!("cannot read the wrapped query: {e}")))?;
+        let inner = pg_query::parse(&text).map_err(|e| ParseError(e.to_string()))?;
+        tables.extend(inner.tables().iter().map(|t| normalise_table(t)));
+        functions.extend(inner.functions().iter().map(|f| f.to_lowercase()));
+    }
+    tables.sort();
+    tables.dedup();
     functions.sort();
     functions.dedup();
     Ok(Statement {
@@ -127,6 +139,17 @@ fn classify_one(sql: &str) -> Result<Statement, ParseError> {
         functions,
         engine: "postgres",
     })
+}
+
+/// The query inside a PREPARE or DECLARE CURSOR, which the parser's own
+/// table and function lists do not look into.
+fn wrapped_query(node: &Node) -> Option<&NodeEnum> {
+    let inner = match node.node.as_ref()? {
+        NodeEnum::PrepareStmt(s) => s.query.as_deref()?,
+        NodeEnum::DeclareCursorStmt(s) => s.query.as_deref()?,
+        _ => return None,
+    };
+    inner.node.as_ref()
 }
 
 fn command_of(node: &Node) -> &'static str {
@@ -446,6 +469,15 @@ mod tests {
     fn finds_functions() {
         let stmts = classify("SELECT pg_read_file('/etc/x'), lower(name) FROM t").unwrap();
         assert_eq!(stmts[0].functions, vec!["lower", "pg_read_file"]);
+    }
+
+    #[test]
+    fn sees_tables_and_functions_inside_prepare_and_cursors() {
+        let s = &classify("DECLARE c CURSOR WITH HOLD FOR SELECT * FROM secrets").unwrap()[0];
+        assert_eq!(s.tables, vec!["secrets"]);
+        let s = &classify("PREPARE p AS SELECT note, lower(note) FROM private.notes").unwrap()[0];
+        assert_eq!(s.tables, vec!["private.notes"]);
+        assert_eq!(s.functions, vec!["lower"]);
     }
 
     #[test]

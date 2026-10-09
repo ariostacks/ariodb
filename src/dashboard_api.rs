@@ -383,31 +383,7 @@ async fn block_like(
         })
         .ok_or_else(|| bad("the decision's statement cannot be parsed"))?;
     let verb = crate::rules::verb(&stmt);
-    let mut parts = vec![
-        format!("agent.name == '{}'", d.agent.replace('\'', "\\'")),
-        format!("sql.verb == '{verb}'"),
-    ];
-    if !stmt.tables.is_empty() {
-        let list = stmt
-            .tables
-            .iter()
-            .map(|t| format!("'{}'", t.replace('\'', "\\'")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("intersects(sql.tables, [{list}])"));
-    }
-    let tables_slug = stmt
-        .tables
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "any".into())
-        .replace(['.', ' '], "-");
-    let name = format!("block-{}-{verb}-{tables_slug}-{}", d.agent, d.id);
-    let snippet = format!(
-        "\n[[rules]]\nname = \"{name}\"\ncondition = \"{}\"\nverdict = \"deny\"\nreason = \"blocked from the dashboard after decision {}\"\n",
-        parts.join(" && ").replace('"', "\\\""),
-        d.id
-    );
+    let (name, snippet) = deny_rule_snippet(&d.agent, &verb, &stmt.tables, d.id);
     let current = std::fs::read_to_string(&state.config_path).map_err(|e| e.to_string())?;
     let candidate = format!(
         "{}{snippet}",
@@ -423,6 +399,79 @@ async fn block_like(
     Ok(Json(
         json!({ "rule": name, "snippet": snippet, "applied": body.apply }),
     ))
+}
+
+/// The deny rule "block requests like this" writes. Table names come from
+/// the agent's own SQL, and a quoted Postgres identifier may hold quotes,
+/// backslashes or new lines, so every value is escaped for CEL and then the
+/// whole condition for TOML. Otherwise an agent could name a table so that
+/// the rule an operator saves also adds config of the agent's choosing.
+fn deny_rule_snippet(
+    agent: &str,
+    verb: &str,
+    tables: &[String],
+    decision: i64,
+) -> (String, String) {
+    let mut parts = vec![
+        format!("agent.name == {}", cel_string(agent)),
+        format!("sql.verb == {}", cel_string(verb)),
+    ];
+    if !tables.is_empty() {
+        let list = tables
+            .iter()
+            .map(|t| cel_string(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("intersects(sql.tables, [{list}])"));
+    }
+    let slug = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    let first_table = tables.first().map(String::as_str).unwrap_or("any");
+    let name = format!(
+        "block-{}-{}-{}-{decision}",
+        slug(agent),
+        slug(verb),
+        slug(first_table)
+    );
+    let snippet = format!(
+        "\n[[rules]]\nname = {}\ncondition = {}\nverdict = \"deny\"\nreason = \"blocked from the dashboard after decision {decision}\"\n",
+        toml_string(&name),
+        toml_string(&parts.join(" && ")),
+    );
+    (name, snippet)
+}
+
+/// A CEL string literal: single quotes, with backslashes, single quotes and
+/// control characters escaped. (Double quotes need no escape here, and
+/// TOML's escaping covers them in the config file.)
+fn cel_string(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// A TOML basic string, escaped by the TOML library itself.
+fn toml_string(s: &str) -> String {
+    toml::Value::String(s.to_string()).to_string()
 }
 
 async fn list_secrets(
@@ -520,6 +569,49 @@ async fn verify_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_like_this_escapes_what_the_agent_named() {
+        use crate::rules::{Facts, Outcome, RuleSet};
+        let base = r#"
+[database]
+url = "postgres://localhost:5432/app"
+
+[[agents]]
+name = "coding-agent"
+access = "read_write"
+tables = ["orders"]
+token_env = "ARIODB_TOKEN_TEST"
+"#;
+        // A quoted identifier can hold quotes, backslashes and new lines.
+        let table = "a'b\\c\"d\n[[agents]]\nname = 'planted'\naccess = \"read_write\"";
+        let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+        let stmt = crate::classify::classify(&sql).unwrap().remove(0);
+        assert_eq!(stmt.tables, vec![table.to_string()]);
+
+        let (name, snippet) =
+            deny_rule_snippet("coding-agent", &crate::rules::verb(&stmt), &stmt.tables, 7);
+        assert!(name.starts_with("block-coding-agent-select-a-b-c-d-"));
+        let config = Config::from_toml(&format!("{base}{snippet}")).expect("still valid TOML");
+        assert_eq!(config.agents.len(), 1, "no agent was planted");
+        assert_eq!(config.rules.len(), 1);
+
+        // And the rule blocks exactly that table.
+        let rules = RuleSet::compile(&config.rules).expect("the rule compiles");
+        let facts = |s| Facts {
+            agent: &config.agents[0],
+            statement: s,
+            database: "app",
+        };
+        assert!(matches!(
+            rules.evaluate(&facts(&stmt)),
+            Outcome::Deny { .. }
+        ));
+        let other = crate::classify::classify("SELECT * FROM orders")
+            .unwrap()
+            .remove(0);
+        assert_eq!(rules.evaluate(&facts(&other)), Outcome::NoMatch);
+    }
 
     #[test]
     fn masks_and_restores_url_passwords() {

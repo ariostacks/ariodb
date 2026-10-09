@@ -177,7 +177,10 @@ async fn query(
     };
 
     let stmt = match chsql::classify(&sql) {
-        Ok(s) => s,
+        Ok(mut s) => {
+            chsql::scope_to_database(&mut s, &database);
+            s
+        }
         Err(e) => {
             audit("refused", None, Some(&e), None, None);
             return ch_error(StatusCode::FORBIDDEN, 497, &e);
@@ -211,9 +214,15 @@ async fn query(
     };
     {
         let mut q = url.query_pairs_mut();
-        for (k, v) in params.iter().filter(|(k, _)| param_allowed(k)) {
+        for (k, v) in params
+            .iter()
+            .filter(|(k, _)| param_allowed(k) && k != "database")
+        {
             q.append_pair(k, v);
         }
+        // Always name the database, so ClickHouse resolves table names in
+        // the same database ariodb judged them in.
+        q.append_pair("database", &database);
         if stmt.kind == Kind::Read || plan == gate::Plan::Read {
             q.append_pair("readonly", "2");
         }
