@@ -279,7 +279,10 @@ first, up to 100 entries or about 4 MiB of statements at a time:
    "prev":"9b1f…","hash":"c04e…"}]}}
 ```
 
-`outcome` is `allowed`, `refused`, `rolled_back` or `failed`. `prev` and
+`outcome` is `allowed`, `refused`, `rolled_back` or `failed`. When the
+statement asked for approval, `decided_by` lists who decided (the
+approvals' deciders, such as `sso:pat@example.test` or
+`model:openai/<model>`); otherwise it is `[]`. `prev` and
 `hash` are the entry's links in the decisions log's hash chain, so a sink
 can check the chain itself (see SECURITY.md, A1). Answer with the `id` of
 the last entry stored durably:

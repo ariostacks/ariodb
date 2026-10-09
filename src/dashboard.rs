@@ -846,15 +846,27 @@ async fn hook_confirm(
     hook_page(
         StatusCode::OK,
         format!(
-            "<p>Agent <b>{}</b> wants to run:</p><pre>{}</pre><p>Rule: {} ({}). Status: {}.</p>{signed_in_as}\
+            "{}{signed_in_as}\
              <form method=\"post\" action=\"{}\">{csrf_field}<button type=\"submit\">{action} this request</button></form>",
-            html_escape(&a.agent),
-            html_escape(&a.sql),
-            html_escape(&a.rule),
-            html_escape(&a.reason),
-            html_escape(&a.status),
+            request_summary(&a),
             html_escape(&link),
         ),
+    )
+}
+
+/// What an approval link's page says is waiting. The statement is shown as
+/// the chat and email messages show it: characters that reorder or hide
+/// text are written out (`<U+202E>`), so the approver reads the statement
+/// that would run.
+fn request_summary(a: &store::Approval) -> String {
+    let (sql, _) = crate::channels::shown_sql(&a.sql, usize::MAX);
+    format!(
+        "<p>Agent <b>{}</b> wants to run:</p><pre>{}</pre><p>Rule: {} ({}). Status: {}.</p>",
+        html_escape(&a.agent),
+        html_escape(&sql),
+        html_escape(&a.rule),
+        html_escape(&a.reason),
+        html_escape(&a.status),
     )
 }
 
@@ -1108,6 +1120,30 @@ admin_groups = ["admins"]
         assert_eq!(user(Role::Admin, &[]).decider(), "sso:pat@example.test");
         assert!(needs(&user(Role::Approver, &[]), Role::Admin).is_err());
         assert!(needs(&user(Role::Admin, &[]), Role::Approver).is_ok());
+    }
+
+    #[test]
+    fn the_confirmation_page_shows_hidden_characters() {
+        let a = store::Approval {
+            id: "a-1".into(),
+            created_ms: 0,
+            expires_ms: 0,
+            agent: "bot".into(),
+            session: "s-1".into(),
+            // Displays as a harmless SELECT; runs as a DELETE.
+            sql: "SELECT 1 /*\u{202e} ;sredro MORF ETELED */\u{200b}".into(),
+            rule: "ask".into(),
+            approver: "pager".into(),
+            reason: "marked".into(),
+            status: "pending".into(),
+            decided_by: None,
+            note: None,
+            decided_ms: None,
+        };
+        let page = request_summary(&a);
+        assert!(page.contains("&lt;U+202E&gt;"), "{page}");
+        assert!(page.contains("&lt;U+200B&gt;"), "{page}");
+        assert!(!page.contains('\u{202e}') && !page.contains('\u{200b}'));
     }
 
     #[test]

@@ -51,6 +51,12 @@ pub struct Entry<'a> {
     pub engine: &'a str,
     /// The database the statement ran in.
     pub database: &'a str,
+    /// Who decided the approvals this statement asked for, in the order
+    /// they decided, as the approvals table records them
+    /// (`dashboard:root`, `sso:pat@example.test`, `slack:pat`, `webhook`,
+    /// `model:openai/<model>`, `plugin:<name>`, `ariodb`). Empty when no
+    /// approval was asked for.
+    pub decided_by: &'a [String],
 }
 
 /// A stored entry, as the dashboard and fixture export read it.
@@ -70,6 +76,8 @@ pub struct Decision {
     pub latency_ms: Option<i64>,
     pub engine: String,
     pub database: String,
+    /// See `Entry::decided_by`.
+    pub decided_by: Vec<String>,
 }
 
 pub struct AuditLog {
@@ -115,6 +123,10 @@ fn open_conn(dir: &Path) -> Result<Connection, String> {
         .execute_batch("ALTER TABLE decisions ADD COLUMN engine TEXT NOT NULL DEFAULT 'postgres'");
     let _ =
         conn.execute_batch("ALTER TABLE decisions ADD COLUMN database TEXT NOT NULL DEFAULT ''");
+    // A JSON array of deciders, or '' when there were none (and in entries
+    // written before deciders were recorded).
+    let _ =
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN decided_by TEXT NOT NULL DEFAULT ''");
     Ok(conn)
 }
 
@@ -139,6 +151,11 @@ fn chain_text(at_ms: i64, prev: &str, d: &Decision) -> String {
     }
     if !d.database.is_empty() {
         value["database"] = serde_json::json!(d.database);
+    }
+    // Only when there are some, so entries written before deciders were
+    // recorded still hash as they did.
+    if !d.decided_by.is_empty() {
+        value["decided_by"] = serde_json::json!(d.decided_by);
     }
     value.to_string()
 }
@@ -175,6 +192,7 @@ impl AuditLog {
             latency_ms: entry.latency_ms.map(|l| l as i64),
             engine: entry.engine.to_string(),
             database: entry.database.to_string(),
+            decided_by: entry.decided_by.to_vec(),
         };
         let mut conn = self.conn.lock().expect("audit lock");
         let tx = conn
@@ -191,8 +209,8 @@ impl AuditLog {
             .unwrap_or_default();
         let hash = hex::encode(Sha256::digest(chain_text(d.at_ms, &prev, &d).as_bytes()));
         tx.execute(
-            "INSERT INTO decisions (at_ms, session, agent, sql, kind, tables, outcome, rows, reason, rule, latency_ms, prev, hash, engine, database)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO decisions (at_ms, session, agent, sql, kind, tables, outcome, rows, reason, rule, latency_ms, prev, hash, engine, database, decided_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 d.at_ms,
                 d.session,
@@ -208,7 +226,8 @@ impl AuditLog {
                 prev,
                 hash,
                 d.engine,
-                d.database
+                d.database,
+                deciders_text(&d.decided_by)
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -330,8 +349,18 @@ impl SinkCursor {
     }
 }
 
+/// How the deciders column stores a list: '' for none, else a JSON array.
+fn deciders_text(by: &[String]) -> String {
+    if by.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(by).unwrap_or_default()
+    }
+}
+
 fn row_to_decision(r: &rusqlite::Row) -> rusqlite::Result<Decision> {
     let tables: String = r.get("tables")?;
+    let decided_by: String = r.get("decided_by")?;
     Ok(Decision {
         id: r.get("id")?,
         at_ms: r.get("at_ms")?,
@@ -347,6 +376,11 @@ fn row_to_decision(r: &rusqlite::Row) -> rusqlite::Result<Decision> {
         latency_ms: r.get("latency_ms")?,
         engine: r.get("engine")?,
         database: r.get("database")?,
+        decided_by: if decided_by.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&decided_by).unwrap_or_default()
+        },
     })
 }
 
@@ -370,61 +404,21 @@ pub struct Filter {
     pub decided_by_kind: Option<String>,
 }
 
-/// The approvals behind a decision (from `store.rs`'s table in the same
-/// database): same session, agent and rule, asked for after the session's
-/// previous statement was recorded, and decided before this one was. A
-/// session sends one statement at a time, so that window holds only this
-/// statement's approvals (to the millisecond: an approval asked for in the
-/// very millisecond the previous statement was recorded is not found).
-/// Refers to the decision as `d`, the approval as `a`.
-const APPROVAL_OF_D: &str = "a.session = d.session AND a.agent = d.agent \
-    AND a.rule = d.rule AND a.decided_by IS NOT NULL \
-    AND a.created_ms <= d.at_ms AND a.decided_ms <= d.at_ms \
-    AND a.created_ms > coalesce((SELECT max(p.at_ms) FROM decisions p WHERE p.session = d.session AND p.id < d.id), 0)";
+/// The deciders of a decision `d`, as a table of `value`s. Old entries
+/// store '' rather than an empty array.
+const DECIDERS_OF_D: &str = "json_each(CASE WHEN d.decided_by = '' THEN '[]' ELSE d.decided_by END)";
 
-/// The SQL condition on `a.decided_by` for a kind of decider.
+/// The SQL condition on a decider (`value`) for a kind of decider. ariodb
+/// itself decides when a request cannot be delivered or the agent leaves.
 fn decider_kind_condition(kind: &str) -> Result<&'static str, String> {
     Ok(match kind {
-        "model" => "a.decided_by LIKE 'model:%'",
-        "plugin" => "a.decided_by LIKE 'plugin:%'",
+        "model" => "value LIKE 'model:%'",
+        "plugin" => "value LIKE 'plugin:%'",
         "person" => {
-            "a.decided_by NOT LIKE 'model:%' AND a.decided_by NOT LIKE 'plugin:%' AND a.decided_by != 'ariodb'"
+            "value NOT LIKE 'model:%' AND value NOT LIKE 'plugin:%' AND value != 'ariodb' AND value NOT LIKE 'ariodb:%'"
         }
         _ => return Err(format!("decided_by_kind must be person, model or plugin, not '{kind}'")),
     })
-}
-
-/// Who decided the approvals behind each of these decisions, by decision id.
-pub fn deciders(
-    dir: &Path,
-    ids: &[i64],
-) -> Result<std::collections::HashMap<i64, Vec<String>>, String> {
-    let mut out = std::collections::HashMap::new();
-    if ids.is_empty() {
-        return Ok(out);
-    }
-    let conn = open_conn(dir)?;
-    let list = ids
-        .iter()
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT d.id, a.decided_by FROM decisions d JOIN approvals a ON {APPROVAL_OF_D} \
-         WHERE d.id IN ({list}) ORDER BY d.id, a.decided_ms"
-    );
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| e.to_string())?;
-    for row in rows {
-        let (id, by) = row.map_err(|e| e.to_string())?;
-        let list: &mut Vec<String> = out.entry(id).or_default();
-        if !list.contains(&by) {
-            list.push(by);
-        }
-    }
-    Ok(out)
 }
 
 pub fn query(dir: &Path, f: &Filter) -> Result<Vec<Decision>, String> {
@@ -454,13 +448,13 @@ pub fn query(dir: &Path, f: &Filter) -> Result<Vec<Decision>, String> {
     let by_condition = f
         .decided_by
         .as_ref()
-        .map(|_| format!("EXISTS (SELECT 1 FROM approvals a WHERE {APPROVAL_OF_D} AND a.decided_by = ?)"));
+        .map(|_| format!("EXISTS (SELECT 1 FROM {DECIDERS_OF_D} WHERE value = ?)"));
     if let (Some(c), Some(v)) = (&by_condition, &f.decided_by) {
         conditions.push((c.as_str(), Box::new(v.clone())));
     }
     if let Some(kind) = &f.decided_by_kind {
         sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM approvals a WHERE {APPROVAL_OF_D} AND {})",
+            " AND EXISTS (SELECT 1 FROM {DECIDERS_OF_D} WHERE {})",
             decider_kind_condition(kind)?
         ));
     }
@@ -603,6 +597,7 @@ mod tests {
             latency_ms: Some(2),
             engine: "postgres",
             database: "app",
+            decided_by: &[],
         }
     }
 
@@ -665,57 +660,30 @@ mod tests {
     }
 
     #[test]
-    fn decisions_know_who_decided_their_approvals() {
+    fn decisions_record_who_decided_their_approvals() {
         let dir = std::env::temp_dir().join(format!("ariodb-audit-d-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let log = AuditLog::open(&dir, &Settings::default()).unwrap();
-        let db = crate::store::Db::open(&dir).unwrap();
-        let approval = |id: &str, session: &str, rule: &str, by: &str| {
-            let now = crate::store::now_ms();
-            db.insert_approval(&crate::store::Approval {
-                id: id.into(),
-                created_ms: now,
-                expires_ms: now + 1000,
-                agent: "bot".into(),
-                session: session.into(),
-                sql: "SELECT 1".into(),
-                rule: rule.into(),
-                approver: "ops".into(),
-                reason: String::new(),
-                status: "allowed".into(),
-                decided_by: Some(by.into()),
-                note: None,
-                decided_ms: Some(now),
-            })
-            .unwrap();
-        };
-        let decide = |session: &str, rule: Option<&str>| {
+        let decide = |session: &str, rule: Option<&str>, by: &[String]| {
             let mut e = entry("SELECT 1", &[]);
             e.session = session;
             e.rule = rule;
+            e.decided_by = by;
             log.record(&e);
         };
-        // Two statements in one session, each approved by someone else, and
-        // one in another session decided by a model.
-        let tick = || std::thread::sleep(std::time::Duration::from_millis(3));
-        approval("a-1", "s1", "ask", "sso:pat@example.test");
-        decide("s1", Some("ask"));
-        tick();
-        approval("a-2", "s1", "ask", "dashboard:root");
-        decide("s1", Some("ask"));
-        approval("a-3", "s2", "ask", "model:openai/gpt-test");
-        decide("s2", Some("ask"));
-        tick();
-        decide("s2", None);
+        let by = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        decide("s1", Some("ask"), &by(&["sso:pat@example.test"]));
+        decide("s1", Some("ask"), &by(&["dashboard:root", "slack:sam"]));
+        decide("s2", Some("ask"), &by(&["model:openai/gpt-test"]));
+        decide("s2", None, &[]);
+        decide("s3", Some("ask"), &by(&["ariodb:failed-open:model:openai/gpt-test"]));
         let all = query(&dir, &Filter::default()).unwrap();
-        let ids: Vec<i64> = all.iter().map(|d| d.id).collect();
-        let by = deciders(&dir, &ids).unwrap();
-        let of = |n: usize| by.get(&all[n].id).cloned().unwrap_or_default();
-        // Newest first: s2 unruled, s2 model, s1 root, s1 pat.
-        assert!(of(0).is_empty());
-        assert_eq!(of(1), vec!["model:openai/gpt-test"]);
-        assert_eq!(of(2), vec!["dashboard:root"]);
-        assert_eq!(of(3), vec!["sso:pat@example.test"]);
+        // Newest first.
+        assert_eq!(all[0].decided_by, by(&["ariodb:failed-open:model:openai/gpt-test"]));
+        assert!(all[1].decided_by.is_empty());
+        assert_eq!(all[2].decided_by, by(&["model:openai/gpt-test"]));
+        assert_eq!(all[3].decided_by, by(&["dashboard:root", "slack:sam"]));
+        assert_eq!(all[4].decided_by, by(&["sso:pat@example.test"]));
         let filtered = |f: Filter| query(&dir, &f).unwrap().len();
         assert_eq!(
             filtered(Filter {
@@ -724,6 +692,14 @@ mod tests {
             }),
             1
         );
+        assert_eq!(
+            filtered(Filter {
+                decided_by: Some("slack:sam".into()),
+                ..Default::default()
+            }),
+            1
+        );
+        // A failed-open model is not a person, nor a model's decision.
         assert_eq!(
             filtered(Filter {
                 decided_by_kind: Some("person".into()),
@@ -749,7 +725,91 @@ mod tests {
             )
             .is_err()
         );
+        assert_eq!(verify(&dir), Ok(5));
+        // The deciders are part of the chain.
+        let conn = open_conn(&dir).unwrap();
+        conn.execute(
+            "UPDATE decisions SET decided_by = '[\"dashboard:mallory\"]' WHERE decided_by LIKE '%root%'",
+            [],
+        )
+        .unwrap();
+        assert!(verify(&dir).unwrap_err().contains("edited"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_from_before_deciders_were_recorded_still_verify() {
+        let dir = std::env::temp_dir().join(format!("ariodb-audit-o-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // An entry as an earlier ariodb wrote it: no decided_by column, and
+        // a hash over the fields it knew.
+        crate::secrets::ensure_private_dir(&dir).unwrap();
+        let conn = Connection::open(dir.join("ariodb.db")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE decisions ADD COLUMN engine TEXT NOT NULL DEFAULT 'postgres';
+             ALTER TABLE decisions ADD COLUMN database TEXT NOT NULL DEFAULT '';",
+        )
+        .unwrap();
+        let text = serde_json::json!({
+            "at_ms": 1_000, "prev": "", "session": "s1", "agent": "bot",
+            "sql": "SELECT 1", "kind": "read", "tables": ["orders"],
+            "outcome": "allowed", "rows": 1, "reason": null, "rule": "ask",
+            "latency_ms": 2, "database": "app",
+        })
+        .to_string();
+        let hash = hex::encode(Sha256::digest(text.as_bytes()));
+        conn.execute(
+            "INSERT INTO decisions (at_ms, session, agent, sql, kind, tables, outcome, rows, reason, rule, latency_ms, prev, hash, engine, database)
+             VALUES (1000, 's1', 'bot', 'SELECT 1', 'read', '[\"orders\"]', 'allowed', 1, NULL, 'ask', 2, '', ?1, 'postgres', 'app')",
+            [&hash],
+        )
+        .unwrap();
+        drop(conn);
+        // Opening adds the column; the old entry keeps its hash, and new
+        // entries with and without deciders chain on from it.
+        let log = AuditLog::open(&dir, &Settings::default()).unwrap();
+        let tables = vec!["orders".to_string()];
+        let by = vec!["dashboard:root".to_string()];
+        let mut e = entry("SELECT 2", &tables);
+        e.decided_by = &by;
+        log.record(&e);
+        log.record(&entry("SELECT 3", &tables));
+        assert_eq!(verify(&dir), Ok(3));
+        let all = query(&dir, &Filter::default()).unwrap();
+        assert!(all[2].decided_by.is_empty());
+        assert_eq!(all[1].decided_by, by);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fixtures_ignore_who_decided() {
+        let config = crate::config::Config::from_toml(
+            "[database]\nurl = \"postgres://localhost/app\"\n\n[[approvers]]\nname = \"ops\"\ntype = \"dashboard\"\n\n[[rules]]\nname = \"ask\"\ncondition = \"true\"\nverdict = \"approve\"\napprove = [\"ops\"]\n",
+        )
+        .unwrap();
+        let mut d = Decision {
+            id: 7,
+            at_ms: 0,
+            session: "s1".into(),
+            agent: "bot".into(),
+            sql: "SELECT 1".into(),
+            kind: "read".into(),
+            tables: Vec::new(),
+            outcome: "allowed".into(),
+            rows: None,
+            reason: None,
+            rule: Some("ask".into()),
+            latency_ms: None,
+            engine: "postgres".into(),
+            database: "app".into(),
+            decided_by: Vec::new(),
+        };
+        let without = crate::testing::fixture_for(&d, &config);
+        d.decided_by = vec!["dashboard:root".into(), "model:openai/gpt-test".into()];
+        let with = crate::testing::fixture_for(&d, &config);
+        assert_eq!(without, with);
+        assert!(!with.unwrap().to_string().contains("dashboard:root"));
     }
 
     #[test]

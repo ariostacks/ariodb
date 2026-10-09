@@ -167,6 +167,7 @@ impl Session {
                         None,
                         Some(&r.message),
                         r.rule.as_deref(),
+                        &r.decided_by,
                         started,
                     );
                     return sink
@@ -178,8 +179,18 @@ impl Session {
                 }
             };
 
+        let by = &approved.by;
         if let Err(e) = self.begin(plan).await? {
-            self.audit(sql, &statements, "failed", None, Some(&e.message), started);
+            self.audit_rule(
+                sql,
+                &statements,
+                "failed",
+                None,
+                Some(&e.message),
+                None,
+                by,
+                started,
+            );
             let _ = self.end(false).await;
             return sink.send(wire::error_response(&e.code, &e.message)).await;
         }
@@ -215,7 +226,16 @@ impl Session {
 
         if status == b'E' || failed.is_some() {
             self.end(false).await?;
-            self.audit(sql, &statements, "failed", None, failed.as_deref(), started);
+            self.audit_rule(
+                sql,
+                &statements,
+                "failed",
+                None,
+                failed.as_deref(),
+                None,
+                by,
+                started,
+            );
             for f in held {
                 sink.send(f).await?;
             }
@@ -230,7 +250,8 @@ impl Session {
                 "allowed",
                 None,
                 None,
-                approved.as_deref(),
+                approved.rule.as_deref(),
+                by,
                 started,
             );
             return Ok(());
@@ -240,7 +261,16 @@ impl Session {
             Ok(e) => e,
             Err(e) => {
                 self.end(false).await?;
-                self.audit(sql, &statements, "failed", None, Some(&e.message), started);
+                self.audit_rule(
+                    sql,
+                    &statements,
+                    "failed",
+                    None,
+                    Some(&e.message),
+                    None,
+                    by,
+                    started,
+                );
                 return sink.send(wire::error_response(&e.code, &e.message)).await;
             }
         };
@@ -250,7 +280,7 @@ impl Session {
         } else {
             reported
         };
-        if let Err(r) = gate::judge_write(
+        let verdict = gate::judge_write(
             &self.state,
             &self.ctx(),
             &statements,
@@ -258,25 +288,32 @@ impl Session {
             reported,
             self.measured,
         )
-        .await
-        {
-            self.end(false).await?;
-            self.audit_rule(
-                sql,
-                &statements,
-                "rolled_back",
-                Some(rows),
-                Some(&r.message),
-                r.rule.as_deref(),
-                started,
-            );
-            return sink
-                .send(wire::error_response(
-                    r.code,
-                    &format!("ariodb: {}", r.message),
-                ))
-                .await;
-        }
+        .await;
+        let mut by = approved.by.clone();
+        let after = match verdict {
+            Ok(after) => after,
+            Err(r) => {
+                by.extend(r.decided_by.iter().cloned());
+                self.end(false).await?;
+                self.audit_rule(
+                    sql,
+                    &statements,
+                    "rolled_back",
+                    Some(rows),
+                    Some(&r.message),
+                    r.rule.as_deref(),
+                    &by,
+                    started,
+                );
+                return sink
+                    .send(wire::error_response(
+                        r.code,
+                        &format!("ariodb: {}", r.message),
+                    ))
+                    .await;
+            }
+        };
+        by.extend(after);
         self.end(true).await?;
         self.audit_rule(
             sql,
@@ -284,7 +321,8 @@ impl Session {
             "allowed",
             Some(rows),
             None,
-            approved.as_deref(),
+            approved.rule.as_deref(),
+            &by,
             started,
         );
         for f in held {
@@ -302,7 +340,7 @@ impl Session {
         reason: Option<&str>,
         started: Instant,
     ) {
-        self.audit_rule(sql, statements, outcome, rows, reason, None, started);
+        self.audit_rule(sql, statements, outcome, rows, reason, None, &[], started);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -314,6 +352,7 @@ impl Session {
         rows: Option<u64>,
         reason: Option<&str>,
         rule: Option<&str>,
+        decided_by: &[String],
         started: Instant,
     ) {
         let tables = gate::tables(statements);
@@ -330,6 +369,7 @@ impl Session {
             latency_ms: Some(started.elapsed().as_millis() as u64),
             engine: "postgres",
             database: &self.database,
+            decided_by,
         });
     }
 }

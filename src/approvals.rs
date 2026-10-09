@@ -252,25 +252,36 @@ pub fn validate(
     Ok(())
 }
 
-/// Ask every approver in order. All must allow.
+/// One approver's answer: who decided, if anyone did, and why not when
+/// the statement may not run.
+pub(crate) struct Answer {
+    /// As the approvals table records it: `dashboard:root`, `slack:pat`,
+    /// `webhook`, `model:openai/<model>`, `plugin:<name>`, `ariodb`. `None`
+    /// when nobody decided (the request expired or was withdrawn).
+    pub by: Option<String>,
+    pub verdict: Result<(), String>,
+}
+
+/// Ask every approver in order. All must allow. Returns who allowed; a
+/// refusal carries who decided before it, and who denied.
 pub async fn require(
     state: &State,
     ctx: &Ctx<'_>,
     statements: &[Statement],
     need: &ApprovalNeed,
-) -> Result<(), Refusal> {
+) -> Result<Vec<String>, Refusal> {
     let config = state.config();
     let sql = statements
         .iter()
         .map(|s| s.sql.as_str())
         .collect::<Vec<_>>()
         .join("; ");
+    let mut deciders = Vec::new();
     for name in &need.approvers {
         let Some(approver) = config.approvers.iter().find(|a| &a.name == name) else {
-            return Err(Refusal::by_rule(
-                &need.rule,
-                format!("approver '{name}' is not defined"),
-            ));
+            let mut r = Refusal::by_rule(&need.rule, format!("approver '{name}' is not defined"));
+            r.decided_by = deciders;
+            return Err(r);
         };
         // Notifiers get the statement as the decisions log stores it.
         let stored = statements
@@ -289,25 +300,26 @@ pub async fn require(
             "reason": need.reason,
         });
         crate::plugins::notify("approval_requested", event.clone());
-        let verdict = match approver.kind {
+        let answer = match approver.kind {
             ApproverKind::Llm => ask_model(state, approver, ctx, statements, need).await,
             ApproverKind::Plugin => {
                 crate::plugins::ask(state, approver, ctx, statements, need).await
             }
             _ => ask_person(state, approver, ctx, &sql, need).await,
         };
+        let verdict = answer.verdict;
         let mut decided = event;
         decided["verdict"] = json!(if verdict.is_ok() { "allow" } else { "deny" });
         decided["why"] = json!(verdict.as_ref().err());
         crate::plugins::notify("approval_decided", decided);
+        deciders.extend(answer.by);
         if let Err(why) = verdict {
-            return Err(Refusal::by_rule(
-                &need.rule,
-                format!("{}: {why}", need.reason),
-            ));
+            let mut r = Refusal::by_rule(&need.rule, format!("{}: {why}", need.reason));
+            r.decided_by = deciders;
+            return Err(r);
         }
     }
-    Ok(())
+    Ok(deciders)
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +331,7 @@ async fn ask_person(
     ctx: &Ctx<'_>,
     sql: &str,
     need: &ApprovalNeed,
-) -> Result<(), String> {
+) -> Answer {
     let config = state.config();
     let timeout = approver
         .timeout_seconds
@@ -340,7 +352,12 @@ async fn ask_person(
         note: None,
         decided_ms: None,
     };
-    state.db.insert_approval(&approval)?;
+    if let Err(e) = state.db.insert_approval(&approval) {
+        return Answer {
+            by: None,
+            verdict: Err(e),
+        };
+    }
 
     let notified = match approver.kind {
         ApproverKind::Dashboard => Ok(()),
@@ -349,8 +366,14 @@ async fn ask_person(
         _ => notify_channel(&config, approver, &approval).await,
     };
     if let Err(e) = notified {
-        state.db.decide(&approval.id, false, "ariodb", Some(&e))?;
-        return Err(format!("could not reach approver '{}': {e}", approver.name));
+        let recorded = state.db.decide(&approval.id, false, "ariodb", Some(&e));
+        return Answer {
+            by: recorded.is_ok().then(|| "ariodb".to_string()),
+            verdict: Err(match recorded {
+                Ok(_) => format!("could not reach approver '{}': {e}", approver.name),
+                Err(db) => db,
+            }),
+        };
     }
 
     let decided = wait_for_decision(state, approver, ctx, &approval.id, timeout).await;
@@ -358,7 +381,7 @@ async fn ask_person(
         approver.kind,
         ApproverKind::Pagerduty | ApproverKind::Opsgenie
     ) {
-        let outcome = match &decided {
+        let outcome = match &decided.verdict {
             Ok(()) => "approved".to_string(),
             Err(why) => why.clone(),
         };
@@ -378,31 +401,46 @@ async fn wait_for_decision(
     ctx: &Ctx<'_>,
     id: &str,
     timeout: u64,
-) -> Result<(), String> {
+) -> Answer {
+    let nobody = |verdict: Result<(), String>| Answer { by: None, verdict };
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
-        if let Some(a) = state.db.approval(id)? {
-            match a.status.as_str() {
-                "allowed" => return Ok(()),
-                "denied" => {
-                    let by = a.decided_by.unwrap_or_default();
-                    let note = a.note.map(|n| format!(" ({n})")).unwrap_or_default();
-                    return Err(format!("denied by {by}{note}"));
+        match state.db.approval(id) {
+            Err(e) => return nobody(Err(e)),
+            Ok(Some(a)) => match a.status.as_str() {
+                "allowed" => {
+                    return Answer {
+                        by: a.decided_by,
+                        verdict: Ok(()),
+                    };
                 }
-                "expired" => return Err("the approval request expired".to_string()),
+                "denied" => {
+                    let by = a.decided_by.clone().unwrap_or_default();
+                    let note = a.note.map(|n| format!(" ({n})")).unwrap_or_default();
+                    return Answer {
+                        by: a.decided_by,
+                        verdict: Err(format!("denied by {by}{note}")),
+                    };
+                }
+                "expired" => return nobody(Err("the approval request expired".to_string())),
                 _ => {}
-            }
+            },
+            Ok(None) => {}
         }
         if let Some(why) = ctx.live.and_then(|l| l.stopped()) {
-            state.db.withdraw(id, why)?;
-            return Err(format!("{why}, so the request was withdrawn"));
+            return nobody(match state.db.withdraw(id, why) {
+                Ok(()) => Err(format!("{why}, so the request was withdrawn")),
+                Err(e) => Err(e),
+            });
         }
         if Instant::now() >= deadline {
-            state.db.expire(id)?;
-            return Err(format!(
-                "no decision from '{}' within {timeout} seconds",
-                approver.name
-            ));
+            return nobody(match state.db.expire(id) {
+                Ok(()) => Err(format!(
+                    "no decision from '{}' within {timeout} seconds",
+                    approver.name
+                )),
+                Err(e) => Err(e),
+            });
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -441,7 +479,7 @@ async fn notify_slack(
         "*ariodb approval needed* ({})\nAgent `{}` wants to run:\n```{}```\nRule: {}\n<{}|Open in the dashboard>",
         slack_escape(&a.reason),
         slack_escape(&a.agent),
-        slack_escape(&truncate(&a.sql, 2500)),
+        slack_escape(&crate::channels::shown_sql(&a.sql, 2500).0),
         slack_escape(&a.rule),
         dashboard_link(config, &a.id)
     );
@@ -659,14 +697,6 @@ fn slack_escape(s: &str) -> String {
         .replace('`', "`\u{200b}")
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(n).collect::<String>())
-    }
-}
-
 fn http() -> reqwest::Client {
     crate::tls::init();
     reqwest::Client::builder()
@@ -717,8 +747,9 @@ async fn ask_model(
     ctx: &Ctx<'_>,
     statements: &[Statement],
     need: &ApprovalNeed,
-) -> Result<(), String> {
+) -> Answer {
     let config = state.config();
+    let decider = crate::llm::decider(approver);
     let sql = statements
         .iter()
         .map(|s| s.sql.as_str())
@@ -734,14 +765,16 @@ async fn ask_model(
         .cloned()
         && at.elapsed() < ttl
     {
-        return verdict;
+        return Answer {
+            by: Some(decider),
+            verdict,
+        };
     }
 
     let judged = judge(&config, approver, ctx, statements, need).await;
     // Only the model's own answers are reused. An outage (allowed under
     // fail-open) or a setup error must not stand in for a decision.
     let cacheable = matches!(judged, Judged::Allow | Judged::Deny(_));
-    let decider = crate::llm::decider(approver);
     let who = format!("model approver '{}' ({decider})", approver.name);
     // An allow the model never gave must not look like one in the record.
     let mut failed_open = None;
@@ -777,8 +810,8 @@ async fn ask_model(
         } else {
             "denied".into()
         },
-        decided_by: Some(decider),
-        note: verdict.as_ref().err().cloned().or(failed_open),
+        decided_by: Some(decider.clone()),
+        note: verdict.as_ref().err().cloned().or(failed_open.clone()),
         decided_ms: Some(now),
     });
 
@@ -790,7 +823,16 @@ async fn ask_model(
         }
         cache.insert(key, (Instant::now(), verdict.clone()));
     }
-    verdict
+    // In the decisions log, an allow the model never gave is ariodb's.
+    let by = if failed_open.is_some() {
+        format!("ariodb:failed-open:{decider}")
+    } else {
+        decider
+    };
+    Answer {
+        by: Some(by),
+        verdict,
+    }
 }
 
 async fn judge(

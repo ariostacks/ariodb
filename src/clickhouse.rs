@@ -149,6 +149,7 @@ async fn query(
                  rows: Option<u64>,
                  reason: Option<&str>,
                  rule: Option<&str>,
+                 decided_by: &[String],
                  stmt: Option<&crate::classify::Statement>| {
         let tables = stmt.map(|s| s.tables.clone()).unwrap_or_default();
         state.audit.record(&crate::audit::Entry {
@@ -166,6 +167,7 @@ async fn query(
             latency_ms: Some(started.elapsed().as_millis() as u64),
             engine: "clickhouse",
             database: &database,
+            decided_by,
         });
     };
 
@@ -175,7 +177,7 @@ async fn query(
             s
         }
         Err(e) => {
-            audit("refused", None, Some(&e), None, None);
+            audit("refused", None, Some(&e), None, &[], None);
             return ch_error(StatusCode::FORBIDDEN, 497, &e);
         }
     };
@@ -188,6 +190,7 @@ async fn query(
                     None,
                     Some(&r.message),
                     r.rule.as_deref(),
+                    &r.decided_by,
                     Some(&stmt),
                 );
                 return ch_error(StatusCode::FORBIDDEN, 497, &r.message);
@@ -248,7 +251,14 @@ async fn query(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            audit("failed", None, Some(&e.to_string()), None, Some(&stmt));
+            audit(
+                "failed",
+                None,
+                Some(&e.to_string()),
+                None,
+                &approved.by,
+                Some(&stmt),
+            );
             return ch_error(
                 StatusCode::BAD_GATEWAY,
                 210,
@@ -288,7 +298,8 @@ async fn query(
         outcome,
         rows,
         reason.as_deref(),
-        approved.as_deref(),
+        approved.rule.as_deref(),
+        &approved.by,
         Some(&stmt),
     );
 

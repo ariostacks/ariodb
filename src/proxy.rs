@@ -573,12 +573,14 @@ impl Connection {
         statements: &[Statement],
         final_sync: bool,
     ) -> Result<(), WireError> {
-        self.session.audit(
+        self.session.audit_rule(
             sql,
             statements,
             "refused",
             None,
             Some(&r.message),
+            None,
+            &r.decided_by,
             Instant::now(),
         );
         self.batch.clear();
@@ -734,6 +736,7 @@ impl Connection {
         let mut reason = outcome.error.clone();
         let mut rows = None;
         let mut send = outcome.held;
+        let mut decided_by = approved.by.clone();
 
         if has_execute && plan == Plan::Write {
             if outcome.error.is_some() {
@@ -759,6 +762,10 @@ impl Connection {
                     self.session.measured,
                 )
                 .await;
+                match &verdict {
+                    Ok(after) => decided_by.extend(after.iter().cloned()),
+                    Err(r) => decided_by.extend(r.decided_by.iter().cloned()),
+                }
                 let end = if verdict.is_ok() { COMMIT } else { ROLLBACK };
                 let tail = end_with(end);
                 let finish = self.exchange(&tail, Hold::All).await?;
@@ -792,7 +799,7 @@ impl Connection {
         }
         if has_execute {
             let rule = if audit_outcome == "allowed" {
-                approved.as_deref()
+                approved.rule.as_deref()
             } else {
                 None
             };
@@ -803,6 +810,7 @@ impl Connection {
                 rows,
                 reason.as_deref(),
                 rule,
+                &decided_by,
                 started,
             );
         }

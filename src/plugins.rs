@@ -1267,15 +1267,15 @@ fn request_params(ctx: &Ctx<'_>, statements: &[Statement]) -> Value {
     })
 }
 
-/// Ask a plugin approver. `Ok` allows; `Err` refuses, with the reason.
-/// The decision is recorded with people's and models' decisions.
-pub async fn ask(
+/// Ask a plugin approver. An `Ok` verdict allows; `Err` refuses, with the
+/// reason. The decision is recorded with people's and models' decisions.
+pub(crate) async fn ask(
     state: &State,
     approver: &crate::approvals::ApproverConfig,
     ctx: &Ctx<'_>,
     statements: &[Statement],
     need: &ApprovalNeed,
-) -> Result<(), String> {
+) -> crate::approvals::Answer {
     let config = state.config();
     let name = approver.plugin.clone().unwrap_or_default();
     let timeout = approver
@@ -1336,7 +1336,7 @@ pub async fn ask(
         approver: approver.name.clone(),
         reason: need.reason.clone(),
         status: status.to_string(),
-        decided_by: Some(by),
+        decided_by: Some(by.clone()),
         note,
         decided_ms: Some(store::now_ms()),
     });
@@ -1346,7 +1346,10 @@ pub async fn ask(
             approver.name
         );
     }
-    verdict
+    crate::approvals::Answer {
+        by: (status != "expired").then_some(by),
+        verdict,
+    }
 }
 
 /// Ask facts plugins about one statement, all at once. Each answer, or why
@@ -1974,7 +1977,7 @@ for line in sys.stdin:
         uninstall();
         host.stop().await;
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(verdict.is_ok(), "{verdict:?}");
+        assert_eq!(verdict.as_ref().ok(), Some(&vec!["plugin:n".to_string()]), "{verdict:?}");
         assert!(text.contains("approval_requested"), "{text}");
         assert!(!text.contains("not-a-real-card-4242"), "{text}");
     }

@@ -84,19 +84,7 @@ async fn decisions(
     Query(f): Query<Filter>,
 ) -> Result<Json<Value>, ApiError> {
     require_user(&state, &headers)?;
-    let dir = state_dir(&state);
-    let items = audit::query(&dir, &f).map_err(bad)?;
-    let ids: Vec<i64> = items.iter().map(|d| d.id).collect();
-    let mut deciders = audit::deciders(&dir, &ids)?;
-    let items: Vec<Value> = items
-        .into_iter()
-        .map(|d| {
-            let by = deciders.remove(&d.id).unwrap_or_default();
-            let mut v = json!(d);
-            v["decided_by"] = json!(by);
-            v
-        })
-        .collect();
+    let items = audit::query(&state_dir(&state), &f).map_err(bad)?;
     Ok(Json(json!({ "decisions": items, "deciders": state.db.deciders()? })))
 }
 

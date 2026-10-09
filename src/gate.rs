@@ -107,6 +107,9 @@ pub struct Refusal {
     pub message: String,
     /// The rule that refused, if a rule did.
     pub rule: Option<String>,
+    /// Who decided the approvals asked for before the refusal, the one
+    /// that denied it last (see `audit::Entry::decided_by`).
+    pub decided_by: Vec<String>,
 }
 
 impl Refusal {
@@ -115,6 +118,7 @@ impl Refusal {
             code: "42501",
             message: message.into(),
             rule: None,
+            decided_by: Vec::new(),
         }
     }
 
@@ -123,6 +127,7 @@ impl Refusal {
             code: "42501",
             message: message.into(),
             rule: Some(rule.to_string()),
+            decided_by: Vec::new(),
         }
     }
 }
@@ -157,6 +162,15 @@ impl Liveness {
     }
 }
 
+/// The approvals a statement passed before it ran.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Approved {
+    /// The first rule that asked for an approval.
+    pub rule: Option<String>,
+    /// Who decided, in order (see `audit::Entry::decided_by`).
+    pub by: Vec<String>,
+}
+
 /// An approval a rule asked for.
 #[derive(Debug, Clone)]
 pub struct ApprovalNeed {
@@ -178,12 +192,13 @@ pub async fn check(
         .map(|(plan, _)| plan)
 }
 
-/// Like `check`, and also names the rule whose approval let it through.
+/// Like `check`, and also names the rule whose approval let it through
+/// and who approved.
 pub async fn check_detailed(
     state: &State,
     ctx: &Ctx<'_>,
     statements: &[Statement],
-) -> Result<(Plan, Option<String>), Refusal> {
+) -> Result<(Plan, Approved), Refusal> {
     let mut plan = Plan::Read;
     let rules = state.rules();
     let mut needs: Vec<ApprovalNeed> = Vec::new();
@@ -223,19 +238,32 @@ pub async fn check_detailed(
             RuleOutcome::Allow { .. } | RuleOutcome::NoMatch => {}
         }
     }
-    let approved = needs.first().map(|n| n.rule.clone());
+    let mut approved = Approved {
+        rule: needs.first().map(|n| n.rule.clone()),
+        by: Vec::new(),
+    };
     for need in needs {
-        crate::approvals::require(state, ctx, statements, &need).await?;
+        match crate::approvals::require(state, ctx, statements, &need).await {
+            Ok(by) => approved.by.extend(by),
+            Err(mut r) => {
+                approved.by.append(&mut r.decided_by);
+                r.decided_by = approved.by;
+                return Err(r);
+            }
+        }
     }
     // An approval can arrive just as the agent leaves; do not run then.
     if let Some(why) = ctx.live.and_then(|l| l.stopped()) {
-        return Err(Refusal::new(format!("{why} while the statement waited")));
+        let mut r = Refusal::new(format!("{why} while the statement waited"));
+        r.decided_by = approved.by;
+        return Err(r);
     }
     Ok((plan, approved))
 }
 
 /// Judge a write by what it actually did, against the row limit, the
 /// agent's tables and any after-stage rules. `Err` means roll it back.
+/// `Ok` holds who approved the write, when an after-stage rule asked.
 /// `reported` is how many rows the database said the statements changed.
 /// `measured` is false under `write_check = "reported"`, when `effects` is
 /// empty and the reported count is all there is.
@@ -246,7 +274,7 @@ pub async fn judge_write(
     effects: &[Effect],
     reported: u64,
     measured: bool,
-) -> Result<(), Refusal> {
+) -> Result<Vec<String>, Refusal> {
     let config = state.config();
     let (rows, tables) = if measured {
         judge_measurement(effects, reported)?;
@@ -287,7 +315,7 @@ pub async fn judge_write(
                     ..r
                 })
         }
-        RuleOutcome::Allow { .. } | RuleOutcome::NoMatch => Ok(()),
+        RuleOutcome::Allow { .. } | RuleOutcome::NoMatch => Ok(Vec::new()),
     }
 }
 

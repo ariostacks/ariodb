@@ -464,20 +464,20 @@ where
                 // opposed to what the policy refuses, so recorded decisions
                 // replay cleanly with `ariodb test`.
                 let decision = match (&stmt, &data) {
-                    (_, Err(e)) => Err((None, e.clone(), "unsupported")),
-                    (Err(e), _) => Err((None, e.clone(), "refused")),
+                    (_, Err(e)) => Err((None, e.clone(), "unsupported", Vec::new())),
+                    (Err(e), _) => Err((None, e.clone(), "refused", Vec::new())),
                     (Ok(s), _) => {
                         let countable = match s.kind {
                             Kind::Write => chsql::insert_from_client(&q.sql),
                             _ => Ok(()),
                         };
                         match countable {
-                            Err(e) => Err((None, e, "unsupported")),
+                            Err(e) => Err((None, e, "unsupported", Vec::new())),
                             Ok(()) => {
                                 let ctx = Ctx { agent, session, database, live: None };
                                 gate::check_detailed(state, &ctx, std::slice::from_ref(s))
                                     .await
-                                    .map_err(|r| (r.rule.clone(), r.message, "refused"))
+                                    .map_err(|r| (r.rule.clone(), r.message, "refused", r.decided_by))
                             }
                         }
                     }
@@ -487,7 +487,11 @@ where
                     .map(|s| s.kind.to_string())
                     .unwrap_or_else(|_| "unknown".into());
                 let tables = stmt.as_ref().map(|s| s.tables.clone()).unwrap_or_default();
-                let record = |outcome: &str, rows: Option<u64>, reason: Option<&str>, rule: Option<&str>| {
+                let record = |outcome: &str,
+                              rows: Option<u64>,
+                              reason: Option<&str>,
+                              rule: Option<&str>,
+                              decided_by: &[String]| {
                     state.audit.record(&crate::audit::Entry {
                         session,
                         agent: &agent.name,
@@ -501,11 +505,12 @@ where
                         latency_ms: Some(started.elapsed().as_millis() as u64),
                         engine: "clickhouse",
                         database,
+                        decided_by,
                     });
                 };
                 let (_, approved) = match decision {
-                    Err((rule, message, outcome)) => {
-                        record(outcome, None, Some(&message), rule.as_deref());
+                    Err((rule, message, outcome, by)) => {
+                        record(outcome, None, Some(&message), rule.as_deref(), &by);
                         send(exception_packet(497, &message)).await?;
                         continue;
                     }
@@ -518,23 +523,25 @@ where
                 out.extend_from_slice(&data.expect("checked above"));
                 up.write_all(&out).await.map_err(|e| e.to_string())?;
                 if !insert {
-                    record("allowed", None, None, approved.as_deref());
+                    record("allowed", None, None, approved.rule.as_deref(), &approved.by);
                     continue;
                 }
                 let limit = agent
                     .max_rows_per_write
                     .unwrap_or(config.limits.max_rows_per_write);
                 match relay_insert(c, up, &mut frames, rev, limit).await {
-                    Insert::Sent(rows) => record("allowed", Some(rows), None, approved.as_deref()),
+                    Insert::Sent(rows) => {
+                        record("allowed", Some(rows), None, approved.rule.as_deref(), &approved.by)
+                    }
                     Insert::Abandoned { reason, next: after } => {
-                        record("failed", None, Some(reason), approved.as_deref());
+                        record("failed", None, Some(reason), approved.rule.as_deref(), &approved.by);
                         match after {
                             Some(p) => next = Some(p),
                             None => return Ok(None),
                         }
                     }
                     Insert::Stopped { outcome, message, rows } => {
-                        record(outcome, rows, Some(&message), approved.as_deref());
+                        record(outcome, rows, Some(&message), approved.rule.as_deref(), &approved.by);
                         return Ok(Some(message));
                     }
                 }

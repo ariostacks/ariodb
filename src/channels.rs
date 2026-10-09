@@ -613,7 +613,7 @@ fn html_escape(s: &str) -> String {
 /// Characters that reorder or hide text (bidirectional controls and
 /// zero-width characters) are written out as `<U+202E>` and the like, so
 /// the approver reads the statement that would run.
-fn shown_sql(sql: &str, max: usize) -> (String, bool) {
+pub(crate) fn shown_sql(sql: &str, max: usize) -> (String, bool) {
     let mut shown = String::with_capacity(sql.len());
     for c in sql.chars() {
         if matches!(

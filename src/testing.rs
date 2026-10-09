@@ -398,6 +398,8 @@ mod tests {
                 latency_ms: None,
                 engine: engine.into(),
                 database: String::new(),
+                // Who decided plays no part in a fixture or its replay.
+                decided_by: vec!["dashboard:root".into()],
             };
         let cases = [
             decision("SELECT * FROM orders", "allowed", Some("ask"), "postgres"),
@@ -457,6 +459,7 @@ mod tests {
             latency_ms: None,
             engine: "mysql".into(),
             database: "app".into(),
+            decided_by: vec!["model:openai/gpt-test".into()],
         };
         let cases = [
             decision("SELECT * FROM orders", "allowed", None),

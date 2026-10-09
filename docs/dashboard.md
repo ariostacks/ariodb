@@ -133,7 +133,17 @@ This is the decisions log in `<state dir>/ariodb.db`.
 
 Columns: when, agent, outcome, kind (ariodb's classification, such as
 `read` or `write`), the rule that decided (empty for the built-in policy),
-rows changed, latency in milliseconds, and the statement.
+who decided its approvals, rows changed, latency in milliseconds, and the
+statement.
+
+Who decided is recorded with the entry itself, in the order they decided,
+as the approvals list names them: `dashboard:<user>`, `sso:<user>`,
+`slack:<user>`, `webhook` (a signed link followed without signing in),
+`model:<provider>/<model>`, `plugin:<name>`, or `ariodb` (a request that
+could not be delivered). A model that could not be reached under
+`llm_fail_mode = "open"` is recorded as `ariodb:failed-open:model:...`,
+since the model never allowed the statement. A refused statement names
+who denied it. Entries written before ariodb recorded this show nobody.
 
 Filters, applied on the server:
 
@@ -142,6 +152,8 @@ Filters, applied on the server:
 | Agent | Exact agent name |
 | Outcome | `allowed`, `refused`, `rolled_back` or `failed` |
 | Rule | Exact rule name |
+| Decided by | Exactly this decider, such as `sso:pat@example.test` |
+| Decider kind | Decided by a person, a model or a plugin |
 | Text in statement | Any statement containing the text |
 | Latest | How many to show: 100, 200 (default), 500 or 1000 |
 

@@ -313,6 +313,7 @@ async fn handle(
         statements: HashMap::new(),
         next_statement: 1,
         audited: AtomicBool::new(false),
+        decided_by: Vec::new(),
     };
     let result = conn.run(rx, kill).await;
     reader_task.abort();
@@ -542,6 +543,9 @@ struct Conn {
     next_statement: u32,
     /// Whether the statement in hand has its decisions-log entry yet.
     audited: AtomicBool,
+    /// Who decided the approvals of the statement in hand; recorded with
+    /// its decisions-log entry. Cleared before each command.
+    decided_by: Vec<String>,
 }
 
 impl Conn {
@@ -618,6 +622,7 @@ impl Conn {
                 .await;
         };
         let body = &cmd[1..];
+        self.decided_by.clear();
         match code {
             w::COM_QUERY => self.query(body).await,
             w::COM_STMT_PREPARE => self.prepare(body).await,
@@ -780,6 +785,7 @@ impl Conn {
         r: &Refusal,
         started: Instant,
     ) -> Result<(), WireError> {
+        self.decided_by = r.decided_by.clone();
         self.audit(
             sql,
             statements,
@@ -921,10 +927,11 @@ impl Conn {
         sql: &str,
         statements: &[Statement],
         plan: Plan,
-        approved: Option<String>,
+        approved: gate::Approved,
         started: Instant,
     ) -> Result<(), WireError> {
         self.audited.store(false, SeqCst);
+        self.decided_by = approved.by.clone();
         let result = self
             .run_in_transaction(command, sql, statements, plan, approved, started)
             .await;
@@ -943,9 +950,10 @@ impl Conn {
         sql: &str,
         statements: &[Statement],
         plan: Plan,
-        approved: Option<String>,
+        approved: gate::Approved,
         started: Instant,
     ) -> Result<(), WireError> {
+        let approved = approved.rule;
         // A write's transaction starts in InnoDB at once, so InnoDB lists it
         // from the start and a fresh count of its rows always finds it.
         let begin = match plan {
@@ -1057,6 +1065,16 @@ impl Conn {
                 live: Some(&self.live),
             };
             gate::judge_write(&self.state, &ctx, statements, &[], rows, false).await
+        };
+        let judged = match judged {
+            Ok(after) => {
+                self.decided_by.extend(after);
+                Ok(())
+            }
+            Err(refusal) => {
+                self.decided_by.extend(refusal.decided_by.iter().cloned());
+                Err(refusal)
+            }
         };
         if let Err(refusal) = judged {
             self.audit(
@@ -1339,6 +1357,7 @@ impl Conn {
             latency_ms: Some(started.elapsed().as_millis() as u64),
             engine: "mysql",
             database: &self.database,
+            decided_by: &self.decided_by,
         });
     }
 }
