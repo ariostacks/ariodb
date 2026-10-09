@@ -10,11 +10,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 BIN=./target/debug/ariodb
-PG=ariodb-e2e-pg
-PORT=55433
-PROXY=6544
-DASH=8091
-MOCK=8092
+# Parallel runs (for example several worktrees) set E2E_OFFSET and E2E_NAME
+# so ports and container names do not collide.
+OFF=${E2E_OFFSET:-0}
+PG=ariodb-e2e-pg${E2E_NAME:+-$E2E_NAME}
+PORT=$((55433 + OFF))
+PROXY=$((6544 + OFF))
+DASH=$((8091 + OFF))
+MOCK=$((8092 + OFF))
 WORK=$(mktemp -d)
 trap 'kill $SERVE_PID $MOCK_PID 2>/dev/null || true; docker rm -f $PG >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 python3 -I "$(dirname "$0")/mock_services.py" $MOCK "$WORK/mock.log" &

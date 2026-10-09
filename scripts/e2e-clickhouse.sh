@@ -6,12 +6,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 BIN=./target/debug/ariodb
-CH=ariodb-e2e-ch
+OFF=${E2E_OFFSET:-0}
+CH=ariodb-e2e-ch${E2E_NAME:+-$E2E_NAME}
 IMAGE=${CH_IMAGE:-clickhouse/clickhouse-server:24.10-alpine}
-CH_HTTP=18123
-CH_NATIVE=19000
-PROXY_HTTP=8125
-PROXY_NATIVE=9011
+CH_HTTP=$((18123 + OFF))
+CH_NATIVE=$((19000 + OFF))
+PROXY_HTTP=$((8125 + OFF))
+PROXY_NATIVE=$((9011 + OFF))
 WORK=$(mktemp -d)
 SERVE_PID=""
 trap 'kill $SERVE_PID 2>/dev/null || true; docker rm -f $CH >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
