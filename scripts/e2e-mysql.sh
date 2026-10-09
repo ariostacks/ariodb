@@ -148,6 +148,17 @@ access = "read_only"
 tables = ["unused"]
 token_env = "E2E_PGONLY_TOKEN"
 
+# Every table, which still leaves out ariodb's own and the server's.
+[[agents]]
+name = "wide-agent"
+access = "read_only"
+tables = ["unused"]
+token_env = "E2E_WIDE_TOKEN"
+
+[agents.mysql]
+access = "read_write"
+tables = ["*"]
+
 [[approvers]]
 name = "ops"
 type = "dashboard"
@@ -167,7 +178,8 @@ reason = "marked for a human"
 EOF
 export E2E_MY_PASSWORD=gw-local-test-only E2E_AGENT_TOKEN=agent-token-test-only
 export E2E_BOT_TOKEN=bot-token-test-only E2E_PGONLY_TOKEN=pgonly-token-test-only
-T=$E2E_AGENT_TOKEN; B=$E2E_BOT_TOKEN
+export E2E_WIDE_TOKEN=wide-token-test-only
+T=$E2E_AGENT_TOKEN; B=$E2E_BOT_TOKEN; W=$E2E_WIDE_TOKEN
 CFG=(--config "$WORK/ariodb.toml")
 
 start_ariodb() {
@@ -240,10 +252,42 @@ expect "and changed nothing" "0" "$(q "SELECT COUNT(*) FROM orders WHERE status 
 expect "nor did the trigger" "0" "$(q "SELECT COUNT(*) FROM order_log")"
 expect_not "a small triggered write commits" "ERROR" "$(agent coding-agent $T "UPDATE orders SET status = 'audited' WHERE id <= 5")"
 expect "with its trigger's rows" "15" "$(q "SELECT COUNT(*) FROM order_log")"
+# ariodb counts rows with its own SELECT on the agent's session, so the
+# agent's session settings must not be able to blind it.
+expect "a session row limit does not hide a trigger's rows" "would change 120 rows" "$(raw coding-agent $T "Q:SET sql_select_limit = 0" "Q:UPDATE orders SET status = 'audited' WHERE id BETWEEN 31 AND 60")"
+expect "nor do the session's character sets" "would change 120 rows" "$(raw coding-agent $T "Q:SET character_set_connection = utf32, character_set_results = utf32" "Q:UPDATE orders SET status = 'audited' WHERE id BETWEEN 31 AND 60")"
+# A client reading innodb_trx more often than every 100 ms stops InnoDB
+# refreshing it; ariodb must notice, not count from a stale list.
+python3 -c "print('SELECT COUNT(*) FROM information_schema.innodb_trx; DO SLEEP(0.02);' * 200)" > "$WORK/poll.sql"
+docker cp "$WORK/poll.sql" "$MY:/tmp/poll.sql" >/dev/null
+docker exec "$MY" sh -c "$CLIENT -h127.0.0.1 -uroot -plocal-test-only-pw -N < /tmp/poll.sql > /dev/null 2>&1" & POLLER=$!
+sleep 1
+expect "a client keeping InnoDB's transaction list stale cannot hide them" "stayed stale" "$(raw coding-agent $T "Q:UPDATE orders SET status = 'audited' WHERE id BETWEEN 31 AND 60")"
+wait $POLLER || true
+expect "none of those changed anything" "15" "$(q "SELECT COUNT(*) FROM order_log")"
+expect_not "and writes count again once the list is fresh" "ERROR" "$(raw coding-agent $T "Q:UPDATE orders SET status = 'audited' WHERE id = 31")"
+expect "with the trigger's rows" "18" "$(q "SELECT COUNT(*) FROM order_log")"
+case "$IMAGE" in
+  *mariadb*)
+    OUT=$(raw coding-agent $T "Q:INSERT INTO customers (id, name) VALUES (900, 'x'), (1, 'dup') RETURNING id")
+    expect "a failed INSERT ... RETURNING reports its error" "Duplicate entry" "$OUT"
+    expect_not "and not the rows it rolled back" "ROW 900" "$OUT"
+    ;;
+esac
+expect "an agent with every table still cannot write ariodb's tag table" "belongs to ariodb or to the server" "$(raw wide-agent $W "Q:INSERT INTO ariodb.session_tags (session, agent) VALUES ('s-0000000000', 'support-bot')")"
+expect "nor read other sessions' statements" "belongs to ariodb or to the server" "$(raw wide-agent $W "Q:SELECT info FROM information_schema.processlist")"
+expect "nor InnoDB's transaction list" "belongs to ariodb or to the server" "$(raw wide-agent $W "Q:SELECT COUNT(*) FROM information_schema.innodb_trx")"
+expect "but it reads every other table" "not-a-real-secret" "$(raw wide-agent $W "Q:SELECT note FROM secrets")"
 expect "two statements in one query refused" "one statement at a time" "$(raw coding-agent $T "Q:SELECT 1; DELETE FROM orders WHERE id = 1")"
 expect "LOAD DATA LOCAL refused" "LOAD reads a file" "$(agent coding-agent $T "LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE orders" "${PLAIN[@]}" --local-infile=1)"
 expect "rules apply to MySQL" "marked statements are refused on MySQL" "$(agent coding-agent $T "SELECT 'blocked-marker' FROM orders LIMIT 1")"
 expect "KILL of another agent's connection refused" "unknown thread id" "$(agent support-bot $B "KILL QUERY 1")"
+MODE=$(admin -N -e "SELECT @@GLOBAL.sql_mode")
+admin -e "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ANSI_QUOTES,NO_BACKSLASH_ESCAPES')"
+OUT=$(raw coding-agent $T "Q:SELECT @@sql_mode" "Q:SET sql_select_limit = 0" "R" "Q:SELECT DATABASE(), @@sql_select_limit > 0, @@sql_mode LIKE '%ANSI_QUOTES%' LIMIT 1")
+admin -e "SET GLOBAL sql_mode = '$MODE'"
+expect_not "quoting modes in the server's sql_mode are removed for agents" "NO_BACKSLASH_ESCAPES" "$OUT"
+expect "and set up again after COM_RESET_CONNECTION" "ROW app | 1 | 0" "$OUT"
 expect "the connection keeps working after a refusal" "ROW 1000" "$(raw coding-agent $T "Q:SELECT * FROM secrets" "Q:SELECT COUNT(*) FROM orders")"
 
 echo "prepared statements"

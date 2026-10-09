@@ -8,6 +8,7 @@ Actions: Q:<sql>           COM_QUERY
          P:<sql>           COM_STMT_PREPARE (the statement becomes "current")
          X[:<param>...]    COM_STMT_EXECUTE the current statement with string parameters
          C                 COM_STMT_CLOSE the current statement
+         R                 COM_RESET_CONNECTION
          CANCEL:<secs>:<sql>  COM_QUERY, then KILL QUERY it from a second connection
 Prints one line per reply: OK <rows>, ROW <values>, ERROR <code> <message>,
 PREPARED <params>, ID <connection id>.
@@ -194,6 +195,9 @@ for action in actions:
         read_result(conn, binary=True)
     elif kind == "C":
         conn.command(b"\x19" + struct.pack("<I", current or 0))
+    elif kind == "R":
+        conn.command(b"\x1f")
+        read_result(conn, binary=False)
     elif kind == "CANCEL":
         delay, _, sql = rest.partition(":")
         conn.command(b"\x03" + sql.encode())

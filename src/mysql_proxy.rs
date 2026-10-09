@@ -41,7 +41,9 @@ const MAX_HELD: usize = 64 << 20;
 /// when nobody has read it for 100 ms. ariodb spaces its own reads further
 /// apart than that, so each one sees the transaction as it is now.
 const TRX_CACHE_IDLE: Duration = Duration::from_millis(110);
-const TRX_ROWS_SQL: &str = "SELECT trx_rows_modified FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID()";
+/// How many reads of `innodb_trx` ariodb tries before it gives up on
+/// counting a write's rows and rolls the write back.
+const TRX_TRIES: usize = 5;
 
 /// Errors for refused statements: access denied, as MySQL reports it.
 const ER_REFUSED: u16 = 1142;
@@ -53,6 +55,9 @@ const ER_NET_PACKET_TOO_LARGE: u16 = 1153;
 const ER_SECURE_TRANSPORT_REQUIRED: u16 = 3159;
 const ER_HANDSHAKE_ERROR: u16 = 1043;
 const ER_UNKNOWN_ERROR: u16 = 1105;
+const ER_QUERY_INTERRUPTED: u16 = 1317;
+/// A missing global privilege, here PROCESS.
+const ER_SPECIFIC_ACCESS_DENIED: u16 = 1227;
 
 /// Shared by every MySQL connection.
 struct Shared {
@@ -158,7 +163,7 @@ fn host_of(addr: &str) -> String {
 /// thinks they mean.
 async fn prepare_session(up: &mut Upstream, config: &Config) -> Result<(), String> {
     let mode = up
-        .query("SELECT @@SESSION.sql_mode")
+        .query("SELECT @@SESSION.sql_mode LIMIT 1")
         .await?
         .map_err(|e| format!("cannot read sql_mode: {}", e.message))?;
     let current = mode
@@ -307,6 +312,7 @@ async fn handle(
         running,
         statements: HashMap::new(),
         next_statement: 1,
+        audited: AtomicBool::new(false),
     };
     let result = conn.run(rx, kill).await;
     reader_task.abort();
@@ -534,6 +540,8 @@ struct Conn {
     /// The agent's prepared statement ids, mapped to the server's.
     statements: HashMap<u32, Prepared>,
     next_statement: u32,
+    /// Whether the statement in hand has its decisions-log entry yet.
+    audited: AtomicBool,
 }
 
 impl Conn {
@@ -746,6 +754,16 @@ impl Conn {
     fn classify(&self, sql: &str) -> Result<Vec<Statement>, String> {
         let mut statements = crate::mysql_sql::classify(sql).map_err(|e| e.to_string())?;
         crate::mysql_sql::scope_to_database(&mut statements, &self.database);
+        let tag_table = self.state.config().mysql.tag_table.clone();
+        let reserved = statements
+            .iter()
+            .flat_map(|s| &s.tables)
+            .find(|t| reserved_table(t, &tag_table, &self.database));
+        if let Some(t) = reserved {
+            return Err(format!(
+                "agents may not use table '{t}': it belongs to ariodb or to the server"
+            ));
+        }
         match statements.len() {
             0 => Err("the query was empty".to_string()),
             1 => Ok(statements),
@@ -895,7 +913,8 @@ impl Conn {
             .await
     }
 
-    /// Run one allowed statement in ariodb's own transaction.
+    /// Run one allowed statement in ariodb's own transaction. If either
+    /// connection breaks first, the decisions log still hears of it.
     async fn run_statement(
         &mut self,
         command: &[u8],
@@ -905,9 +924,33 @@ impl Conn {
         approved: Option<String>,
         started: Instant,
     ) -> Result<(), WireError> {
+        self.audited.store(false, SeqCst);
+        let result = self
+            .run_in_transaction(command, sql, statements, plan, approved, started)
+            .await;
+        if let Err(e) = &result
+            && !self.audited.load(SeqCst)
+        {
+            let why = format!("the statement did not finish: {e}");
+            self.audit(sql, statements, "failed", None, Some(&why), None, started);
+        }
+        result
+    }
+
+    async fn run_in_transaction(
+        &mut self,
+        command: &[u8],
+        sql: &str,
+        statements: &[Statement],
+        plan: Plan,
+        approved: Option<String>,
+        started: Instant,
+    ) -> Result<(), WireError> {
+        // A write's transaction starts in InnoDB at once, so InnoDB lists it
+        // from the start and a fresh count of its rows always finds it.
         let begin = match plan {
             Plan::Read => "START TRANSACTION READ ONLY",
-            Plan::Write => "START TRANSACTION",
+            Plan::Write => "START TRANSACTION WITH CONSISTENT SNAPSHOT",
         };
         if let Err(e) = self.up.query(begin).await? {
             self.audit(
@@ -967,8 +1010,11 @@ impl Conn {
                 None,
                 started,
             );
-            for p in &r.held {
-                self.out.physical(p).await?;
+            // A read's reply, error included, has already gone to the agent.
+            // A failed write's rows (INSERT ... RETURNING) were rolled back,
+            // so the agent hears only the error.
+            if plan == Plan::Write {
+                self.out.server_error(e).await?;
             }
             return Ok(());
         }
@@ -986,7 +1032,23 @@ impl Conn {
             return Ok(());
         }
 
-        let rows = self.rows_changed(r.reported).await?;
+        let rows = match self.rows_changed(r.reported).await? {
+            Ok(rows) => rows,
+            Err(why) => {
+                let why = format!("rolled back: {why}");
+                self.audit(
+                    sql,
+                    statements,
+                    "rolled_back",
+                    None,
+                    Some(&why),
+                    None,
+                    started,
+                );
+                self.end(false).await?;
+                return self.out.error(ER_REFUSED, "42000", &why).await;
+            }
+        };
         let judged = {
             let ctx = Ctx {
                 agent: &self.agent,
@@ -997,7 +1059,6 @@ impl Conn {
             gate::judge_write(&self.state, &ctx, statements, &[], rows, false).await
         };
         if let Err(refusal) = judged {
-            self.end(false).await?;
             self.audit(
                 sql,
                 statements,
@@ -1007,7 +1068,24 @@ impl Conn {
                 refusal.rule.as_deref(),
                 started,
             );
+            self.end(false).await?;
             return self.out.error(ER_REFUSED, "42000", &refusal.message).await;
+        }
+        // KILL QUERY from the agent's other connection may arrive after the
+        // statement itself finished; the agent asked for it not to happen.
+        if self.live.cancelled.load(SeqCst) {
+            let why = "rolled back: the agent cancelled the statement";
+            self.audit(
+                sql,
+                statements,
+                "rolled_back",
+                Some(rows),
+                Some(why),
+                None,
+                started,
+            );
+            self.end(false).await?;
+            return self.out.error(ER_QUERY_INTERRUPTED, "70100", why).await;
         }
         if let Err(e) = self.up.query("COMMIT").await? {
             self.audit(
@@ -1019,6 +1097,9 @@ impl Conn {
                 None,
                 started,
             );
+            // Whatever is left open must not be committed by the next
+            // statement's START TRANSACTION.
+            self.end(false).await?;
             return self.out.server_error(&e).await;
         }
         self.audit(
@@ -1083,55 +1164,77 @@ impl Conn {
         Ok(r)
     }
 
+    /// End ariodb's transaction. A ROLLBACK that fails is fatal: the write
+    /// would otherwise stay open until the next START TRANSACTION commits
+    /// it. Dropping the connection makes the server roll it back.
     async fn end(&mut self, commit: bool) -> Result<(), WireError> {
-        let _ = self
-            .up
-            .query(if commit { "COMMIT" } else { "ROLLBACK" })
-            .await?;
-        Ok(())
+        let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+        match self.up.query(sql).await? {
+            Err(e) if !commit => Err(WireError::Protocol(format!(
+                "ROLLBACK failed ({}), so ariodb closed the connection to roll back",
+                e.message
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// The rows a write changed: what the OK packets said, raised to
     /// InnoDB's count for the transaction (which includes rows changed by
-    /// triggers and cascades), less ariodb's own tag row.
-    async fn rows_changed(&mut self, reported: u64) -> Result<u64, WireError> {
+    /// triggers and cascades), less ariodb's own tag row. `Err` when the
+    /// count cannot be had, and the write must be rolled back.
+    ///
+    /// Another client reading `innodb_trx` at least every 100 ms keeps
+    /// InnoDB's cache from ever refreshing, and a stale count would miss
+    /// rows. So each read names itself with a random marker and counts only
+    /// if InnoDB shows that very read as the transaction's current
+    /// statement. The values are compared on the server and digits read
+    /// without NULs, so the agent's character_set_results and
+    /// sql_select_limit cannot spoil the answer.
+    async fn rows_changed(&mut self, reported: u64) -> Result<Result<u64, String>, WireError> {
         let tag = self.tagging as u64;
-        // A count below this predates the statement: a stale cache.
-        let at_least = tag + (reported > 0) as u64;
         let mut last_read = self.shared.trx_read.lock().await;
-        let mut counted = None;
-        for _ in 0..3 {
+        for _ in 0..TRX_TRIES {
             if let Some(t) = *last_read {
                 let wait = TRX_CACHE_IDLE.saturating_sub(t.elapsed());
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
             }
-            let result = self.up.query(TRX_ROWS_SQL).await?;
+            let sql = trx_rows_sql(&format!("{:016x}", rand::random::<u64>()));
+            let result = self.up.query(&sql).await?;
             *last_read = Some(Instant::now());
-            match result {
-                Err(e) => {
+            let rows = match result {
+                Ok(rows) => rows,
+                Err(e) if e.code == ER_SPECIFIC_ACCESS_DENIED => {
                     if !self.shared.warned_no_trx.swap(true, SeqCst) {
                         eprintln!(
                             "ariodb: cannot read information_schema.innodb_trx ({}); MySQL writes are judged by the rows the server reports, which leave out triggers. Grant the PROCESS privilege to [mysql] user",
                             e.message
                         );
                     }
-                    break;
+                    return Ok(Ok(reported));
                 }
-                Ok(rows) => {
-                    counted = rows
-                        .rows
-                        .first()
-                        .and_then(|r| r.first().cloned().flatten())
-                        .and_then(|v| v.parse::<u64>().ok());
-                    if counted.is_some_and(|n| n >= at_least) {
-                        break;
-                    }
+                Err(e) => {
+                    return Ok(Err(format!(
+                        "cannot count the rows it changed: {}",
+                        e.message
+                    )));
                 }
+            };
+            let number = |i: usize| {
+                let v = rows.rows.first()?.get(i)?.as_ref()?;
+                v.replace('\0', "").trim().parse::<u64>().ok()
+            };
+            if number(1) == Some(1) {
+                return Ok(match number(0) {
+                    Some(n) => Ok(reported.max(n.saturating_sub(tag))),
+                    None => Err("cannot count the rows it changed: InnoDB gave no number".into()),
+                });
             }
         }
-        Ok(reported.max(counted.unwrap_or(0).saturating_sub(tag)))
+        Ok(Err(
+            "cannot count the rows it changed: InnoDB's transaction list (information_schema.innodb_trx) stayed stale, as it does while another client reads it more often than every 100 ms".into(),
+        ))
     }
 
     async fn kill(&mut self, sql: &str, kill: Kill, started: Instant) -> Result<(), WireError> {
@@ -1215,6 +1318,7 @@ impl Conn {
         rule: Option<&str>,
         started: Instant,
     ) {
+        self.audited.store(true, SeqCst);
         let tables = gate::tables(statements);
         let kind =
             if statements.is_empty() && sql.trim_start().to_ascii_lowercase().starts_with("kill") {
@@ -1246,6 +1350,34 @@ struct Relayed {
     failed: Option<ServerError>,
     infile: bool,
     too_big: bool,
+}
+
+/// The query that reads this transaction's row count from InnoDB. Its
+/// second column is 1 only when InnoDB's list is fresh: the transaction's
+/// current statement is this very query, which `marker` makes unique.
+/// LIMIT 1 overrides the agent's sql_select_limit.
+fn trx_rows_sql(marker: &str) -> String {
+    format!(
+        "SELECT trx_rows_modified, INSTR(trx_query, 'ariodb-count-{marker}') > 0 FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID() LIMIT 1"
+    )
+}
+
+/// Tables no agent may use, whatever its `tables` say (even "*"): ariodb's
+/// tag table, where a forged row would credit changes to another session in
+/// the journal; the views the gateway's PROCESS privilege opens, which show
+/// other sessions' statements and InnoDB's transaction list (whose readers
+/// can stop it refreshing); and the server's own schemas.
+fn reserved_table(table: &str, tag_table: &str, database: &str) -> bool {
+    let table = table.to_lowercase();
+    let tag = tag_table.to_lowercase();
+    let local = format!("{}.", database.to_lowercase());
+    table == tag
+        || tag.strip_prefix(&local) == Some(table.as_str())
+        || table == "information_schema.processlist"
+        || table.starts_with("information_schema.innodb_")
+        || ["mysql.", "sys.", "performance_schema."]
+            .iter()
+            .any(|s| table.starts_with(s))
 }
 
 /// `KILL [QUERY | CONNECTION] <id>`, which ariodb answers itself: ids are
@@ -1340,6 +1472,42 @@ mod tests {
         assert_eq!(host_of("db.internal:3306"), "db.internal");
         assert_eq!(host_of("[::1]:3306"), "::1");
         assert_eq!(host_of("127.0.0.1:3306"), "127.0.0.1");
+    }
+
+    #[test]
+    fn reserved_tables_are_out_of_reach() {
+        let r = |t: &str| reserved_table(t, "ariodb.session_tags", "app");
+        assert!(r("ariodb.session_tags"));
+        assert!(r("ARIODB.Session_Tags"));
+        assert!(r("information_schema.processlist"));
+        assert!(r("information_schema.innodb_trx"));
+        assert!(r("information_schema.innodb_lock_waits"));
+        assert!(r("performance_schema.threads"));
+        assert!(r("sys.session"));
+        assert!(r("mysql.user"));
+        assert!(!r("orders"));
+        assert!(!r("other.session_tags"));
+        assert!(!r("information_schema.tables"));
+        // A tag table in the agents' own database is named without it.
+        assert!(reserved_table("session_tags", "app.session_tags", "app"));
+        assert!(reserved_table("session_tags", "session_tags", "app"));
+        assert!(!reserved_table(
+            "session_tags",
+            "ariodb.session_tags",
+            "app"
+        ));
+    }
+
+    #[test]
+    fn row_counts_prove_they_are_fresh() {
+        let sql = trx_rows_sql("00ff");
+        // The marker the server looks for is in the query itself, so only
+        // a list made while this query runs can match it.
+        assert!(sql.contains("INSTR(trx_query, 'ariodb-count-00ff')"));
+        // An explicit LIMIT beats the agent's sql_select_limit.
+        assert!(sql.ends_with("LIMIT 1"));
+        let statements = crate::mysql_sql::classify(&sql).unwrap();
+        assert_eq!(statements.len(), 1);
     }
 
     #[test]
