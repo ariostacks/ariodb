@@ -776,7 +776,7 @@ fn param(col: &Column, cell: &Option<Cell>) -> Result<Value, String> {
     let text = match cell {
         None => return Ok(Value::NULL),
         Some(Cell::Unchanged { .. }) => {
-            return Err(format!("the binlog did not carry {} in full", col.name));
+            return Err(format!("the journal could not record {} in full", col.name));
         }
         Some(Cell::Text(t)) => t,
     };

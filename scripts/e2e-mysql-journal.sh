@@ -114,6 +114,8 @@ CREATE TABLE kinds (
 -- mysql_common misreads negative TIME(2) values with a fraction.
 CREATE TABLE clock (id INT PRIMARY KEY, span TIME(2));
 INSERT INTO clock VALUES (1, '-01:00:00.50');
+CREATE TABLE shifty (id INT PRIMARY KEY, a VARCHAR(20), b VARCHAR(20));
+INSERT INTO shifty VALUES (1, 'a1', 'b1');
 CREATE TABLE notes (
   id INT PRIMARY KEY,
   customer_id INT NOT NULL,
@@ -171,7 +173,7 @@ token_env = "E2E_AGENT_TOKEN"
 
 [agents.mysql]
 access = "read_write"
-tables = ["customers", "orders", "items", "kinds", "notes", "clock"]
+tables = ["customers", "orders", "items", "kinds", "notes", "clock", "shifty"]
 EOF
 export E2E_MYSQL_PASSWORD=gateway-test-only-pw E2E_MYSQL_JOURNAL_PASSWORD=journal-test-only-pw
 export E2E_AGENT_TOKEN=agent-token-test-only
@@ -380,6 +382,23 @@ wait_for $S6
 pass "changes made while the journal was down are recorded on restart"
 [ "$(wc -l < "$WORK/state/mysql-journal.jsonl")" -eq $((LINES + 1)) ] && pass "and nothing is recorded twice" || fail "journal lines repeated"
 refute "the journal reports no errors" "MySQL journal:" "$(cat "$WORK/serve.log")"
+
+echo "a table that changes shape while the journal is down"
+kill "$SERVE_PID"; wait "$SERVE_PID" 2>/dev/null || true; SERVE_PID=""
+S13=s-000000160d
+agent $S13 "UPDATE shifty SET a = 'a2' WHERE id = 1"
+root shop -e "ALTER TABLE shifty ADD COLUMN z VARCHAR(20) NOT NULL DEFAULT 'zz' AFTER id"
+$BIN "${CFG[@]}" serve >"$WORK/serve.log" 2>&1 &
+SERVE_PID=$!
+wait_for $S13
+OUT=$(ario undo --session $S13 || true)
+case "$IMAGE" in
+  # binlog_row_metadata = FULL: the binlog names the columns.
+  mariadb*) expect "named columns are matched by name" "restore shop.shifty row (1)" "$OUT"
+     refute "and are not a conflict" "conflict" "$OUT" ;;
+  *) expect "unnamed columns of a changed table are not guessed at" "cannot undo: shop.shifty" "$OUT"
+     expect "and the journal says why" "has changed shape" "$(cat "$WORK/serve.log")" ;;
+esac
 
 echo "a binlog that starts again"
 kill "$SERVE_PID"; wait "$SERVE_PID" 2>/dev/null || true; SERVE_PID=""

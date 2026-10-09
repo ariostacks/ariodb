@@ -76,6 +76,9 @@ pub struct TableShape {
     pub schema: String,
     pub table: String,
     pub columns: Vec<ColumnShape>,
+    /// The binlog does not name the columns and the table has changed shape
+    /// since, so they are recorded as `@1`, `@2`, ... and undo refuses them.
+    pub unnamed: bool,
 }
 
 /// Whether text in this character set is recorded as text.
@@ -118,21 +121,26 @@ pub fn shape(tme: &TableMapEvent<'_>, info: &[InfoColumn]) -> TableShape {
         }
     }
     let names_from_binlog = names.len() == count;
+    let types: Vec<Option<ColumnType>> = (0..count)
+        .map(|i| tme.get_column_type(i).ok().flatten())
+        .collect();
+    // Without names, columns are matched to information_schema by position,
+    // which is only right if the table still has the same columns: a column
+    // added or dropped since would shift every value to another column.
+    let by_position = !names_from_binlog && same_columns(&types, info);
     let (mut enums, mut sets) = (enum_members.into_iter(), set_members.into_iter());
     let mut columns = Vec::with_capacity(count);
-    for i in 0..count {
-        let ty = tme.get_column_type(i).ok().flatten();
-        let name = if let Some(n) = names.get(i).filter(|_| names_from_binlog) {
-            n.clone()
+    for (i, &ty) in types.iter().enumerate() {
+        let name = if names_from_binlog {
+            names[i].clone()
+        } else if by_position {
+            info[i].name.clone()
         } else {
-            info.get(i)
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| format!("@{}", i + 1))
+            format!("@{}", i + 1)
         };
-        // Match by name when the binlog names columns; otherwise by position.
         let found = if names_from_binlog {
             info.iter().find(|c| c.name == name)
-        } else if info.len() == count {
+        } else if by_position {
             info.get(i)
         } else {
             None
@@ -176,7 +184,56 @@ pub fn shape(tme: &TableMapEvent<'_>, info: &[InfoColumn]) -> TableShape {
         schema: tme.database_name().to_string(),
         table: tme.table_name().to_string(),
         columns,
+        unnamed: !names_from_binlog && !by_position,
     }
+}
+
+/// Could these binlog column types be the table's columns now, in order?
+/// Only types that clearly differ count: strings, blobs and the like are
+/// all one kind here, as servers map them in more ways than are worth
+/// listing.
+pub fn same_columns(types: &[Option<ColumnType>], info: &[InfoColumn]) -> bool {
+    types.len() == info.len()
+        && types
+            .iter()
+            .zip(info)
+            .all(|(ty, c)| ty.is_none_or(|ty| kind_of_type(ty) == kind_of_data_type(&c.data_type)))
+}
+
+fn kind_of_type(ty: ColumnType) -> Option<&'static str> {
+    use ColumnType::*;
+    Some(match ty {
+        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
+        | MYSQL_TYPE_LONGLONG => "integer",
+        MYSQL_TYPE_FLOAT => "float",
+        MYSQL_TYPE_DOUBLE => "double",
+        MYSQL_TYPE_NEWDECIMAL | MYSQL_TYPE_DECIMAL => "decimal",
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => "date",
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => "datetime",
+        MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => "timestamp",
+        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => "time",
+        MYSQL_TYPE_YEAR => "year",
+        MYSQL_TYPE_BIT => "bit",
+        MYSQL_TYPE_JSON => "json",
+        _ => return None,
+    })
+}
+
+fn kind_of_data_type(data_type: &str) -> Option<&'static str> {
+    Some(match data_type {
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => "integer",
+        "float" => "float",
+        "double" | "real" => "double",
+        "decimal" | "numeric" => "decimal",
+        "date" => "date",
+        "datetime" => "datetime",
+        "timestamp" => "timestamp",
+        "time" => "time",
+        "year" => "year",
+        "bit" => "bit",
+        "json" => "json",
+        _ => return None,
+    })
 }
 
 /// Types that hold text without a character set in `information_schema`
@@ -792,6 +849,42 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn columns_match_by_position_only_when_the_table_is_unchanged() {
+        use ColumnType::*;
+        let info = |cols: &[(&str, &str)]| -> Vec<InfoColumn> {
+            cols.iter()
+                .map(|(n, t)| InfoColumn {
+                    name: n.to_string(),
+                    data_type: t.to_string(),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let types = [
+            Some(MYSQL_TYPE_LONG),
+            Some(MYSQL_TYPE_VARCHAR),
+            Some(MYSQL_TYPE_DATETIME2),
+        ];
+        let now = info(&[("id", "int"), ("name", "varchar"), ("at", "datetime")]);
+        assert!(same_columns(&types, &now));
+        // MariaDB's JSON is longtext; blobs and strings are one kind.
+        let blob = info(&[("id", "bigint"), ("doc", "longtext"), ("at", "datetime")]);
+        assert!(same_columns(&types, &blob));
+        // A column added or dropped since.
+        let added = info(&[
+            ("id", "int"),
+            ("z", "varchar"),
+            ("name", "varchar"),
+            ("at", "datetime"),
+        ]);
+        assert!(!same_columns(&types, &added));
+        assert!(!same_columns(&types, &now[..2]));
+        // The same number of columns, moved about.
+        let moved = info(&[("id", "int"), ("at", "datetime"), ("name", "varchar")]);
+        assert!(!same_columns(&types, &moved));
     }
 
     #[test]

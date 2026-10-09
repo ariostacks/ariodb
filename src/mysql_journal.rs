@@ -612,6 +612,7 @@ impl<'a> Reader<'a> {
     async fn follow(&mut self) -> Result<(), String> {
         let mut lookup = connect(self.config).await?;
         let mariadb = is_mariadb(&mut lookup).await;
+        drop_torn_line(&self.path)?;
         self.last_lsn = read_all(self.config)?.last().map(|r| r.lsn).unwrap_or(0);
         let start = match load_position(self.config)? {
             Some(p) => p,
@@ -803,7 +804,16 @@ impl<'a> Reader<'a> {
                 }
                 if let std::collections::hash_map::Entry::Vacant(e) = self.shapes.entry(table_id) {
                     let info = columns_of(lookup, &db, &table).await?;
-                    e.insert(mysql_binlog::shape(tme, &info));
+                    let shape = mysql_binlog::shape(tme, &info);
+                    if shape.unnamed {
+                        report(
+                            self.last_error,
+                            format!(
+                                "{db}.{table} has changed shape since changes the journal is reading now, and the binlog does not name columns (binlog_row_metadata is not FULL), so they are recorded without column names and undo will refuse them"
+                            ),
+                        );
+                    }
+                    e.insert(shape);
                 }
                 let shape = &self.shapes[&table_id];
                 let changes = mysql_binlog::changes(&rows, tme, shape)?;
@@ -908,6 +918,28 @@ impl<'a> Reader<'a> {
             }
         }
     }
+}
+
+/// Cut off a last line left half-written by a crash or a full disk, which
+/// would otherwise stop every later read of the journal. Its transaction's
+/// position was never saved, so it is read again.
+fn drop_torn_line(path: &Path) -> Result<(), String> {
+    let Ok(bytes) = fs::read(path) else {
+        return Ok(());
+    };
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return Ok(());
+    }
+    let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let err = |e: std::io::Error| format!("cannot repair {}: {e}", path.display());
+    let file = OpenOptions::new().write(true).open(path).map_err(err)?;
+    file.set_len(keep as u64).map_err(err)?;
+    file.sync_all().map_err(err)?;
+    eprintln!(
+        "ariodb: MySQL journal: dropped a half-written last line from {}; its transaction will be read again",
+        path.display()
+    );
+    Ok(())
 }
 
 fn starts_with_word(sql: &str, word: &str) -> bool {
@@ -1262,6 +1294,22 @@ tables = ["customers"]
         let p: Position = serde_json::from_str(r#"{"file":"binlog.000001","pos":4}"#).unwrap();
         assert_eq!(p.base, 0);
         assert!(!serde_json::to_string(&p).unwrap().contains("base"));
+    }
+
+    #[test]
+    fn a_half_written_last_line_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("ariodb-torn-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mysql-journal.jsonl");
+        fs::write(&path, "{\"a\":1}\n{\"b\":").unwrap();
+        drop_torn_line(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
+        drop_torn_line(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
+        fs::write(&path, "{\"b\":").unwrap();
+        drop_torn_line(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
