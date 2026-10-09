@@ -1,9 +1,12 @@
 # Database compatibility
 
-What ariodb guarantees depends on what the database can do. Run
-`ariodb doctor` against your own database: it checks each login and the
-journal, and ends with what works there. Every check is read-only or runs in
-a transaction that is rolled back.
+What ariodb guarantees depends on what the database can do. This page
+lists the Postgres versions and Postgres-compatible databases that have been
+tested, the managed services expected to work, and what
+`write_check = "reported"` gives up. It is for operators choosing where to
+put ariodb. Run `ariodb doctor` against your own database: it checks each
+login and the journal, and ends with what works there. Every check is
+read-only or runs in a transaction that is rolled back.
 
 Tested on 9 October 2026 with `scripts/e2e.sh` (130 checks) and
 `scripts/e2e-compat.sh` (17 checks).
@@ -88,3 +91,10 @@ after-write rules over `effects.rows`. Not seen: rows changed by triggers,
 cascades and functions, and the tables they touch. Use it only where
 `measured` cannot work, and keep the database role's grants tight, since
 they are the backstop for what parsing cannot see.
+
+## Next
+
+- [Postgres](postgres.md): roles, privileges and logical replication.
+- [Installation](installation.md): building and running ariodb.
+- [CLI](cli.md): `ariodb doctor` and `ariodb setup`.
+- [Troubleshooting](troubleshooting.md): when `doctor` reports a failure.

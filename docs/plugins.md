@@ -11,6 +11,10 @@ plugin can do any of four things:
 | `notifier` | Hear about approvals, refusals, rollbacks and undos |
 | `audit_sink` | Receive every entry of the decisions log, in order, at least once |
 
+This page covers configuring plugins, their lifecycle, the protocol, the
+commands for trying them out, and their security. It is for operators
+adding approvers or notifiers and for anyone writing a plugin.
+
 Plugins can be written in anything that reads and writes lines. Two
 examples come with ariodb:
 
@@ -192,8 +196,10 @@ statement is denied.
 
 - The time limit is the approver's `timeout_seconds`, or
   `[approvals] timeout_seconds` (90 by default).
-- If the agent disconnects or cancels while it waits, the request is
-  withdrawn and the plugin is told with a `cancel` notification:
+- If an agent on the Postgres proxy disconnects or cancels while it
+  waits, the request is withdrawn and the plugin is told with a `cancel`
+  notification (ClickHouse requests and `ariodb mcp` tool calls are not
+  withdrawn this way):
   `{"jsonrpc":"2.0","method":"cancel","params":{"id":8,"approval_id":"a-3f9c0e1b2a4d","reason":"the agent disconnected"}}`.
   Any later answer is ignored.
 - Every outcome is recorded with people's and models' decisions (`ariodb
@@ -355,3 +361,10 @@ variables, described at the top of the file.
   logged or shown.
 - The plugin's environment is limited to what the config names. It does not
   inherit ariodb's database URLs, agent tokens or API keys.
+
+## Next
+
+- [Approvals](approvals.md): plugin approvers alongside the other kinds.
+- [Rules](rules.md): reading plugin facts as `plugin.<name>.<key>`.
+- [Architecture](architecture.md#plugins): how ariodb supervises plugins.
+- [Security model](security-model.md): why plugins are trusted code.
