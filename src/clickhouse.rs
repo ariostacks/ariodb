@@ -40,14 +40,30 @@ pub async fn serve_http(state: Arc<State>) -> Result<(), String> {
         "ariodb: ClickHouse HTTP clients can connect to {scheme}://{}",
         config.clickhouse.http_listen
     );
-    match acceptor {
-        Some(acceptor) => {
-            let tls = crate::tls::TlsListener::new(listener, acceptor).map_err(|e| e.to_string())?;
-            axum::serve(tls, app).await.map_err(|e| e.to_string())
-        }
-        None => axum::serve(listener, app).await.map_err(|e| e.to_string()),
-    }
+    let limiter = crate::limits::Limiter::new("ClickHouse HTTP", &config.limits);
+    let agents = limiter.clone();
+    let app = app.layer(axum::Extension(agents));
+    crate::limits::serve_http(
+        listener,
+        acceptor,
+        app,
+        limiter,
+        move || state.config().limits.clone(),
+        || {
+            ch_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                TOO_MANY_CONNECTIONS,
+                "too many connections open to ariodb's ClickHouse HTTP listener; try again shortly",
+            )
+        },
+    )
+    .await;
+    Ok(())
 }
+
+/// ClickHouse's TOO_MANY_SIMULTANEOUS_QUERIES, which its clients know to
+/// retry.
+pub const TOO_MANY_CONNECTIONS: u32 = 202;
 
 /// The agent as ClickHouse sees it: its ClickHouse access and tables.
 pub fn clickhouse_agent(config: &Config, name: &str, token: &str) -> Result<Agent, &'static str> {
@@ -84,6 +100,7 @@ fn param_allowed(name: &str) -> bool {
 
 async fn query(
     AxState(state): AxState<Arc<State>>,
+    axum::Extension(limiter): axum::Extension<Arc<crate::limits::Limiter>>,
     method: Method,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
@@ -124,6 +141,20 @@ async fn query(
     let agent = match clickhouse_agent(&config, &user, &token) {
         Ok(a) => a,
         Err(why) => return ch_error(StatusCode::UNAUTHORIZED, 516, &format!("{user}: {why}")),
+    };
+    // Over HTTP, an agent's connections are its requests in flight.
+    let _claim = match limiter.claim(&agent.name) {
+        Ok(c) => c,
+        Err(limit) => {
+            return ch_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                TOO_MANY_CONNECTIONS,
+                &format!(
+                    "agent '{}' has {limit} requests in flight, the most it may ([limits] max_connections_per_agent)",
+                    agent.name
+                ),
+            );
+        }
     };
 
     // The statement: the `query` parameter, or else the whole body.

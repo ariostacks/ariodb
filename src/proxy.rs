@@ -11,14 +11,16 @@
 
 use crate::classify::{self, Statement};
 use crate::exec::{Session, Sink};
+use crate::config::Agent;
 use crate::gate::{self, Plan, Refusal, State};
+use crate::limits::{Admission, Limiter};
 use crate::tls::Io;
 use crate::upstream::{self, Target};
 use crate::wire::{self, Frame, WireError};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Our cancel key to: where the real query runs, its cancel key, and the
@@ -54,98 +56,67 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
     );
 
     let cancels: CancelMap = Arc::new(Mutex::new(HashMap::new()));
+    let limiter = Limiter::new("Postgres proxy", &config.limits);
     loop {
-        let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
-        let _ = socket.set_nodelay(true);
+        let (socket, _) = crate::limits::accept(&listener, &limiter).await;
+        limiter.update(&state.config().limits);
+        let admission = limiter.admit();
+        if let Admission::Drop = admission {
+            continue;
+        }
+        let timeout = limiter.handshake_timeout();
         let (state, acceptor, cancels) = (state.clone(), acceptor.clone(), cancels.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle(socket, state, acceptor, cancels).await {
+            if let Err(e) = handle(socket, state, acceptor, cancels, admission, timeout).await {
                 eprintln!("ariodb: connection ended: {e}");
             }
         });
     }
 }
 
+/// Postgres's own message for a server with no room for another client.
+const TOO_MANY_CLIENTS: &str = "sorry, too many clients already";
+
 async fn handle(
-    mut socket: TcpStream,
+    socket: TcpStream,
     state: Arc<State>,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     cancels: CancelMap,
+    admission: Admission,
+    timeout: Duration,
 ) -> Result<(), String> {
-    let config = state.config();
     let e = |e: WireError| e.to_string();
-
-    // Startup: TLS negotiation first, on the raw socket. Clients may ask
-    // for GSS encryption, then TLS, before the real startup message.
-    let mut first = match wire::read_startup(&mut socket).await {
-        Ok(f) => f,
-        // Port checks and load balancers connect and hang up; that is not an error.
-        Err(WireError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-        Err(err) => return Err(err.to_string()),
-    };
-    loop {
-        match first.code {
-            wire::GSSENC_REQUEST => {}
-            wire::SSL_REQUEST if acceptor.is_none() => {}
-            _ => break,
-        }
-        wire::write_all(&mut socket, b"N").await.map_err(e)?;
-        first = wire::read_startup(&mut socket).await.map_err(e)?;
-    }
-    let (mut io, first): (Box<dyn Io>, wire::Startup) = if first.code == wire::SSL_REQUEST {
-        let acc = acceptor.expect("checked above");
-        wire::write_all(&mut socket, b"S").await.map_err(e)?;
-        let tls = acc.accept(socket).await.map_err(|e| format!("TLS: {e}"))?;
-        let mut io: Box<dyn Io> = Box::new(tls);
-        let next = wire::read_startup(&mut io).await.map_err(e)?;
-        (io, next)
-    } else {
-        if config.proxy.require_tls && first.code == wire::PROTOCOL_3 {
-            let msg =
-                wire::fatal_response("28000", "ariodb requires TLS; connect with sslmode=require");
-            let _ = wire::write_all(&mut socket, &msg).await;
+    let mut slot = match admission {
+        Admission::Admitted(slot) => slot,
+        // Over the limit: answer the startup with 53300 (cancel requests
+        // are still served). Quietly: refusals are logged per burst.
+        _ => {
+            let greeting = greet(socket, &state, acceptor, &cancels, true);
+            let _ = tokio::time::timeout(timeout, greeting).await;
             return Ok(());
         }
-        (Box::new(socket), first)
     };
-    if first.code == wire::CANCEL_REQUEST {
-        handle_cancel(&first.body, &cancels).await;
-        return Ok(());
-    }
-    if first.code != wire::PROTOCOL_3 {
-        let msg = wire::fatal_response("08P01", "unsupported protocol version");
-        let _ = wire::write_all(&mut io, &msg).await;
-        return Ok(());
-    }
-
-    let params = wire::startup_params(&first.body);
-    let user = params
-        .iter()
-        .find(|(k, _)| k == "user")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-
-    // Agents prove who they are with their token, sent as the password.
-    wire::write_all(&mut io, &wire::auth_cleartext())
-        .await
-        .map_err(e)?;
-    let reply = wire::read_frame(&mut io).await.map_err(e)?;
-    let given = reply
-        .body
-        .strip_suffix(&[0])
-        .unwrap_or(&reply.body)
-        .to_vec();
-    let agent = config.agent(&user).cloned();
-    let token = agent.as_ref().and_then(|a| config.agent_token(a));
-    let ok = reply.tag == b'p' && token.is_some_and(|t| constant_time_eq(t.as_bytes(), &given));
-    let Some(agent) = agent.filter(|_| ok) else {
+    // TLS, startup and the token must all arrive in time; a client that
+    // stops part way is cut off.
+    let greeting = greet(socket, &state, acceptor, &cancels, false);
+    let (mut io, agent) = match tokio::time::timeout(timeout, greeting).await {
+        Err(_) => return Ok(()),
+        Ok(greeted) => match greeted? {
+            Some(logged_in) => logged_in,
+            None => return Ok(()),
+        },
+    };
+    if let Err(limit) = slot.agent(&agent.name) {
         let msg = wire::fatal_response(
-            "28P01",
-            &format!("password authentication failed for user \"{user}\""),
+            "53300",
+            &format!(
+                "ariodb: too many connections for agent \"{}\": it has {limit} open, the most it may",
+                agent.name
+            ),
         );
         let _ = wire::write_all(&mut io, &msg).await;
         return Ok(());
-    };
+    }
 
     let mut session = match Session::open(state.clone(), agent).await {
         Ok(s) => s,
@@ -213,6 +184,101 @@ async fn handle(
     reader_task.abort();
     cancels.lock().expect("cancel map").remove(&our_key);
     result
+}
+
+/// A new connection up to a logged-in agent: TLS, the startup message and
+/// the token. `None` when the client went away or was refused (and told
+/// why), or the connection was a cancel request. With `over_limit`, the
+/// listener is full, and the client is told so once its startup arrives.
+async fn greet(
+    mut socket: TcpStream,
+    state: &State,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    cancels: &CancelMap,
+    over_limit: bool,
+) -> Result<Option<(Box<dyn Io>, Agent)>, String> {
+    let config = state.config();
+    let e = |e: WireError| e.to_string();
+
+    // Startup: TLS negotiation first, on the raw socket. Clients may ask
+    // for GSS encryption, then TLS, before the real startup message.
+    let mut first = match wire::read_startup(&mut socket).await {
+        Ok(f) => f,
+        // Port checks and load balancers connect and hang up; that is not an error.
+        Err(WireError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    loop {
+        match first.code {
+            wire::GSSENC_REQUEST => {}
+            wire::SSL_REQUEST if acceptor.is_none() => {}
+            _ => break,
+        }
+        wire::write_all(&mut socket, b"N").await.map_err(e)?;
+        first = wire::read_startup(&mut socket).await.map_err(e)?;
+    }
+    let (mut io, first): (Box<dyn Io>, wire::Startup) = if first.code == wire::SSL_REQUEST {
+        let acc = acceptor.expect("checked above");
+        wire::write_all(&mut socket, b"S").await.map_err(e)?;
+        let tls = acc.accept(socket).await.map_err(|e| format!("TLS: {e}"))?;
+        let mut io: Box<dyn Io> = Box::new(tls);
+        let next = wire::read_startup(&mut io).await.map_err(e)?;
+        (io, next)
+    } else {
+        if config.proxy.require_tls && first.code == wire::PROTOCOL_3 {
+            let msg =
+                wire::fatal_response("28000", "ariodb requires TLS; connect with sslmode=require");
+            let _ = wire::write_all(&mut socket, &msg).await;
+            return Ok(None);
+        }
+        (Box::new(socket), first)
+    };
+    if first.code == wire::CANCEL_REQUEST {
+        handle_cancel(&first.body, cancels).await;
+        return Ok(None);
+    }
+    if first.code != wire::PROTOCOL_3 {
+        let msg = wire::fatal_response("08P01", "unsupported protocol version");
+        let _ = wire::write_all(&mut io, &msg).await;
+        return Ok(None);
+    }
+    if over_limit {
+        let msg = wire::fatal_response("53300", &format!("ariodb: {TOO_MANY_CLIENTS}"));
+        let _ = wire::write_all(&mut io, &msg).await;
+        return Ok(None);
+    }
+
+    let params = wire::startup_params(&first.body);
+    let user = params
+        .iter()
+        .find(|(k, _)| k == "user")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    // Agents prove who they are with their token, sent as the password.
+    wire::write_all(&mut io, &wire::auth_cleartext())
+        .await
+        .map_err(e)?;
+    let reply = wire::read_frame(&mut io).await.map_err(e)?;
+    let given = reply
+        .body
+        .strip_suffix(&[0])
+        .unwrap_or(&reply.body)
+        .to_vec();
+    let agent = config.agent(&user).cloned();
+    let token = agent.as_ref().and_then(|a| config.agent_token(a));
+    let ok = reply.tag == b'p' && token.is_some_and(|t| constant_time_eq(t.as_bytes(), &given));
+    let Some(agent) = agent.filter(|_| ok) else {
+        let msg = wire::fatal_response(
+            "28P01",
+            &format!("password authentication failed for user \"{user}\""),
+        );
+        let _ = wire::write_all(&mut io, &msg).await;
+        return Ok(None);
+    };
+    Ok(Some((io, agent)))
 }
 
 async fn handle_cancel(body: &[u8], cancels: &CancelMap) {
@@ -955,6 +1021,134 @@ struct Exchange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Send a startup message and, when asked, the token; return the
+    /// SQLSTATE and message of the error that ends the connection.
+    async fn startup(port: u16, user: &str, token: Option<&str>) -> (String, String) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(&wire::startup_message(&[("user", user), ("database", "app")]))
+            .await
+            .unwrap();
+        loop {
+            let f = match wire::read_frame(&mut s).await {
+                Ok(f) => f,
+                Err(e) => return ("closed".into(), e.to_string()),
+            };
+            match f.tag {
+                b'R' => {
+                    let t = token.expect("asked for the token");
+                    let mut body = t.as_bytes().to_vec();
+                    body.push(0);
+                    s.write_all(&wire::frame(b'p', &body)).await.unwrap();
+                }
+                b'E' => {
+                    let fields: Vec<&[u8]> = f.body.split(|b| *b == 0).collect();
+                    let field = |c: u8| {
+                        fields
+                            .iter()
+                            .find(|x| x.first() == Some(&c))
+                            .map(|x| String::from_utf8_lossy(&x[1..]).to_string())
+                            .unwrap_or_default()
+                    };
+                    return (field(b'C'), field(b'M'));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_limits_are_refused_with_53300() {
+        // A database that accepts connections and never answers, so a
+        // logged-in agent's session stays open, waiting for it.
+        let db = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let db_addr = db.local_addr().unwrap();
+        let _db = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = db.accept().await {
+                held.push(s);
+            }
+        });
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = std::env::temp_dir().join(format!("ariodb-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let toml = format!(
+            r#"
+            [database]
+            url = "postgres://gw:not-a-real-password@{db_addr}/app"
+            tls = "disable"
+            [limits]
+            max_connections = 2
+            max_connections_per_agent = 1
+            handshake_timeout_ms = 400
+            [proxy]
+            listen = "127.0.0.1:{port}"
+            [journal]
+            enabled = false
+            dir = "{dir}"
+            [dashboard]
+            listen = ""
+            [[agents]]
+            name = "bot"
+            access = "read_only"
+            tables = ["t"]
+            token_env = "ARIODB_LIMITS_TEST_TOKEN"
+            "#,
+            dir = dir.display(),
+        );
+        // SAFETY: no other test reads or writes this variable.
+        unsafe { std::env::set_var("ARIODB_LIMITS_TEST_TOKEN", "agent-token-local-test-only") };
+        let config = crate::config::Config::from_toml(&toml).unwrap();
+        let audit = Arc::new(crate::audit::AuditLog::open(&dir, &config.audit).unwrap());
+        let state = State::new(config, dir.join("ariodb.toml"), audit).unwrap();
+        let server = tokio::spawn(serve(state));
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let token = Some("agent-token-local-test-only");
+
+        // The agent's first connection logs in and waits on the database...
+        let first = tokio::spawn(startup(port, "bot", token));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // ...so its second is over its own limit.
+        let (code, message) = startup(port, "bot", token).await;
+        assert_eq!(code, "53300", "{message}");
+        assert!(message.contains("too many connections for agent \"bot\""), "{message}");
+
+        // A silent client takes the listener's last place, so the next
+        // client is refused once its startup arrives...
+        let mut silent = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (code, message) = startup(port, "bot", None).await;
+        assert_eq!(code, "53300", "{message}");
+        assert!(message.contains("too many clients"), "{message}");
+
+        // ...until the handshake timeout cuts the silent one off.
+        let started = Instant::now();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut buf))
+            .await
+            .expect("the silent client was not cut off");
+        assert!(matches!(n, Ok(0) | Err(_)), "{n:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A wrong token is still told so: the place is free again.
+        let (code, _) = startup(port, "bot", Some("wrong")).await;
+        assert_eq!(code, "28P01");
+
+        first.abort();
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn frame_of(raw: Bytes) -> Frame {
         Frame {

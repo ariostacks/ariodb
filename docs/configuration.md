@@ -190,6 +190,9 @@ ca_file = "/etc/ariodb/db-ca.pem"
 |---|---|---|---|
 | `max_rows_per_write` | integer | `500` | A write that changes more rows than this, counted across every table it touched (including through triggers and cascades), is rolled back. Must be at least 1. Agents can override it. |
 | `statement_timeout_ms` | integer | `5000` | Set as `SET LOCAL statement_timeout` at the start of every transaction ariodb runs for an agent. On ClickHouse it becomes `max_execution_time`, rounded up to whole seconds (at least 1). On Postgres, `0` means no timeout. |
+| `max_connections` | integer | `256` | The most connections each listener holds at once, logged in or not: the Postgres and MySQL listeners, the ClickHouse HTTP and native listeners, and the dashboard each have their own count. Must be at least 1. |
+| `max_connections_per_agent` | integer | `32` | The most connections one agent holds at once on each listener, counted once it has logged in. Over HTTP (ClickHouse), it counts the agent's requests in flight. Must be at least 1. |
+| `handshake_timeout_ms` | integer | `10000` | How long a new connection has to become a logged-in agent: the TLS handshake, the protocol's startup and the token. A connection still short of that is closed. On the HTTP listeners it is the time each request's headers have to arrive, and how long an idle kept-alive connection stays open. Must be at least 1. |
 
 The timeout covers the statement running in the database, not time spent
 waiting for an approval. On Postgres it is a default, not a ceiling: an
@@ -198,10 +201,35 @@ and lift it for that transaction. See
 [statement timeouts](postgres.md#statement-timeouts) for a rule that
 stops this.
 
+A client over `max_connections` or `max_connections_per_agent` is told so
+in its own protocol rather than cut off without a word:
+
+| Listener | Over `max_connections` | Over `max_connections_per_agent` |
+|---|---|---|
+| Postgres | `FATAL 53300 sorry, too many clients already`, once its startup message arrives (cancel requests are still served) | `FATAL 53300 too many connections for agent "<name>"` |
+| MySQL | Error 1040 (`08004`) in place of the handshake | Error 1203 (`42000`) after the login |
+| ClickHouse native | Exception code 202, in answer to the client's Hello | Exception code 202 |
+| ClickHouse HTTP | `503` with a ClickHouse-style exception (code 202) | `503`, code 202 |
+| Dashboard | `503` with `Retry-After: 5` | Does not apply |
+
+ariodb logs the first refusal of a burst, such as `ariodb: Postgres proxy:
+refusing new connections: 256 are open, the limit ([limits]
+max_connections)`, and no more until 10 seconds pass without one; the next
+burst's line says how many the previous one refused. At most 64 clients
+over the limit are answered at once; beyond that, new connections are
+closed at once. The three connection keys take effect for the next
+connection after a reload; connections already open keep their places.
+Size `max_connections` below the database's own connection limit, less
+what other clients need: each logged-in agent connection holds one
+database connection.
+
 ```toml
 [limits]
 max_rows_per_write = 500
 statement_timeout_ms = 5000
+max_connections = 256
+max_connections_per_agent = 32
+handshake_timeout_ms = 10000
 ```
 
 ## `[proxy]`

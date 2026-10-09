@@ -19,6 +19,7 @@
 use crate::classify::Statement;
 use crate::config::{Agent, Config};
 use crate::gate::{self, Ctx, Liveness, Plan, Refusal, State};
+use crate::limits::{Admission, Limiter, Slot};
 use crate::mysql_wire::{self as w, Seen, ServerError, Upstream, WireError};
 use crate::tls::Io;
 use std::collections::HashMap;
@@ -29,8 +30,6 @@ use tokio::io::{AsyncWriteExt, BufReader, BufWriter, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
-/// How long an agent has to log in.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest command ariodb reads from an agent.
 const MAX_COMMAND: usize = 16 << 20;
 /// The largest SQL text ariodb will judge, as for Postgres.
@@ -53,6 +52,10 @@ const ER_NO_SUCH_THREAD: u16 = 1094;
 const ER_UNKNOWN_STMT_HANDLER: u16 = 1243;
 const ER_NET_PACKET_TOO_LARGE: u16 = 1153;
 const ER_SECURE_TRANSPORT_REQUIRED: u16 = 3159;
+/// Too many connections: the listener is full.
+const ER_CON_COUNT_ERROR: u16 = 1040;
+/// One login (here, one agent) has too many connections.
+const ER_TOO_MANY_USER_CONNECTIONS: u16 = 1203;
 const ER_HANDSHAKE_ERROR: u16 = 1043;
 const ER_UNKNOWN_ERROR: u16 = 1105;
 const ER_QUERY_INTERRUPTED: u16 = 1317;
@@ -117,12 +120,31 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
         "ariodb: MySQL agents can connect to {}{tls_note}",
         config.mysql.listen
     );
+    let limiter = Limiter::new("MySQL proxy", &config.limits);
     loop {
-        let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
-        let _ = socket.set_nodelay(true);
+        let (mut socket, _) = crate::limits::accept(&listener, &limiter).await;
+        limiter.update(&state.config().limits);
+        let timeout = limiter.handshake_timeout();
+        let slot = match limiter.admit() {
+            Admission::Admitted(slot) => slot,
+            Admission::Refuse(refusing) => {
+                // As MySQL does: the error instead of the handshake.
+                tokio::spawn(async move {
+                    let p = w::err_packet(ER_CON_COUNT_ERROR, "08004", "ariodb: too many connections");
+                    let _ = tokio::time::timeout(timeout, async {
+                        let _ = w::write_packet(&mut socket, &mut 0, &p).await;
+                        let _ = socket.shutdown().await;
+                    })
+                    .await;
+                    drop(refusing);
+                });
+                continue;
+            }
+            Admission::Drop => continue,
+        };
         let (state, acceptor, shared) = (state.clone(), acceptor.clone(), shared.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle(socket, state, acceptor, shared).await {
+            if let Err(e) = handle(socket, state, acceptor, shared, slot, timeout).await {
                 eprintln!("ariodb: MySQL connection ended: {e}");
             }
         });
@@ -230,17 +252,18 @@ async fn handle(
     state: Arc<State>,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     shared: Arc<Shared>,
+    mut slot: Slot,
+    timeout: Duration,
 ) -> Result<(), String> {
     let id = shared.next_id.fetch_add(1, SeqCst);
-    let login =
-        match tokio::time::timeout(LOGIN_TIMEOUT, login(socket, &state, acceptor, id, &shared))
-            .await
-        {
-            Err(_) => return Ok(()), // too slow to log in
-            Ok(Err(e)) => return Err(e),
-            Ok(Ok(None)) => return Ok(()),
-            Ok(Ok(Some(l))) => l,
-        };
+    let login = match tokio::time::timeout(timeout, login(socket, &state, acceptor, id, &shared))
+        .await
+    {
+        Err(_) => return Ok(()), // too slow to log in
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Ok(Some(l))) => l,
+    };
     let LoggedIn {
         mut io,
         agent,
@@ -249,6 +272,15 @@ async fn handle(
         mut seq,
         sha2,
     } = login;
+    if let Err(limit) = slot.agent(&agent.name) {
+        let msg = format!(
+            "ariodb: agent '{}' already has {limit} connections open, the most it may",
+            agent.name
+        );
+        let p = w::err_packet(ER_TOO_MANY_USER_CONNECTIONS, "42000", &msg);
+        let _ = w::write_packet(&mut io, &mut seq, &p).await;
+        return Ok(());
+    }
     let config = state.config();
     let up =
         match connect_upstream(&config, caps & w::RELAYED_CAPS, w::safe_collation(charset)).await {

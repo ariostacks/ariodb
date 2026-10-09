@@ -18,6 +18,7 @@ use crate::chsql;
 use crate::clickhouse_blocks::{Frames, MAX_HELD, Problem, read_data};
 use crate::classify::Kind;
 use crate::gate::{self, Ctx, State};
+use crate::limits::{Admission, Limiter};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -59,18 +60,25 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
         config.clickhouse.native_listen
     );
     let acceptor = config.clickhouse_tls()?;
+    let limiter = Limiter::new("ClickHouse native", &config.limits);
     loop {
-        let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
-        let _ = socket.set_nodelay(true);
+        let (socket, _) = crate::limits::accept(&listener, &limiter).await;
+        limiter.update(&state.config().limits);
+        let admission = limiter.admit();
+        if let Admission::Drop = admission {
+            continue;
+        }
+        // TLS, the client's Hello and its login share one deadline.
+        let deadline = tokio::time::Instant::now() + limiter.handshake_timeout();
         let (state, acceptor) = (state.clone(), acceptor.clone());
         tokio::spawn(async move {
             let result = match acceptor {
                 // TLS only when configured, like ClickHouse's own secure port.
-                Some(acc) => match tokio::time::timeout(std::time::Duration::from_secs(10), acc.accept(socket)).await {
-                    Ok(Ok(tls)) => handle(tls, state).await,
+                Some(acc) => match tokio::time::timeout_at(deadline, acc.accept(socket)).await {
+                    Ok(Ok(tls)) => handle(tls, state, admission, deadline).await,
                     _ => Ok(()),
                 },
-                None => handle(socket, state).await,
+                None => handle(socket, state, admission, deadline).await,
             };
             if let Err(e) = result
                 && !e.contains("early eof")
@@ -157,6 +165,9 @@ pub(crate) fn put_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+/// The exception code for a connection over a limit; see clickhouse.rs.
+const TOO_MANY_CONNECTIONS: i32 = crate::clickhouse::TOO_MANY_CONNECTIONS as i32;
+
 /// A server Exception packet, as the client expects to read one.
 fn exception_packet(code: i32, message: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -182,7 +193,29 @@ struct Hello {
     password: String,
 }
 
-async fn handle<S>(socket: S, state: Arc<State>) -> Result<(), String>
+async fn read_hello<R: tokio::io::AsyncRead + Unpin>(c: &mut Rd<R>) -> Result<Hello, String> {
+    if c.varint().await? != 0 {
+        return Err("expected Hello".into());
+    }
+    // Nothing is known about the client yet, so its Hello may not make
+    // ariodb allocate much.
+    Ok(Hello {
+        client_name: c.short_string().await?,
+        major: c.varint().await?,
+        minor: c.varint().await?,
+        revision: c.varint().await?,
+        database: c.short_string().await?,
+        user: c.short_string().await?,
+        password: c.short_string().await?,
+    })
+}
+
+async fn handle<S>(
+    socket: S,
+    state: Arc<State>,
+    admission: Admission,
+    deadline: tokio::time::Instant,
+) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -194,20 +227,27 @@ where
         taken: Vec::new(),
     };
 
-    // 1. The client's Hello.
-    if c.varint().await? != 0 {
-        return Err("expected Hello".into());
-    }
-    // Nothing is known about the client yet, so its Hello may not make
-    // ariodb allocate much.
-    let mut hello = Hello {
-        client_name: c.short_string().await?,
-        major: c.varint().await?,
-        minor: c.varint().await?,
-        revision: c.varint().await?,
-        database: c.short_string().await?,
-        user: c.short_string().await?,
-        password: c.short_string().await?,
+    // 1. The client's Hello, in time. Over the limit, the client is told
+    // so in answer to it; quietly, as refusals are logged per burst.
+    let hello = tokio::time::timeout_at(deadline, read_hello(&mut c)).await;
+    let mut slot = match admission {
+        Admission::Admitted(slot) => slot,
+        _ => {
+            if let Ok(Ok(_)) = hello {
+                let refusal = exception_packet(TOO_MANY_CONNECTIONS, "too many connections");
+                let mut w = client_write.lock().await;
+                let _ = tokio::time::timeout_at(deadline, async {
+                    let _ = w.write_all(&refusal).await;
+                    let _ = w.shutdown().await;
+                })
+                .await;
+            }
+            return Ok(());
+        }
+    };
+    let mut hello = match hello {
+        Err(_) => return Ok(()), // too slow: cut off
+        Ok(hello) => hello?,
     };
     // Name the database even when the client does not, so ClickHouse
     // resolves table names in the database ariodb judges them in.
@@ -233,6 +273,14 @@ where
             return Ok(());
         }
     };
+    if let Err(limit) = slot.agent(&agent.name) {
+        let message = format!(
+            "agent '{}' already has {limit} connections open, the most it may",
+            agent.name
+        );
+        send(exception_packet(TOO_MANY_CONNECTIONS, &message)).await?;
+        return Ok(());
+    }
 
     // 2. Log in to ClickHouse at a revision both sides can share.
     let our_revision = hello.revision.min(MAX_REVISION);

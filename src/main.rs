@@ -14,6 +14,7 @@ mod exec;
 mod gate;
 mod doctor;
 mod journal;
+mod limits;
 mod llm;
 mod mysql_binlog;
 mod mysql_journal;

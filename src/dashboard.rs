@@ -57,12 +57,29 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
             )
         })?;
     println!("ariodb: dashboard at {}", config.dashboard.public_url);
-    axum::serve(
+    let limiter = crate::limits::Limiter::new("dashboard", &config.limits);
+    crate::limits::serve_http(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        None,
+        app,
+        limiter,
+        move || state.config().limits.clone(),
+        busy,
     )
-    .await
-    .map_err(|e| e.to_string())
+    .await;
+    Ok(())
+}
+
+/// The answer to a connection over `[limits] max_connections`.
+fn busy() -> Response {
+    let mut r = ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the dashboard has too many connections open; try again shortly".into(),
+    )
+    .into_response();
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+    r
 }
 
 pub fn router(state: Arc<State>) -> Router {

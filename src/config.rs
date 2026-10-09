@@ -323,6 +323,16 @@ pub enum WriteCheck {
 pub struct Limits {
     pub max_rows_per_write: u64,
     pub statement_timeout_ms: u64,
+    /// Connections each listener (the Postgres and MySQL proxies, the
+    /// ClickHouse HTTP and native listeners, the dashboard) holds at once,
+    /// logged in or not. See limits.rs.
+    pub max_connections: usize,
+    /// Connections one agent holds at once on each listener, counted once
+    /// it has logged in.
+    pub max_connections_per_agent: usize,
+    /// How long a new connection has for TLS, startup and logging in (for
+    /// HTTP, for each request's headers) before it is closed.
+    pub handshake_timeout_ms: u64,
 }
 
 impl Default for Limits {
@@ -330,6 +340,9 @@ impl Default for Limits {
         Limits {
             max_rows_per_write: 500,
             statement_timeout_ms: 5000,
+            max_connections: 256,
+            max_connections_per_agent: 32,
+            handshake_timeout_ms: 10_000,
         }
     }
 }
@@ -461,10 +474,20 @@ impl Config {
                 "database.url must start with postgres:// or postgresql://".to_string(),
             ));
         }
-        if self.limits.max_rows_per_write == 0 {
-            return Err(ConfigError::Problem(
-                "limits.max_rows_per_write must be at least 1".to_string(),
-            ));
+        for (key, value) in [
+            ("max_rows_per_write", self.limits.max_rows_per_write),
+            ("max_connections", self.limits.max_connections as u64),
+            (
+                "max_connections_per_agent",
+                self.limits.max_connections_per_agent as u64,
+            ),
+            ("handshake_timeout_ms", self.limits.handshake_timeout_ms),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Problem(format!(
+                    "limits.{key} must be at least 1"
+                )));
+            }
         }
         crate::rules::RuleSet::compile(&self.rules).map_err(ConfigError::Problem)?;
         crate::tunnels::validate(&self.tunnels).map_err(ConfigError::Problem)?;
@@ -831,6 +854,36 @@ mod tests {
             Config::from_toml(&text),
             Err(ConfigError::Problem(_))
         ));
+    }
+
+    #[test]
+    fn connection_limits_have_defaults_and_must_be_positive() {
+        let config = Config::from_toml(GOOD).unwrap();
+        assert_eq!(config.limits.max_connections, 256);
+        assert_eq!(config.limits.max_connections_per_agent, 32);
+        assert_eq!(config.limits.handshake_timeout_ms, 10_000);
+        let text = GOOD.replace(
+            "statement_timeout_ms = 5000",
+            "statement_timeout_ms = 5000\nmax_connections = 8\nmax_connections_per_agent = 2\nhandshake_timeout_ms = 1500",
+        );
+        let config = Config::from_toml(&text).unwrap();
+        assert_eq!(config.limits.max_connections, 8);
+        assert_eq!(config.limits.max_connections_per_agent, 2);
+        assert_eq!(config.limits.handshake_timeout_ms, 1500);
+        for key in [
+            "max_connections",
+            "max_connections_per_agent",
+            "handshake_timeout_ms",
+        ] {
+            let text = GOOD.replace(
+                "statement_timeout_ms = 5000",
+                &format!("statement_timeout_ms = 5000\n{key} = 0"),
+            );
+            match Config::from_toml(&text) {
+                Err(ConfigError::Problem(p)) => assert!(p.contains(key), "{p}"),
+                other => panic!("{key} = 0 was accepted: {other:?}"),
+            }
+        }
     }
 
     #[test]
