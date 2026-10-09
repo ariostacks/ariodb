@@ -88,12 +88,13 @@ error: cannot parse SQL: Error splitting: syntax error at or near "SELEC"
 ```
 
 It exits 0, or 1 if the SQL does not parse. `classify` reads Postgres SQL
-only; for ClickHouse, use `explain --engine clickhouse`.
+only; for ClickHouse and MySQL, use `explain --engine clickhouse` or
+`explain --engine mysql`.
 
 ## `ariodb explain`: what would happen to one statement
 
 ```bash
-ariodb explain --agent <name> [--engine postgres|clickhouse] "<sql>"
+ariodb explain --agent <name> [--engine postgres|clickhouse|mysql] "<sql>"
 ```
 
 Loads the config (`--config`, default `ariodb.toml`), then judges the
@@ -131,12 +132,31 @@ deny  (decided by: policy)  agent 'support-bot' is read only
   deny  (decided by: policy)  send one statement per request
   ```
 
+- **`--engine mysql`** judges MySQL and MariaDB SQL against the agent's
+  `[agents.mysql]` access, in `[mysql] database`:
+
+  ```text
+  $ ariodb explain --engine mysql --agent coding-agent "SELECT * FROM other.notes"
+  deny  (decided by: policy)  agent 'coding-agent' may not use table 'other.notes'
+
+  $ ariodb explain --engine mysql --agent coding-agent "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
+  deny  (decided by: policy)  agents may not read uncommitted data (READ UNCOMMITTED)
+
+  $ ariodb explain --engine mysql --agent support-bot "SELECT * FROM orders LOCK IN SHARE MODE"
+  deny  (decided by: policy)  agent 'support-bot' is read only
+  ```
+
+  It judges the SQL only. Three things the MySQL listener does itself are
+  not part of it: refusing a query with more than one statement, refusing
+  the [reserved tables](mysql.md#reserved-tables) to agents whose list is
+  `"*"`, and answering `KILL` for the agent's own connections (`explain`
+  shows `KILL` as refused by the policy).
+
   Any other `--engine` value is treated as `postgres`.
-  <!-- TODO: add --engine mysql once MySQL support is merged. -->
-- **The database** is the one in the `[database]` URL for Postgres, and
-  `default` for ClickHouse. `explain` has no option to change it; use a
-  [fixture](#fixture-format) with `sql.database` to test another
-  ClickHouse database.
+- **The database** is the one in the `[database]` URL for Postgres,
+  `default` for ClickHouse, and `[mysql] database` for MySQL. `explain`
+  has no option to change it; use a [fixture](#fixture-format) with
+  `sql.database` to test another ClickHouse or MySQL database.
 - **Several statements** in one Postgres string are judged together, as
   the proxy does: any deny refuses all of them, any `approve` holds all of
   them.
@@ -192,9 +212,9 @@ One fixture object, or an array of them, per `.json` file:
 |---|---|---|
 | `name` | no | Shown in the output. Default: `<file name> #<position>`. |
 | `action.agent` | yes | An agent name from the config. An unknown agent is a `deny` by `policy`. |
-| `action.engine` | no | `postgres` (default) or `clickhouse`. |
+| `action.engine` | no | `postgres` (default), `clickhouse` or `mysql`. |
 | `action.sql.statement` | yes | The SQL, as the agent would send it. |
-| `action.sql.database` | no | Default: the `[database]` URL's database, or `default` for ClickHouse. Rules see it as `sql.database`; ClickHouse table names are scoped to it. |
+| `action.sql.database` | no | Default: the `[database]` URL's database, `default` for ClickHouse, or `[mysql] database` for MySQL. Rules see it as `sql.database`; ClickHouse and MySQL table names are scoped to it. |
 | `match.verdict` | yes | `allow`, `deny` or `approve`. |
 | `match.rule` | no | If given, the deciding rule must match too: a rule name, or `policy` for the built-in policy. A plain allow has no deciding rule, so leave `rule` out for those unless an `allow` rule decides. |
 
@@ -277,7 +297,11 @@ How decisions become fixtures:
 | Held by an `approve` rule, whatever the approver then said | `approve`, that rule: the policy's job was to ask, and it should ask again |
 | Rolled back, failed at the database, or unsupported by the transport | Skipped: these depend on data or the protocol, not the policy |
 
-ClickHouse decisions keep `"engine": "clickhouse"` and their database.
+ClickHouse decisions keep `"engine": "clickhouse"` and their database,
+and MySQL decisions `"engine": "mysql"` and theirs. A few MySQL decisions
+come from the listener rather than the policy (a query with several
+statements, a reserved table, a cursor, `KILL`), so `ariodb test` may
+report them as drift; drop them from the exported file.
 So fewer fixtures than `--limit` is normal.
 
 A workflow that works:
@@ -386,8 +410,10 @@ out everything that depends on running it:
 - **The database itself.** Grants, `READ ONLY` enforcement, statement
   timeouts, constraint errors, and whether a table exists.
 - **The transport.** The 1 MiB message limit, reserved statement names,
-  and ClickHouse native-protocol `INSERT` (refused as unsupported, though
-  `explain` judges the SQL as an ordinary insert).
+  ClickHouse native-protocol `INSERT` (refused as unsupported, though
+  `explain` judges the SQL as an ordinary insert), and the MySQL
+  listener's own checks (one statement per query, reserved tables,
+  cursors, `KILL`).
 
 For those, test against a staging database through a running ariodb, and
 run [`ariodb doctor`](postgres.md#reading-ariodb-doctor) there.

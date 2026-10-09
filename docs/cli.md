@@ -56,12 +56,12 @@ first, and stops with exit code 1 if it does not load (2 for `test`). See
 | `classify` | no | no | no | no | no |
 | `explain` | yes | no | no | only if `[database] secret` is used | no |
 | `test` | yes | no | no | only if `[database] secret` is used | no |
-| `setup` | yes | yes, journal login | starts or reuses | no | no |
+| `setup` | yes | yes, journal login (and the MySQL journal login) | starts or reuses | MySQL: writes `mysql-binlog-position.json` | no |
 | `doctor` | yes | yes, every login | starts or reuses | only for secrets | no |
 | `serve` | yes | yes | starts its own | yes | starts all |
 | `mcp` | yes | yes | starts or reuses | yes | starts approvers and facts |
-| `sessions` | yes | no | no | reads `journal.jsonl` | no |
-| `undo` | yes | yes, admin login | starts or reuses | reads `journal.jsonl` | `--apply` starts them to notify |
+| `sessions` | yes | no | no | reads `journal.jsonl` and `mysql-journal.jsonl` | no |
+| `undo` | yes | yes, admin login (MySQL: the journal login) | starts or reuses | reads `journal.jsonl` or `mysql-journal.jsonl` | Postgres `--apply` starts them to notify |
 | `approvals`, `approve`, `deny` | yes | no | no | `ariodb.db` | no |
 | `audit`, `export-fixtures` | yes | no | no | `ariodb.db` | no |
 | `dashboard-password` | yes | no | no | `ariodb.db` | no |
@@ -140,9 +140,11 @@ error: cannot parse SQL: Error splitting: syntax error at or near "SELEC"
 ### `ariodb explain --agent <AGENT> [--engine <ENGINE>] <SQL>`
 
 Show what the built-in policy and the before-stage rules would decide for
-one agent, without running anything. `--engine` is `postgres` (default) or
-`clickhouse`; with `clickhouse`, the agent's `[agents.clickhouse]` access
-applies and the database is `default`.
+one agent, without running anything. `--engine` is `postgres` (default),
+`clickhouse` or `mysql`; with `clickhouse`, the agent's
+`[agents.clickhouse]` access applies and the database is `default`; with
+`mysql`, its `[agents.mysql]` access applies and the database is
+`[mysql] database`.
 
 ```text
 $ ariodb explain --agent coding-agent "SELECT email FROM customers"
@@ -153,6 +155,9 @@ deny  (decided by: policy)  destructive statements are never allowed for agents:
 
 $ ariodb explain --agent support-bot "UPDATE orders SET status = 'x' WHERE id = 1"
 deny  (decided by: policy)  agent 'support-bot' is read only
+
+$ ariodb explain --engine mysql --agent coding-agent "SELECT LOAD_FILE('/etc/passwd')"
+deny  (decided by: policy)  the function 'load_file' is never allowed for agents: it would get round ariodb's checks
 ```
 
 `decided by: policy` means the built-in policy; `-` means nothing objected.
@@ -205,8 +210,8 @@ wrote 143 fixtures to policy-fixtures/recorded.json
 
 Prepare the database for the journal. Run it once before the first `serve`,
 and again whenever you give an agent write access to a new table or
-upgrade to Postgres 18. It is safe to run repeatedly. It does nothing when
-`[journal] enabled = false`.
+upgrade to Postgres 18. It is safe to run repeatedly. Its Postgres steps
+are skipped when `[journal] enabled = false`; MySQL is described below.
 
 It connects with `ARIODB_JOURNAL_URL` (or the gateway URL), which must have
 the `REPLICATION` attribute and own the protected tables. It checks
@@ -224,6 +229,30 @@ ok   replication slot 'ariodb' is ready
 
 Failures stop at the first problem with exit 1; see
 [troubleshooting](troubleshooting.md#setup-failures).
+
+With `[mysql] listen` set and `[mysql] journal` on (the default), `setup`
+also prepares MySQL or MariaDB, as the `[mysql]` journal login: it checks
+the binlog settings, creates the tag table, records where the journal
+starts, and prints the grants both MySQL logins need (it does not run
+them). It runs after the Postgres steps, which are skipped when
+`[journal] enabled = false`.
+
+```text
+$ ariodb setup
+ok   the binlog is on
+ok   binlog_format is ROW
+ok   binlog_row_image is FULL
+warn binlog_row_metadata is MINIMAL; column names will come from information_schema, which is wrong if a table changes shape before the journal reads its changes. Set it to FULL
+ok   tag table ariodb.session_tags is ready
+ok   the journal will record changes from binlog.000003:158
+
+Grants ariodb needs (not run; run them as an administrator, with the right host instead of '%'):
+  ...
+```
+
+A binlog setting that must change stops it with exit 1, for example
+`error: binlog_format is MIXED; it must be ROW (start MariaDB with --binlog-format=ROW)`.
+See [MySQL and MariaDB](mysql.md#what-ariodb-setup-does).
 
 ### `ariodb doctor`
 
@@ -276,6 +305,35 @@ what works here
 error: some checks failed
 ```
 
+With `[mysql] listen` set, `doctor` also checks the MySQL gateway login
+and, with `[mysql] journal` on, the MySQL journal login. Their lines in
+`what works here` start `MySQL`. With `[proxy] listen = ""` and
+`[journal] enabled = false`, the Postgres checks are skipped.
+
+```text
+$ ariodb doctor
+mysql gateway: ariodb_gw@mysql.internal.example:3306/app
+  ok    connected over TLS
+  ok    MySQL 8.4.6
+  ok    table names are case-sensitive here, and no two tables differ only by case
+  ok    reads run in READ ONLY transactions, and the server enforces them
+  ok    writes can be tagged with their session for the journal
+  ok    writes are counted before commit, triggers and cascades included (a 1-row test write counted 1)
+  ok    every agent table exists and this login can see it
+
+mysql journal: ariodb_journal@mysql.internal.example:3306
+  ok    connected
+  ...
+
+what works here
+  yes  MySQL reads, forced read-only
+  yes  MySQL writes, checked before commit
+  yes  MySQL undo of agent sessions
+```
+
+Every MySQL line is explained in
+[MySQL and MariaDB](mysql.md#reading-ariodb-doctor).
+
 `ariodb serve` runs the same checks once at startup and logs a one-line
 summary (see [operations](operations.md#the-startup-summary)).
 
@@ -297,9 +355,13 @@ ariodb: reads yes; checked writes yes; undo yes
 
 It exits 1 if a tunnel does not come up, or if the Postgres proxy cannot
 start (for example `error: cannot listen on 0.0.0.0:6543: Address already
-in use (os error 98)`). A dashboard or ClickHouse listener that cannot
-start is logged (`ariodb: dashboard stopped: ...`) but does not stop
-`serve`. Run exactly one `serve` per journal slot; see
+in use (os error 98)`). A dashboard, ClickHouse or MySQL listener that
+cannot start is logged (`ariodb: dashboard stopped: ...`,
+`ariodb: MySQL proxy stopped: ...`) but does not stop `serve`. With
+`[mysql] listen` set, it also prints
+`ariodb: MySQL agents can connect to 0.0.0.0:3307 (TLS required)` and,
+with the MySQL journal on,
+`ariodb: MySQL journal is recording changes to /var/lib/ariodb/mysql-journal.jsonl, from binlog.000003:158`. Run exactly one `serve` per journal slot; see
 [operations](operations.md#high-availability).
 
 ### `ariodb mcp --agent <AGENT>`
@@ -331,8 +393,9 @@ Errors before the server starts: `error: unknown agent 'x'`,
 
 ### `ariodb sessions`
 
-List agent sessions that changed data, from `journal.jsonl`. Does not
-connect to the database.
+List agent sessions that changed data, from `journal.jsonl` and, for
+MySQL and MariaDB, `mysql-journal.jsonl`. Does not connect to the
+database.
 
 ```text
 $ ariodb sessions
@@ -377,7 +440,26 @@ Use --skip-conflicts to undo the rest.`, `error: some changes cannot be
 undone: ...`, `error: session 's-...' was already undone` or `error: no
 recorded changes for session 's-...'`.
 
-<!-- TODO: document undo of MySQL and MariaDB sessions once merged. -->
+**MySQL and MariaDB sessions.** When the session is in
+`mysql-journal.jsonl`, `undo` reverses it on the MySQL server instead,
+connecting as the `[mysql]` journal login (`journal_user`, or `user`), not
+`ARIODB_ADMIN_URL`. The plan and the errors read the same, with table
+names qualified by their database, and the plan can end with `warning:`
+lines for changes undo cannot see:
+
+```text
+$ ariodb undo --session s-0000001007
+undo plan for s-0000001007: 1 steps
+  re-insert deleted app.customers row (5)
+  warning: deletes on app.customers may have changed rows in app.notes (ON DELETE CASCADE); MySQL does not write those to the binlog, so undo cannot restore them
+
+nothing changed. Run again with --apply to undo.
+```
+
+A MySQL `undo --apply` does not start plugins, so notifier plugins do not
+hear about it; an undo from the dashboard notifies them for both engines.
+See [MySQL and MariaDB](mysql.md#undo) for what MySQL undo can and cannot
+reverse.
 
 ## Approvals
 

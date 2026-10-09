@@ -1,12 +1,13 @@
 # Database compatibility
 
 What ariodb guarantees depends on what the database can do. This page
-lists the Postgres versions and Postgres-compatible databases that have been
-tested, the managed services expected to work, and what
-`write_check = "reported"` gives up. It is for operators choosing where to
-put ariodb. Run `ariodb doctor` against your own database: it checks each
-login and the journal, and ends with what works there. Every check is
-read-only or runs in a transaction that is rolled back.
+lists the Postgres versions, Postgres-compatible databases and MySQL and
+MariaDB servers that have been tested, the managed services expected to
+work, and what `write_check = "reported"` gives up. It is for operators
+choosing where to put ariodb. Run `ariodb doctor` against your own
+database: it checks each login and the journal, and ends with what works
+there. Every check is read-only or runs in a transaction that is rolled
+back.
 
 Tested on 9 October 2026 with `scripts/e2e.sh` (130 checks) and
 `scripts/e2e-compat.sh` (17 checks).
@@ -25,6 +26,12 @@ Tested on 9 October 2026 with `scripts/e2e.sh` (130 checks) and
 | Supabase Postgres 17.6 image | yes | yes | yes | full suite |
 | YugabyteDB 2026.1 | yes | only with `write_check = "reported"` | no | compat suite |
 | CockroachDB 25.2 | yes | only with `write_check = "reported"` | no | compat suite |
+| MySQL 8.4 | yes | yes, weaker check (see notes) | yes | MySQL suites |
+| MariaDB 11.4 | yes | yes, weaker check (see notes) | yes | MySQL suites |
+
+The MySQL suites are `scripts/e2e-mysql.sh` (the MySQL listener) and
+`scripts/e2e-mysql-journal.sh` (setup, doctor, the binlog journal and
+undo), run against the `mysql:8.4` and `mariadb:11.4` images.
 
 Notes:
 
@@ -46,6 +53,21 @@ Notes:
   SQL-level logical decoding the journal reads, so undo is unavailable: set
   `[journal] enabled = false`. CockroachDB also has no
   `pg_logical_emit_message`, so with the journal on, every write fails.
+- **MySQL 8.4 and MariaDB 11.4**: reads run in `READ ONLY` transactions,
+  enforced by the server. Writes are checked before commit by the number
+  of rows they changed: the larger of the server's reported count and
+  InnoDB's count for the transaction, which includes rows changed by
+  triggers and cascades if the gateway login has `PROCESS`. This is weaker
+  than on Postgres: only the tables the statement names are checked
+  against the agent's list, so tables reached through triggers are not,
+  and only InnoDB tables can be rolled back. On MySQL, the statement
+  timeout covers `SELECT` only. Undo reads the binlog and needs
+  `binlog_format = ROW` and `binlog_row_image = FULL`;
+  `binlog_row_metadata = FULL` is recommended. MySQL 8.4's defaults work;
+  MariaDB must be started with `--log-bin --binlog-format=ROW`. Undo
+  cannot restore rows changed by foreign-key `ON DELETE` and `ON UPDATE`
+  actions, which neither server writes to the binlog. See
+  [MySQL and MariaDB](mysql.md).
 
 ## Expected to work, untested
 
@@ -95,6 +117,8 @@ they are the backstop for what parsing cannot see.
 ## Next
 
 - [Postgres](postgres.md): roles, privileges and logical replication.
+- [MySQL and MariaDB](mysql.md): logins, binlog settings and the weaker
+  write check.
 - [Installation](installation.md): building and running ariodb.
 - [CLI](cli.md): `ariodb doctor` and `ariodb setup`.
 - [Troubleshooting](troubleshooting.md): when `doctor` reports a failure.

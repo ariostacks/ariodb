@@ -28,6 +28,7 @@ License.
 1. [Installation](installation.md): building, running as a service,
    containers, upgrading.
 2. [Postgres](postgres.md): roles, privileges, TLS and logical replication.
+   For MySQL or MariaDB, [MySQL and MariaDB](mysql.md) instead.
 3. [Compatibility](compatibility.md): which databases and managed services
    support what.
 4. [Configuration](configuration.md): every section of `ariodb.toml`.
@@ -71,10 +72,11 @@ License.
   journal and what the proxy supports.
 - [ClickHouse](clickhouse.md): the HTTP and native-protocol proxies and
   their limits.
+- [MySQL and MariaDB](mysql.md): connecting agents, the gateway and
+  journal logins, binlog settings, how writes are counted, undo and its
+  limits.
 - [Compatibility](compatibility.md): tested databases, managed services,
   and `write_check = "reported"`.
-
-<!-- TODO: MySQL and MariaDB page, once merged. -->
 
 **Deciding what agents may do**
 

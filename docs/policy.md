@@ -7,7 +7,7 @@ never allow what the policy refuses. This page sets out exactly what the
 policy decides, statement kind by statement kind, and why: what each
 access level may do, which statements are always refused, which session
 settings are allowed, which functions are blocked, how the table
-allow-list matches names, and how ClickHouse differs. It is for anyone
+allow-list matches names, and how ClickHouse and MySQL differ. It is for anyone
 writing an agent's configuration or reviewing what an agent can do.
 
 ## Where the policy sits
@@ -278,7 +278,9 @@ For a checked write, the tables are checked once before it runs (the
 names in the SQL) and again before commit, against every table the
 transaction actually changed. A trigger or cascade that writes to a table
 not on the list rolls the write back. See
-[Postgres](postgres.md#how-writes-are-checked-before-commit).
+[Postgres](postgres.md#how-writes-are-checked-before-commit). On MySQL and
+MariaDB only the first check is possible; see
+[below](#mysql-and-mariadb).
 
 ### The catalogue
 
@@ -351,7 +353,101 @@ Also:
 - **The Postgres blocked-function list does not apply**; the table
   function rules above do that job.
 
-<!-- TODO: add MySQL and MariaDB statement kinds and allow-list rules once MySQL support is merged. -->
+## MySQL and MariaDB
+
+MySQL SQL is read by a lexer that follows the server's own rules for
+comments, strings and quoted names, together with a full SQL parser; if
+the two disagree about the quoting or the comments in a statement, it is
+refused. The same access levels, allow-lists and kinds apply, judged
+against the agent's `[agents.mysql]` block. See
+[MySQL and MariaDB](mysql.md#how-statements-are-judged) for how statements
+are run and what the listener itself refuses.
+
+| Kind | MySQL and MariaDB statements |
+|---|---|
+| `read` | `SELECT`, `WITH ... SELECT`, `TABLE`, `VALUES`, `SELECT ... INTO @variable`; `DESCRIBE`, `DESC` and `EXPLAIN` of a table; `EXPLAIN` of a statement (it only plans); `EXPLAIN ANALYZE` and MariaDB's `ANALYZE` of a read; the `SHOW` forms listed below |
+| `write` | `INSERT` (with `ON DUPLICATE KEY UPDATE` or `SELECT`), `REPLACE`, `UPDATE` and `DELETE` with a `WHERE` (multi-table forms included), `WITH ... UPDATE` or `DELETE`, `SELECT ... FOR UPDATE`, `FOR SHARE` and `LOCK IN SHARE MODE`, `EXPLAIN ANALYZE` or `ANALYZE` of a write |
+| `destructive` | `DROP`, `TRUNCATE`, `UPDATE` or `DELETE` without `WHERE` (also inside `EXPLAIN ANALYZE`) |
+| `schema_change` | `CREATE` (temporary tables included), `ALTER`, `RENAME`, `GRANT`, `REVOKE`, `ANALYZE TABLE`, `OPTIMIZE`, `REPAIR`, `CHECK`, `CHECKSUM` |
+| `transaction` | `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `XA`, `LOCK TABLES`, `UNLOCK TABLES`, `SET autocommit = 0` |
+| `session` | `SET` (only the allowed variables below); `USE` and `KILL`, which the policy refuses and the listener handles itself |
+| `unknown` | `CALL`, `DO`, `HANDLER`, `LOAD`, SQL-level `PREPARE`, `EXECUTE` and `DEALLOCATE`, `BEGIN NOT ATOMIC`, `SET STATEMENT ... FOR`, `SELECT ... INTO OUTFILE` or `DUMPFILE` (or `INTO` anything but user variables), executable comments (`/*! ... */`, `/*M! ... */`), `SET_VAR`, `MAX_EXECUTION_TIME` and `RESOURCE_GROUP` hints, `EXPLAIN FOR CONNECTION`, server control (`FLUSH`, `RESET`, `PURGE`, `CHANGE`, `STOP`, `START` other than a transaction, `INSTALL`, `UNINSTALL`, `SHUTDOWN`, `RESTART`, `CLONE`, `LOCK INSTANCE` and the like), any other `SHOW`, `sql_mode` or character-set changes that would alter quoting |
+
+SQL that ariodb cannot read at all (an unknown first word, a NUL byte, a
+name with a dot inside its backticks, more than 1,000 chained operators)
+is refused as `cannot parse SQL: ...`. Statements that are not UTF-8 are
+refused before they are read.
+
+**`SHOW` forms agents may use**, all reads: `SHOW [FULL] TABLES [FROM db]`,
+`SHOW [FULL] COLUMNS` (or `FIELDS`) and `SHOW INDEX` (or `INDEXES`, `KEYS`)
+`FROM` a table (whose name is checked), `SHOW CREATE TABLE` (checked),
+`SHOW DATABASES`, `SHOW COLLATION`, `SHOW CHARACTER SET`,
+`SHOW [STORAGE] ENGINES`, `SHOW [SESSION] VARIABLES` and `STATUS`,
+`SHOW WARNINGS` and `SHOW ERRORS` (with `LIMIT` and `COUNT(*)`), each with
+an optional `LIKE` or `WHERE`. `SHOW PROCESSLIST`, `SHOW GRANTS`,
+`SHOW GLOBAL ...`, `SHOW ENGINE ... STATUS` and the binlog and replication
+forms are refused: they describe other sessions or the server.
+
+### Session variables
+
+| Allowed | Notes |
+|---|---|
+| `NAMES`, `CHARACTER SET`, `character_set_client` | Only `utf8mb4`, `utf8mb3`, `utf8`, `latin1`, `ascii`, `binary` |
+| `character_set_connection`, `character_set_results`, `collation_connection`, `time_zone`, `lc_time_names` | Formatting |
+| `autocommit` | Only to `1`, `ON` or `TRUE`; turning it off is transaction control |
+| `transaction_isolation`, `tx_isolation`, `SET TRANSACTION ISOLATION LEVEL` | `READ UNCOMMITTED` is refused |
+| `sql_select_limit`, `group_concat_max_len` | |
+| `net_read_timeout`, `net_write_timeout`, `wait_timeout`, `interactive_timeout` | Client-side waits |
+| `sql_mode` | Only a quoted list of modes that leave quoting alone; never `ANSI_QUOTES`, `NO_BACKSLASH_ESCAPES` or the modes that include them |
+| `@user_variables` | The agent's own |
+
+Everything else is refused (`agents may not change the '...' setting`),
+including `sql_log_bin`, `foreign_key_checks`, `unique_checks`,
+`max_execution_time`, `max_statement_time`, `innodb_lock_wait_timeout`,
+`transaction_read_only`, `sql_safe_updates`, `SET PASSWORD`, `SET ROLE`,
+and anything `GLOBAL`, `PERSIST` or `PERSIST_ONLY`. Unlike Postgres's
+`statement_timeout`, ariodb's MySQL time limits cannot be changed by
+agents.
+
+### Blocked functions
+
+Refused for every agent, whatever the rules say:
+
+| Function | Why it is blocked |
+|---|---|
+| `load_file` | Reads files on the server |
+| `sys_exec`, `sys_eval`, `sys_get`, `sys_set`, and every `lib_mysqludf_*` function | The lib_mysqludf_sys functions run shell commands or reach the server's environment |
+| `get_lock`, `release_lock`, `release_all_locks`, `is_free_lock`, `is_used_lock` | Named locks outlive the statement and reach other sessions on the shared gateway login |
+| `master_pos_wait`, `source_pos_wait`, `wait_for_executed_gtid_set`, `wait_until_sql_thread_after_gtids`, `master_gtid_wait` | Wait on replication |
+| Any function in `sys`, `mysql` or `performance_schema` | Read what the catalogue rule keeps from agents |
+
+MariaDB's `NEXTVAL(s)`, `LASTVAL(s)` and `SETVAL(s, n)` name a sequence,
+which is checked as a table against the agent's list.
+
+### Table names
+
+- **Scoped to `[mysql] database`.** `orders` and `app.orders` are the same
+  table when `[mysql] database = "app"`; a table in another database must
+  be listed as `database.table`.
+- **Lower case**, as for Postgres. With `lower_case_table_names = 0`,
+  avoid tables whose names differ only by case; `ariodb doctor` checks.
+- **Reserved tables** are refused for every agent, `"*"` included: the tag
+  table, `information_schema.processlist`, `information_schema.innodb_*`,
+  and everything in `mysql`, `sys` and `performance_schema`. See
+  [reserved tables](mysql.md#reserved-tables).
+- **The catalogue** readable without listing is these
+  `information_schema` views: `tables`, `columns`, `schemata`,
+  `statistics`, `key_column_usage`, `table_constraints`,
+  `referential_constraints`, `views`, `routines`, `character_sets`,
+  `collations`, `engines` and `columns_extensions`. Other
+  `information_schema` views (`user_privileges` and the rest) need
+  listing.
+- **Tables are checked once, before the write runs.** A trigger or stored
+  code that writes to another table is counted against the row limit but
+  not checked against the list, so keep the gateway login's grants tight.
+  See [MySQL and MariaDB](mysql.md#how-this-compares-with-postgres).
+- **The Postgres blocked-function list does not apply**; the MySQL list
+  above does.
 
 ## What rules can and cannot change
 
