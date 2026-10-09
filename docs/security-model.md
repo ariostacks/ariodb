@@ -89,13 +89,68 @@ database's own permissions sit behind ariodb as the last line.
   a timeout or a failure refuses it.
 - **Dashboard changes need a person with the right role.** Every change
   needs a signed-in user whose role allows it (checked by the server on
-  every request), a CSRF token and a same-origin request, and passwords
-  cannot be guessed at speed. Single sign-on accepts only ID tokens with a
-  good public-key signature, the right issuer, audience and nonce, and an
-  expiry in the future, from a browser that started the sign-in.
+  every request, not only hidden in the app), a CSRF token and a
+  same-origin request, and passwords cannot be guessed at speed. Single
+  sign-on accepts only ID tokens with a good public-key signature, the
+  right issuer, audience and nonce, and an expiry in the future, from a
+  browser that started the sign-in (see
+  [dashboard sign-in and roles](#dashboard-sign-in-and-roles)).
 - **Agents never hold database credentials.** Agents authenticate to
   ariodb with their own tokens; database passwords stay with ariodb (but
   see [the MCP caveat](#what-ariodb-does-not-protect-against)).
+
+### Dashboard sign-in and roles
+
+Dashboard users are viewers, approvers or admins (see
+[dashboard](dashboard.md#roles)). A local user's role is read from the
+state directory, and a single sign-on user's is worked out from their
+groups, on every request.
+
+With `[dashboard.oidc]`, people sign in with an OpenID Connect provider:
+
+- The authorisation code flow with PKCE (S256), a random `state` and a
+  random `nonce` per sign-in. The pending sign-in is bound to the browser
+  that started it by an `HttpOnly` cookie, used once, and forgotten after
+  ten minutes, so a callback link sent to someone else, replayed, or with
+  a changed `state` is refused.
+- The ID token must be signed with RSA, RSA-PSS, ECDSA or EdDSA by a key
+  from the provider's published key set, for that key's algorithm: `none`,
+  HMAC (including HMAC keyed with a public key) and a key of the wrong
+  type are refused. The issuer must be the one the discovery document
+  names (which must match the configured issuer), the audience must
+  include the client ID (and `azp` must be the client ID when present or
+  when there are several audiences), `exp`, `nbf` and `iat` are checked
+  with a minute's leeway, and the nonce must be this sign-in's. Keys are
+  cached for an hour and fetched again when a token names an unknown key
+  ID (at most every ten seconds), so the provider can rotate keys.
+- The issuer and every address in its discovery document must be
+  `https://` except on localhost; redirects are not followed when ariodb
+  talks to the provider.
+- The role (viewer, approver, admin) comes from the groups in the ID token
+  and the current config on every request. No mapped group means no
+  access; a config change that takes a group away ends that role at once.
+  `allowed_email_domains` needs a verified email: `email_verified` must be
+  true in the ID token, and a token without the claim does not count. A
+  person is recorded as `sso:<email>` only when the email is verified;
+  otherwise by user name or subject.
+- Local passwords stay for break-glass use (`password_login =
+  "break_glass"`) or are switched off (`"off"`), which also ends existing
+  password sessions. Under single sign-on the first-run password page is
+  off (accepted risk A4 does not apply).
+- Every `[[approvers]]` type except `slack`, `llm` and `plugin` may set
+  `groups`; only members of those groups may then decide its requests, in
+  the dashboard or through a link (`ariodb approve` on the host does not
+  check them). A webhook or channel approver with `groups` needs
+  `approval_links = "sign_in"`, and ariodb refuses a config without it,
+  since a link followed without signing in has nobody whose groups could
+  be checked.
+- Approval links (`approval_links = "sign_in"`, the default under single
+  sign-on) need a signed-in approver as well as the signed link, and the
+  form on the confirmation page carries the session's CSRF token. The
+  person, not the link, is recorded as the decider. A link opened from a
+  chat app or email arrives without the `SameSite=Strict` session cookie,
+  so the page reloads itself once as a same-site navigation (a meta
+  refresh; the page has no script) before asking anyone to sign in.
 
 ## What ariodb does not protect against
 
@@ -269,6 +324,8 @@ without the fix.
 | A7 | Low | ClickHouse HTTP | Agents may send their token as a `password` URL parameter, which intermediaries may log. | Supported for client compatibility; prefer Basic auth or `X-ClickHouse-Key`. |
 | A8 | Low | Dashboard login limit | Twenty wrong passwords for a user, from anywhere, lock that user out for 15 minutes; the counts live in memory and reset on restart. Behind a reverse proxy, all clients share the proxy's address, so five wrong passwords from anyone block sign-in from everyone. | A deliberate trade-off against distributed guessing. Keep the dashboard off untrusted networks. |
 | A9 | Medium | `write_check = "reported"` | Writes are judged by the row counts the database reports, so rows and tables changed by triggers, cascades and functions are not seen. | Off by default, for databases that cannot measure writes (YugabyteDB, CockroachDB); `ariodb doctor` and [compatibility.md](compatibility.md) say what it gives up. Database grants are the backstop. |
+| A10 | Low | Dashboard single sign-on ([`oidc.rs`](../src/oidc.rs)) | Groups are read from the ID token at sign-in. Someone removed from a group at the provider keeps that group's role until their session ends (12 hours) or they sign out. Pending sign-ins live in memory, so a restart makes people start again. | A role mapping changed in the config applies at once, so take the group out of the mapping when someone must lose access before their session ends. |
+| A11 | Low | Approval links with `approval_links = "signed"` | Without single sign-on (or with links set to `signed`), anyone holding a link can decide its request, and the decision is recorded as `webhook`. | Links are signed per request and verdict and only decide on POST (finding 7). Set `approval_links = "sign_in"` to tie each decision to a person. |
 
 ### Reviewed with no issue found
 
@@ -328,8 +385,10 @@ Network and TLS:
 - [ ] TLS to the database with `tls = "verify"` (the default for any
       host other than this one). `"require"` encrypts but accepts any
       certificate, so it does not stop a man in the middle.
-- [ ] Listeners on loopback or private addresses, behind network controls
-      (there are no connection limits).
+- [ ] Listeners on loopback or private addresses, behind network controls,
+      with `[limits] max_connections`, `max_connections_per_agent` and
+      `handshake_timeout_ms` sized for your agents (see
+      [configuration](configuration.md#limits)).
 - [ ] ClickHouse agents use Basic auth or `X-ClickHouse-Key`, not the
       `password` URL parameter.
 
@@ -348,12 +407,14 @@ Dashboard:
       config, undo, users and secrets.
 - [ ] With single sign-on: an `https://` issuer, role groups that only
       the right people can join at the provider, `allowed_email_domains`
-      where the provider sends `email_verified`, and
+      where the provider sends `email_verified`, the client secret in
+      `client_secret_env` or `client_secret_secret`, and
       `password_login = "off"` once a break-glass procedure is agreed (or
       `"break_glass"` with a strong `root` password kept offline).
 - [ ] `approval_links = "sign_in"` wherever links reach people who are not
-      all allowed to decide, and `groups` on approvers whose requests only
-      some approvers should decide.
+      all allowed to decide, and narrow `groups` on approvers whose
+      requests only some approvers should decide, such as those for
+      high-risk rules.
 - [ ] `config_writes = false` unless people are meant to edit policy from
       the dashboard.
 

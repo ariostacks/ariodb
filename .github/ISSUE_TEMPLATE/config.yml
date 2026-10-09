@@ -1,0 +1,18 @@
+# Every issue starts from a template.
+blank_issues_enabled: false
+
+# Security reports go to private advisories, never to public issues. With
+# private vulnerability reporting switched on (Settings > Code security),
+# GitHub adds "Report a security vulnerability" to the template chooser by
+# itself, pointing at SECURITY.md's process.
+#
+# contact_links needs absolute URLs. Once the repository's address is
+# settled, replace OWNER/REPO and uncomment:
+#
+# contact_links:
+#   - name: Report a security vulnerability
+#     url: https://github.com/OWNER/REPO/security/advisories/new
+#     about: Report security problems privately, never in a public issue. See SECURITY.md.
+#   - name: Documentation
+#     url: https://github.com/OWNER/REPO/blob/HEAD/docs/README.md
+#     about: Installation, configuration, every command, troubleshooting and the security model.

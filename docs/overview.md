@@ -244,7 +244,7 @@ with mode `0700`.
   behind network controls and use long random tokens.
 
 The full threat model, with accepted risks, is in the
-[security model](security-model.md) and [SECURITY.md](../SECURITY.md).
+[security model](security-model.md).
 
 ## Next
 

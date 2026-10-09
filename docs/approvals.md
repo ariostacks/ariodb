@@ -131,7 +131,8 @@ llm_cache_seconds = 300       # default 300; reuse a model's answer to the same 
 ```
 
 `timeout_seconds` bounds people (the dashboard, Slack, webhooks and the
-chat, paging and email channels) and plugin approvers; an approver's own `timeout_seconds` overrides it. The two `llm_`
+chat, paging and email channels) and plugin approvers; an approver's own
+`timeout_seconds` overrides it. The two `llm_`
 settings apply only to model approvers and are explained under
 [model approvers](#failures-retries-and-the-fail-mode). Every key, with its
 type and default, is in [configuration](configuration.md#approvals).
@@ -169,7 +170,8 @@ store (`*_secret`, set with `ariodb secret set <name>`).
 | `plugin` | A program you supply | `plugin` |
 
 The eight channel types from `discord` to `email` post the request with
-signed Approve and Deny links, and are described together under
+signed **Approve** and **Deny** links to the dashboard's confirmation page,
+and are described together under
 [chat, paging and email channels](#chat-paging-and-email-channels).
 
 Every approver except `slack`, `llm` and `plugin` may also set `groups`,

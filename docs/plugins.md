@@ -284,8 +284,9 @@ statement asked for approval, `decided_by` lists who decided (the
 approvals' deciders, such as `sso:pat@example.test` or
 `model:openai/<model>`); otherwise it is `[]`. `prev` and
 `hash` are the entry's links in the decisions log's hash chain, so a sink
-can check the chain itself (see SECURITY.md, A1). Answer with the `id` of
-the last entry stored durably:
+can check the chain itself (see accepted risk A1 in the
+[security model](security-model.md#accepted-with-reasons)). Answer with
+the `id` of the last entry stored durably:
 
 ```json
 {"jsonrpc":"2.0","id":12,"result":{"ack":41}}

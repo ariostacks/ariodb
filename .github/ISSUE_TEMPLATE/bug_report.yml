@@ -1,0 +1,89 @@
+name: Bug report
+description: Something in ariodb does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. **If it is a security problem, do not file it here**: report it privately through the Security tab ("Report a vulnerability"), as SECURITY.md describes.
+
+        Remove every password, token, secret and host name you would rather not share from anything you paste.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The smallest set of steps, SQL statements or requests that shows the problem. A script is best.
+      placeholder: |
+        1. Start ariodb with the config below
+        2. Connect as coding-agent and run: UPDATE orders SET ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ariodb version
+      description: The output of `ariodb --version`, or the commit you built.
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Database
+      multiple: true
+      options:
+        - PostgreSQL
+        - Postgres-compatible (TimescaleDB, Supabase, YugabyteDB, CockroachDB or another)
+        - MySQL
+        - MariaDB
+        - ClickHouse
+        - Not database-specific
+    validations:
+      required: true
+  - type: input
+    id: database-version
+    attributes:
+      label: Database version and hosting
+      description: For example "PostgreSQL 17.4 on Amazon RDS" or "mariadb:11.4 in Docker".
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Proxy or wire protocol
+        - Policy or classification
+        - Rules
+        - Approvals
+        - Undo or the journal
+        - Decisions log
+        - Dashboard or single sign-on
+        - MCP server
+        - Plugins
+        - CLI (check, doctor, setup, test and others)
+        - Documentation
+        - Other
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: The parts of ariodb.toml that matter, with every credential removed.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: ariodb's log, `ariodb doctor` output, or the error the agent saw.
+      render: text
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Where ariodb runs, for example "Ubuntu 24.04, x86_64" or "macOS 26, Apple silicon".

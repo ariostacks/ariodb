@@ -42,8 +42,8 @@ License.
 
 1. [Overview](overview.md), then [Architecture](architecture.md): the
    module map and the request lifecycle.
-2. [Security model](security-model.md) and [SECURITY.md](../SECURITY.md):
-   what the code must keep guaranteeing.
+2. [Security model](security-model.md): what the code must keep
+   guaranteeing.
 3. [Testing policies](testing-policies.md) and the tests section of
    [Architecture](architecture.md#tests).
 4. [Plugins](plugins.md): the plugin protocol, if you are extending ariodb
@@ -117,9 +117,10 @@ License.
 - [Architecture](architecture.md): the module map, the request lifecycle,
   the journal, undo, the store, the dashboard, plugins and the tests.
 
-Also in the repository: [README.md](../README.md) for a summary and
-[SECURITY.md](../SECURITY.md) for the security review and how to report a
-vulnerability.
+Also in the repository: [README.md](../README.md) for a summary,
+[SECURITY.md](../SECURITY.md) for how to report a vulnerability, and
+[CONTRIBUTING.md](../CONTRIBUTING.md) for building, testing and sending
+changes.
 
 ## Next
 

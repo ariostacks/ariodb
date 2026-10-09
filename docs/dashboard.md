@@ -116,7 +116,9 @@ cards).
 A local user's role is read from `ariodb.db` on every request, so a change
 of role applies at once. A single sign-on user's role is worked out on every
 request from the groups the provider sent at sign-in and the config in
-force.
+force: taking a group out of the role mapping applies at once, but someone
+removed from a group at the provider keeps its role until their session
+ends (12 hours) or they sign out.
 
 ## Single sign-on
 
@@ -186,6 +188,9 @@ without `email_verified` true is not trusted, for the name or for
 
 ariodb uses only the ID token: it does not call the provider's userinfo
 endpoint, so the groups and email must be in the ID token itself.
+
+What each step guards against is in the
+[security model](security-model.md#dashboard-sign-in-and-roles).
 
 ### Registering ariodb with a provider
 

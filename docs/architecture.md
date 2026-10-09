@@ -738,7 +738,8 @@ the name, and on Linux the scripts run clients on the host's network with
 the name pointing at `127.0.0.1`, where ariodb listens.
 
 When you fix a security issue, add a test that fails without the fix, as
-every item in the review in [SECURITY.md](../SECURITY.md) has.
+every item in the
+[security review](security-model.md#review-of-october-2026) has.
 
 ## Next
 
