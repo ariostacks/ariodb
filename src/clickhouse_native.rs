@@ -56,11 +56,21 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
         "ariodb: clickhouse-client can connect to {}",
         config.clickhouse.native_listen
     );
+    let acceptor = config.clickhouse_tls()?;
     loop {
         let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
-        let state = state.clone();
+        let _ = socket.set_nodelay(true);
+        let (state, acceptor) = (state.clone(), acceptor.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle(socket, state).await
+            let result = match acceptor {
+                // TLS only when configured, like ClickHouse's own secure port.
+                Some(acc) => match tokio::time::timeout(std::time::Duration::from_secs(10), acc.accept(socket)).await {
+                    Ok(Ok(tls)) => handle(tls, state).await,
+                    _ => Ok(()),
+                },
+                None => handle(socket, state).await,
+            };
+            if let Err(e) = result
                 && !e.contains("early eof")
                 && !e.contains("connection reset")
             {
@@ -170,10 +180,12 @@ struct Hello {
     password: String,
 }
 
-async fn handle(socket: TcpStream, state: Arc<State>) -> Result<(), String> {
-    let _ = socket.set_nodelay(true);
+async fn handle<S>(socket: S, state: Arc<State>) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let config = state.config();
-    let (client_read, client_write) = socket.into_split();
+    let (client_read, client_write) = tokio::io::split(socket);
     let client_write = Arc::new(Mutex::new(client_write));
     let mut c = Rd {
         inner: BufReader::new(client_read),

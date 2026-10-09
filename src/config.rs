@@ -62,6 +62,11 @@ pub struct ClickHouse {
     pub password_secret: Option<String>,
     /// For https:// upstreams with a private CA.
     pub accept_invalid_certificate: bool,
+    /// Certificate and key (PEM) for TLS between agents and ariodb. When
+    /// set, both ClickHouse listeners speak TLS only, as ClickHouse's own
+    /// secure ports do (https, and `clickhouse-client --secure`).
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
     /// Reach ClickHouse (both interfaces) through this tunnel. The tunnel
     /// must forward to whichever port is used, HTTP or native.
     pub tunnel: Option<String>,
@@ -78,6 +83,8 @@ impl Default for ClickHouse {
             password_env: None,
             password_secret: None,
             accept_invalid_certificate: false,
+            tls_cert: None,
+            tls_key: None,
             tunnel: None,
         }
     }
@@ -386,6 +393,15 @@ impl Config {
     /// Read a value from the encrypted secret store.
     pub fn secret(&self, name: &str) -> Result<Option<String>, String> {
         crate::secrets::Store::open(Path::new(&self.journal.dir))?.get(name)
+    }
+
+    /// The TLS acceptor for the ClickHouse listeners, if TLS is configured.
+    pub fn clickhouse_tls(&self) -> Result<Option<tokio_rustls::TlsAcceptor>, String> {
+        match (&self.clickhouse.tls_cert, &self.clickhouse.tls_key) {
+            (Some(c), Some(k)) => crate::tls::server_acceptor(c, k).map(Some),
+            (None, None) => Ok(None),
+            _ => Err("clickhouse.tls_cert and clickhouse.tls_key must be set together".to_string()),
+        }
     }
 
     /// The ClickHouse password ariodb uses upstream.

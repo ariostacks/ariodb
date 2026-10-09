@@ -175,4 +175,27 @@ else
 fi
 expect "explain judges ClickHouse statements" "deny" "$($BIN "${CFG[@]}" explain --agent analyst --engine clickhouse "SELECT * FROM url('http://x', CSV, 'a String')")"
 
+echo "TLS on the ClickHouse listeners"
+kill $SERVE_PID 2>/dev/null || true; wait $SERVE_PID 2>/dev/null || true
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,DNS:host.docker.internal" \
+  -keyout "$WORK/ch.key" -out "$WORK/ch.crt" >/dev/null 2>&1
+python3 - "$WORK/ariodb.toml" "$WORK/ch.crt" "$WORK/ch.key" <<'PY'
+import sys
+p, crt, key = sys.argv[1:]
+s = open(p).read()
+s = s.replace('password_env = "E2E_CH_PASSWORD"\n', f'password_env = "E2E_CH_PASSWORD"\ntls_cert = "{crt}"\ntls_key = "{key}"\n', 1)
+open(p, "w").write(s)
+PY
+$BIN "${CFG[@]}" serve >"$WORK/serve-tls.log" 2>&1 &
+SERVE_PID=$!
+for _ in $(seq 1 100); do nc -z 127.0.0.1 $PROXY_NATIVE 2>/dev/null && break; sleep 0.2; done
+expect "HTTPS reads through ariodb" "1001" "$(curl -sk -u analyst:$A "https://127.0.0.1:$PROXY_HTTP/" --data-binary "SELECT count() FROM events")"
+expect "policy still applies over HTTPS" "may not use table 'secrets'" "$(curl -sk -u analyst:$A "https://127.0.0.1:$PROXY_HTTP/" --data-binary "SELECT * FROM secrets")"
+expect "plain HTTP is not served once TLS is on" "000" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 -u analyst:$A "http://127.0.0.1:$PROXY_HTTP/" --data-binary "SELECT 1" || true)"
+expect "clickhouse-client --secure reads through ariodb" "1001" "$(cli analyst $A "SELECT count() FROM events" --secure --accept-invalid-certificate)"
+expect "policy still applies over native TLS" "may not use table 'secrets'" "$(cli analyst $A "SELECT * FROM secrets" --secure --accept-invalid-certificate)"
+expect "a plain native client is not served once TLS is on" "Exception" "$(cli analyst $A "SELECT 1" --connect_timeout 5 --receive_timeout 5)"
+expect "a silent client does not block others" "1001" "$( (sleep 8 | nc 127.0.0.1 $PROXY_HTTP >/dev/null &) ; curl -sk -m 5 -u analyst:$A "https://127.0.0.1:$PROXY_HTTP/" --data-binary "SELECT count() FROM events")"
+
 echo "all ClickHouse checks passed"

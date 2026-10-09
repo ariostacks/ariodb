@@ -380,6 +380,8 @@ native_addr = "127.0.0.1:9000"       # the real native port (default)
 user = "ariodb"                      # ariodb's own login; default "default"
 password_env = "ARIODB_CLICKHOUSE_PASSWORD"   # or password_secret
 accept_invalid_certificate = false   # for https upstreams with a private CA
+# tls_cert = "/etc/ariodb/ch.crt"    # with tls_key: both listeners speak TLS only
+# tls_key = "/etc/ariodb/ch.key"
 # tunnel = "ch"                      # must forward to whichever port is used
 ```
 
@@ -391,6 +393,10 @@ other than formatting and query parameters are dropped. Table functions that
 reach outside the server (`url`, `s3`, `file`, `remote` and others) and ones
 that read tables named in strings (`merge`, `dictionary`, `cluster`,
 `dictGet`, `joinGet`) are refused. One statement per request.
+
+With `tls_cert` and `tls_key` set, both listeners accept TLS only, as
+ClickHouse's own secure ports do: agents use `https://` and
+`clickhouse-client --secure`.
 
 ### `on_failure`
 
@@ -520,8 +526,6 @@ and `E2E_NAME` keep parallel runs of the scripts apart.
 - **ClickHouse native `INSERT` is refused** (as are external tables): use
   the HTTP interface for inserts. ClickHouse writes cannot be rolled back or
   undone; rules and approvals are the only control.
-- **No TLS on the ClickHouse listeners** agents connect to. Keep them on
-  localhost or a private network.
 - **`COPY ... FROM STDIN` is refused**; use `INSERT`. Cursors cannot be read
   (`FETCH` is refused).
 - **No undo for `TRUNCATE` or schema changes**: agents cannot run them.

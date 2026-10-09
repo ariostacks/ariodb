@@ -162,6 +162,8 @@ redact_literals = false      # true stores SQL with values replaced by $1, $2, .
 # native_addr = "127.0.0.1:9000"       # the real native port
 # user = "ariodb"
 # password_env = "ARIODB_CLICKHOUSE_PASSWORD"   # or password_secret = "..."
+# tls_cert = "/etc/ariodb/ch.crt"      # with tls_key, both listeners are TLS only
+# tls_key = "/etc/ariodb/ch.key"
 
 # ---------------------------------------------------------------------------
 # Tunnels (optional): side processes that carry connections to a database.

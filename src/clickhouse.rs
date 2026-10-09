@@ -31,14 +31,22 @@ pub async fn serve_http(state: Arc<State>) -> Result<(), String> {
         .route("/ping", get(|| async { "Ok.\n" }))
         .route("/", any(query))
         .with_state(state.clone());
+    let acceptor = config.clickhouse_tls()?;
     let listener = tokio::net::TcpListener::bind(&config.clickhouse.http_listen)
         .await
         .map_err(|e| format!("cannot listen on {}: {e}", config.clickhouse.http_listen))?;
+    let scheme = if acceptor.is_some() { "https" } else { "http" };
     println!(
-        "ariodb: ClickHouse HTTP clients can connect to http://{}",
+        "ariodb: ClickHouse HTTP clients can connect to {scheme}://{}",
         config.clickhouse.http_listen
     );
-    axum::serve(listener, app).await.map_err(|e| e.to_string())
+    match acceptor {
+        Some(acceptor) => {
+            let tls = crate::tls::TlsListener::new(listener, acceptor).map_err(|e| e.to_string())?;
+            axum::serve(tls, app).await.map_err(|e| e.to_string())
+        }
+        None => axum::serve(listener, app).await.map_err(|e| e.to_string()),
+    }
 }
 
 /// The agent as ClickHouse sees it: its ClickHouse access and tables.
