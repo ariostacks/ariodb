@@ -142,8 +142,9 @@ async fn query(
         Ok(a) => a,
         Err(why) => return ch_error(StatusCode::UNAUTHORIZED, 516, &format!("{user}: {why}")),
     };
-    // Over HTTP, an agent's connections are its requests in flight.
-    let _claim = match limiter.claim(&agent.name) {
+    // Over HTTP, an agent's connections are its requests in flight, until
+    // their answers have streamed out.
+    let claim = match limiter.claim(&agent.name) {
         Ok(c) => c,
         Err(limit) => {
             return ch_error(
@@ -342,6 +343,132 @@ async fn query(
             out = out.header(k, v);
         }
     }
-    out.body(Body::from_stream(resp.bytes_stream()))
+    let answer = futures::StreamExt::map(resp.bytes_stream(), move |chunk| {
+        let _in_flight = &claim;
+        chunk
+    });
+    out.body(Body::from_stream(answer))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Send a query as `analyst` and return the status line once it
+    /// arrives, with the connection, still open, that the answer streams on.
+    async fn ask(port: u16) -> (String, TcpStream) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode("analyst:agent-token-local-test-only");
+        let sql = "SELECT count() FROM events";
+        s.write_all(
+            format!(
+                "POST / HTTP/1.1\r\nhost: x\r\nauthorization: Basic {auth}\r\ncontent-length: {}\r\n\r\n{sql}",
+                sql.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n") {
+            match tokio::time::timeout(Duration::from_secs(5), s.read(&mut byte)).await {
+                Ok(Ok(1)) => head.push(byte[0]),
+                _ => break,
+            }
+        }
+        (String::from_utf8_lossy(&head).trim().to_string(), s)
+    }
+
+    #[tokio::test]
+    async fn an_answer_still_streaming_counts_against_the_agent() {
+        // A ClickHouse whose answers start at once and never finish.
+        let ch = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ch_addr = ch.local_addr().unwrap();
+        let _ch = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut s, _)) = ch.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\n1\n\r\n")
+                    .await;
+                held.push(s);
+            }
+        });
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = std::env::temp_dir().join(format!("ariodb-ch-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let toml = format!(
+            r#"
+            [database]
+            url = "postgres://unused@127.0.0.1:1/unused"
+            [limits]
+            max_connections_per_agent = 1
+            [journal]
+            enabled = false
+            dir = "{dir}"
+            [dashboard]
+            listen = ""
+            [proxy]
+            listen = ""
+            [clickhouse]
+            http_listen = "127.0.0.1:{port}"
+            http_url = "http://{ch_addr}"
+            user = "ariodb"
+            [[agents]]
+            name = "analyst"
+            access = "read_only"
+            tables = ["unused"]
+            token_env = "ARIODB_CH_LIMITS_TEST_TOKEN"
+            [agents.clickhouse]
+            access = "read_only"
+            tables = ["events"]
+            "#,
+            dir = dir.display(),
+        );
+        // SAFETY: no other test reads or writes this variable.
+        unsafe { std::env::set_var("ARIODB_CH_LIMITS_TEST_TOKEN", "agent-token-local-test-only") };
+        let config = Config::from_toml(&toml).unwrap();
+        let audit = Arc::new(crate::audit::AuditLog::open(&dir, &config.audit).unwrap());
+        let state = State::new(config, dir.join("ariodb.toml"), audit).unwrap();
+        let server = tokio::spawn(serve_http(state));
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The first answer is still streaming...
+        let (status, first) = ask(port).await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        // ...so a second query is one more than the agent may have.
+        let (status, second) = ask(port).await;
+        assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+        drop(second);
+        // Once the first answer ends, the agent may ask again.
+        drop(first);
+        let mut status = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            status = ask(port).await.0;
+            if status.contains("200") {
+                break;
+            }
+        }
+        assert_eq!(status, "HTTP/1.1 200 OK");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
