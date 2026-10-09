@@ -918,6 +918,29 @@ async fn check_mysql_gateway(
     }
     let _ = conn.query_drop("SET SESSION innodb_lock_wait_timeout = 3").await;
 
+    // ariodb compares table names without regard to case. Where the server
+    // does not, tables whose names differ only by case are told apart by
+    // the server but not by ariodb's allow-lists.
+    if let Ok(Some(0)) = conn.query_first::<i64, _>("SELECT @@lower_case_table_names").await {
+        let clashes: Vec<String> = conn
+            .exec(
+                "SELECT GROUP_CONCAT(table_name ORDER BY table_name SEPARATOR ', ')
+                 FROM information_schema.tables WHERE table_schema = ?
+                 GROUP BY LOWER(table_name) HAVING COUNT(*) > 1",
+                (config.mysql.database.as_str(),),
+            )
+            .await
+            .unwrap_or_default();
+        if clashes.is_empty() {
+            checks.ok("table names are case-sensitive here, and no two tables differ only by case");
+        } else {
+            checks.fail(format!(
+                "tables whose names differ only by case ({}): ariodb's allow-lists cannot tell them apart. Rename them, or keep agents away from all of them",
+                clashes.join("; ")
+            ));
+        }
+    }
+
     let (db, table) = crate::mysql_journal::tag_table(config);
     let tag = quote_table(&db, &table);
     let insert = format!("INSERT INTO {tag} (session, agent) VALUES ('doctor', 'ariodb-doctor')");

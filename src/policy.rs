@@ -258,6 +258,13 @@ fn mysql_session(stmt: &Statement) -> Result<(), String> {
         if !user_variable && !MYSQL_SAFE_SETTINGS.contains(&name) {
             return Err(format!("agents may not change the '{name}' setting"));
         }
+        // READ UNCOMMITTED would let an agent read another agent's write
+        // before ariodb has judged it, and perhaps rolled it back.
+        if name == "transaction_isolation"
+            && stmt.sql.to_uppercase().replace(['-', '_'], " ").contains("UNCOMMITTED")
+        {
+            return Err("agents may not read uncommitted data (READ UNCOMMITTED)".to_string());
+        }
     }
     Ok(())
 }
@@ -574,6 +581,8 @@ mod tests {
             );
         }
         for sql in [
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            "SET @@session.transaction_isolation = 'READ-UNCOMMITTED'",
             "SET GLOBAL wait_timeout = 1",
             "SET @@global.time_zone = '+00:00'",
             "SET PERSIST wait_timeout = 1",

@@ -41,3 +41,9 @@ webpki-roots = "1.0.9"
 
 [dev-dependencies]
 proptest = "1.11.0"
+
+# mysql_common reads some negative TIME values with arithmetic that
+# overflows; release builds wrap, and the journal detects the result.
+# Debug builds would panic instead, so match release behaviour.
+[profile.dev.package.mysql_common]
+overflow-checks = false

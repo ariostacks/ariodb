@@ -404,6 +404,11 @@ impl Config {
 
     /// Rules that TOML alone cannot express.
     fn check(&self) -> Result<(), ConfigError> {
+        if !self.mysql.listen.is_empty() && self.mysql.journal && self.mysql.server_id == 0 {
+            return Err(ConfigError::Problem(
+                "[mysql] server_id must not be 0: the journal registers with it as a replica".to_string(),
+            ));
+        }
         if !self.mysql.listen.is_empty() && self.mysql.database.is_empty() {
             return Err(ConfigError::Problem(
                 "[mysql] database must name the database agents work in".to_string(),

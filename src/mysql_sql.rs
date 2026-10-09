@@ -335,12 +335,16 @@ fn statement(
 ) -> Result<Option<Statement>, ParseError> {
     let runs_comment = lexemes.iter().any(|l| l.tok == Tok::Comment(true));
     // Optimizer hints are harmless, except SET_VAR, which sets session
-    // variables (some the policy refuses) for the statement.
+    // variables (some the policy refuses) for the statement, and
+    // MAX_EXECUTION_TIME and RESOURCE_GROUP, which would lift ariodb's
+    // time limit or change the statement's resources.
     let sets_variables = lexemes.iter().any(|l| {
-        let text = &sql[l.start..l.end];
+        let text = sql[l.start..l.end].to_lowercase();
         l.tok == Tok::Comment(false)
             && text.starts_with("/*+")
-            && text.to_lowercase().contains("set_var")
+            && ["set_var", "max_execution_time", "resource_group"]
+                .iter()
+                .any(|h| text.contains(h))
     });
     let toks: Vec<Lexeme> = lexemes
         .into_iter()
@@ -363,7 +367,7 @@ fn statement(
     } else if sets_variables {
         Judged::new(
             Kind::Unknown,
-            "SET_VAR hints change settings ariodb does not check",
+            "SET_VAR, MAX_EXECUTION_TIME and RESOURCE_GROUP hints change settings ariodb controls",
             command_for(&word(&toks, 0)),
         )
     } else {
@@ -1762,9 +1766,11 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_hints_are_harmless() {
-        let s = one("SELECT /*+ MAX_EXECUTION_TIME(1000) */ * FROM orders");
+    fn optimizer_hints_are_harmless_unless_they_change_limits() {
+        let s = one("SELECT /*+ NO_INDEX(orders) */ * FROM orders");
         assert_eq!((s.kind, s.tables), (Kind::Read, vec!["orders".to_string()]));
+        assert_eq!(kind_of("SELECT /*+ MAX_EXECUTION_TIME(1000000) */ * FROM orders"), Kind::Unknown);
+        assert_eq!(kind_of("SELECT /*+ RESOURCE_GROUP(batch) */ * FROM orders"), Kind::Unknown);
         assert_eq!(
             kind_of("UPDATE /*+ NO_RANGE_OPTIMIZATION(orders) */ orders SET a = 1 WHERE id = 1"),
             Kind::Write
