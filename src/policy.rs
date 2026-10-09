@@ -153,6 +153,8 @@ const MYSQL_BLOCKED_FUNCTIONS: &[&str] = &[
     "source_pos_wait",
     "wait_for_executed_gtid_set",
     "wait_until_sql_thread_after_gtids",
+    // MariaDB's replication wait.
+    "master_gtid_wait",
 ];
 
 const MYSQL_BLOCKED_PREFIXES: &[&str] = &["lib_mysqludf_"];
@@ -446,6 +448,14 @@ mod tests {
         ] {
             assert!(denied(decide_mysql(Access::ReadOnly, sql)), "{sql}");
         }
+        // A MariaDB sequence is a table; SETVAL's change survives a rollback.
+        for sql in [
+            "UPDATE orders SET a = NEXTVAL(secret_seq) WHERE id = 1",
+            "SELECT SETVAL(secret_seq, 1) FROM orders WHERE id = 1 FOR UPDATE",
+            "UPDATE IGNORE secrets SET a = 1 WHERE id = 1",
+        ] {
+            assert!(denied(decide_mysql(Access::ReadWrite, sql)), "{sql}");
+        }
     }
 
     #[test]
@@ -459,6 +469,7 @@ mod tests {
             "SELECT is_used_lock('x')",
             "SELECT source_pos_wait('binlog.000001', 4)",
             "SELECT wait_for_executed_gtid_set('x')",
+            "SELECT master_gtid_wait('0-1-1', 10)",
             "SELECT sys.ps_thread_id(1)",
             "UPDATE orders SET a = release_lock('x') WHERE id = 1",
             "SET @x = get_lock('x', 1)",

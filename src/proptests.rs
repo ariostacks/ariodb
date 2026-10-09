@@ -368,10 +368,11 @@ proptest! {
     }
 
     /// Whatever a string literal holds, it hides neither a statement nor a
-    /// table: quoted properly, it is one value and nothing more.
+    /// table: quoted properly, it is one value and nothing more. (NUL bytes
+    /// are refused outright; drivers send them escaped.)
     #[test]
     fn mysql_a_string_hides_nothing(
-        text in ".{0,40}",
+        text in "[^\u{0}]{0,40}",
         double in any::<bool>(),
         doubling in any::<bool>(),
     ) {

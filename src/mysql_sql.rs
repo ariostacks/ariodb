@@ -31,6 +31,13 @@ use std::ops::ControlFlow;
 
 /// Split a query string into statements and classify each one.
 pub fn classify(sql: &str) -> Result<Vec<Statement>, ParseError> {
+    // The server ends a `#` or `--` comment at a NUL byte, then reads what
+    // follows as SQL. Drivers escape NULs in strings, so none are needed.
+    if sql.contains('\0') {
+        return Err(ParseError(
+            "NUL bytes are not allowed in statements; escape them as \\0".into(),
+        ));
+    }
     let lexemes = lex(sql)?;
     let blanked = blank_comments(sql, &lexemes);
     let mut out = Vec::new();
@@ -387,10 +394,14 @@ const MAX_OPERATOR_DEPTH: usize = 1000;
 
 /// An upper bound on how deep operator chains could nest a parsed tree:
 /// operators counted since the last comma at each level of parentheses,
-/// summed over the levels open at once.
+/// summed over the levels open at once. Every punctuation character but
+/// parentheses, commas and dots counts, because sqlparser chains more of them
+/// than MySQL has (`a::int::int...` and `a:b:c...` nest as deeply as `+`),
+/// and so does every keyword sqlparser reads as an infix operator.
 fn operator_depth(toks: &[Lexeme]) -> usize {
     const OPERATOR_WORDS: &[&str] = &[
-        "and", "or", "xor", "not", "div", "mod", "like", "regexp", "rlike", "between", "is", "in",
+        "and", "or", "xor", "not", "div", "mod", "like", "ilike", "regexp", "rlike", "glob",
+        "match", "similar", "between", "is", "in", "overlaps", "operator", "at", "notnull",
         "collate", "member", "sounds", "escape",
     ];
     let mut levels = vec![0usize];
@@ -415,7 +426,8 @@ fn operator_depth(toks: &[Lexeme]) -> usize {
                 }
                 false
             }
-            Tok::Punct(c) => "+-*/%&|^<>=!~".contains(*c),
+            Tok::Punct('.') => false,
+            Tok::Punct(_) => true,
             Tok::Word(w) => OPERATOR_WORDS.iter().any(|o| w.eq_ignore_ascii_case(o)),
             _ => false,
         };
@@ -686,7 +698,10 @@ fn explain(text: &str, toks: &[Lexeme], depth: usize) -> Result<Judged, ParseErr
         if analyze {
             // EXPLAIN ANALYZE runs the statement.
             inner.reason = format!("{} (inside EXPLAIN ANALYZE)", inner.reason);
-        } else {
+        } else if inner.kind != Kind::Unknown {
+            // Only a statement ariodb understood becomes a read: an Unknown
+            // one may not have had its tables read (INTO OUTFILE is refused
+            // before they are), so it stays Unknown even when not run.
             inner.kind = Kind::Read;
             inner.reason = "EXPLAIN plans without running".into();
             inner.setting = None;
@@ -771,6 +786,25 @@ fn parsed(text: &str, toks: &[Lexeme]) -> Result<Judged, ParseError> {
             let mut with = "FOR SHARE".to_string();
             with.push_str(&" ".repeat(b - a - with.len()));
             sql.replace_range(a..b, &with);
+        }
+    }
+    // sqlparser reads `UPDATE IGNORE t` as the table `ignore` aliased `t`.
+    // These modifiers change neither the tables nor the kind, and
+    // LOW_PRIORITY and IGNORE are reserved words, never names, so they are
+    // blanked, positions kept. QUICK is not reserved and is blanked only
+    // after DELETE: were it a target table there, it would also have to
+    // follow FROM, where it is reported.
+    for (i, w) in words.iter().enumerate() {
+        if !matches!(w.as_str(), "update" | "delete") {
+            continue;
+        }
+        let mut k = i + 1;
+        while let Some(m) = words.get(k)
+            && (matches!(m.as_str(), "low_priority" | "ignore") || (w == "delete" && m == "quick"))
+        {
+            let (a, b) = (toks[k].start - base, toks[k].end - base);
+            sql.replace_range(a..b, &" ".repeat(b - a));
+            k += 1;
         }
     }
     // MySQL's TABLE t is SELECT * FROM t, which sqlparser reads only inside
@@ -966,6 +1000,50 @@ impl Names {
         }
     }
 
+    /// MariaDB's NEXTVAL(s), LASTVAL(s) and SETVAL(s, n) name a sequence,
+    /// which is a table, and SETVAL and NEXTVAL change it outside the
+    /// transaction. The sequence is reported as a table so the agent's
+    /// tables decide. On MySQL these would be stored functions, and their
+    /// argument is still reported: stricter, never looser.
+    fn sequence(&mut self, f: &sqlparser::ast::Function) {
+        use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+        let is_sequence = match f.name.0.as_slice() {
+            [ObjectNamePart::Identifier(i)] => {
+                matches!(
+                    i.value.to_lowercase().as_str(),
+                    "nextval" | "lastval" | "setval"
+                )
+            }
+            _ => false,
+        };
+        if !is_sequence {
+            return;
+        }
+        let first = match &f.args {
+            FunctionArguments::List(list) => list.args.first(),
+            _ => None,
+        };
+        let parts: Vec<String> = match first {
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(i)))) => {
+                vec![i.value.to_lowercase()]
+            }
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(ids)))) => {
+                ids.iter().map(|i| i.value.to_lowercase()).collect()
+            }
+            _ => {
+                self.error = Some(format!(
+                    "ariodb cannot tell which sequence {}() names",
+                    f.name
+                ));
+                return;
+            }
+        };
+        match dotted(&parts) {
+            Ok(n) => self.tables.push(n),
+            Err(e) => self.error = Some(e.0),
+        }
+    }
+
     /// `TABLE t`, MySQL's short SELECT, which the relation visitor misses.
     fn table_statements(&mut self, body: &SetExpr, visible: &[String]) {
         match body {
@@ -1107,6 +1185,7 @@ impl Visitor for Names {
     fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
         if let Expr::Function(f) = e {
             self.add_function(&f.name);
+            self.sequence(f);
         }
         ControlFlow::Continue(())
     }
@@ -1186,8 +1265,19 @@ fn show(text: &str, toks: &[Lexeme]) -> Result<Judged, ParseError> {
         ("session" | "local", "variables" | "status") => i += 2,
         ("warnings" | "errors", _) => {
             i += 1;
+            // LIMIT n, LIMIT n, m or LIMIT n OFFSET m: numbers only.
+            let number = |k: usize| match toks.get(k).map(|l| &l.tok) {
+                Some(Tok::Word(n)) => n.bytes().all(|b| b.is_ascii_digit()),
+                _ => false,
+            };
             if w(i) == "limit" {
-                i = toks.len();
+                if !number(i + 1) {
+                    return Err(ParseError("SHOW ... LIMIT takes numbers".into()));
+                }
+                i += 2;
+                if (punct(toks, i, ',') || w(i) == "offset") && number(i + 1) {
+                    i += 2;
+                }
             }
         }
         ("count", _)
@@ -2191,6 +2281,151 @@ mod tests {
             kind_of(&format!("INSERT INTO t VALUES {values}")),
             Kind::Write
         );
+    }
+
+    /// sqlparser chains operators MySQL does not have, such as `::` casts,
+    /// `:` access and AT TIME ZONE. Each of these, repeated, used to
+    /// overflow the stack and abort the process.
+    #[test]
+    fn every_operator_sqlparser_chains_is_bounded() {
+        for op in [
+            "::int",
+            ":b",
+            " AT TIME ZONE 'UTC'",
+            " COLLATE utf8mb4_bin",
+            " ILIKE 'x'",
+            " SIMILAR TO 'x'",
+            " OVERLAPS b",
+            " -> '$.a'",
+            " ->> '$.a'",
+            " <=> 1",
+            " := 1",
+            "[1]",
+            "!",
+        ] {
+            let sql = format!("SELECT a{} FROM t", op.repeat(20_000));
+            assert!(classify(&sql).is_err(), "{op}");
+        }
+        // Within the limit these still parse (or fail) without crashing.
+        let _ = classify(&format!("SELECT 1{} FROM t", "::int".repeat(450)));
+        let _ = classify(&format!(
+            "SELECT now(){} FROM t",
+            " AT TIME ZONE 'UTC'".repeat(900)
+        ));
+    }
+
+    /// LOW_PRIORITY, IGNORE and QUICK made sqlparser read the modifier as
+    /// the table and the real table as its alias.
+    #[test]
+    fn update_and_delete_modifiers_hide_no_table() {
+        let s = one("UPDATE IGNORE secrets SET a = 1 WHERE id = 1");
+        assert_eq!(
+            (s.kind, s.tables),
+            (Kind::Write, vec!["secrets".to_string()])
+        );
+        assert_eq!(
+            tables("UPDATE LOW_PRIORITY IGNORE other.secrets SET a = 1 WHERE id = 1"),
+            vec!["other.secrets"]
+        );
+        assert_eq!(
+            tables(
+                "UPDATE IGNORE secrets s JOIN orders o ON s.id = o.id SET s.a = 1 WHERE o.id = 1"
+            ),
+            vec!["orders", "secrets"]
+        );
+        assert_eq!(
+            kind_of("UPDATE IGNORE secrets SET a = 1"),
+            Kind::Destructive
+        );
+        let s = one("DELETE IGNORE FROM secrets");
+        assert_eq!(
+            (s.kind, s.tables),
+            (Kind::Destructive, vec!["secrets".to_string()])
+        );
+        assert_eq!(
+            tables("DELETE LOW_PRIORITY QUICK IGNORE FROM secrets WHERE id = 1"),
+            vec!["secrets"]
+        );
+        assert_eq!(
+            tables("DELETE QUICK FROM secrets WHERE id = 1"),
+            vec!["secrets"]
+        );
+        assert_eq!(
+            tables("EXPLAIN UPDATE IGNORE secrets SET a = 1 WHERE id = 1"),
+            vec!["secrets"]
+        );
+        assert!(
+            tables(
+                "WITH x AS (SELECT 1 AS id) UPDATE IGNORE secrets SET a = 1 WHERE id IN (SELECT id FROM x)"
+            )
+            .contains(&"secrets".to_string())
+        );
+        // A quoted name is a name.
+        assert_eq!(
+            tables("UPDATE `ignore` SET a = 1 WHERE id = 1"),
+            vec!["ignore"]
+        );
+    }
+
+    #[test]
+    fn explain_of_a_statement_ariodb_cannot_judge_is_not_a_read() {
+        assert_eq!(
+            kind_of("EXPLAIN SELECT * FROM secrets INTO OUTFILE '/tmp/x'"),
+            Kind::Unknown
+        );
+        assert_eq!(
+            kind_of("DESCRIBE SELECT 1 FROM secrets INTO DUMPFILE '/tmp/x'"),
+            Kind::Unknown
+        );
+        assert_eq!(kind_of("EXPLAIN SELECT * FROM secrets"), Kind::Read);
+    }
+
+    #[test]
+    fn show_limit_takes_only_numbers() {
+        for sql in [
+            "SHOW WARNINGS LIMIT 10",
+            "SHOW WARNINGS LIMIT 1, 2",
+            "SHOW ERRORS LIMIT 2 OFFSET 1",
+        ] {
+            assert_eq!(kind_of(sql), Kind::Read, "{sql}");
+        }
+        for sql in [
+            "SHOW WARNINGS LIMIT (SELECT 1 FROM secrets)",
+            "SHOW WARNINGS LIMIT 1 garbage",
+            "SHOW ERRORS LIMIT",
+        ] {
+            assert!(classify(sql).is_err(), "{sql}");
+        }
+    }
+
+    /// The server ends a `#` or `--` comment at a NUL and reads on.
+    #[test]
+    fn nul_bytes_are_refused() {
+        for sql in [
+            "DELETE FROM orders # x\0\nWHERE id = 1",
+            "DELETE FROM orders -- x\0\nWHERE id = 1",
+            "SELECT 'a\0b'",
+            "SELECT 1\0",
+        ] {
+            assert!(classify(sql).is_err(), "{sql:?}");
+        }
+    }
+
+    /// MariaDB's sequence functions name a table, and SETVAL's change
+    /// survives a rollback.
+    #[test]
+    fn sequences_are_tables() {
+        assert_eq!(tables("SELECT NEXTVAL(secret_seq)"), vec!["secret_seq"]);
+        let s = one("SELECT SETVAL(App.`Secret_Seq`, 5) FROM orders WHERE id = 1 FOR UPDATE");
+        assert_eq!(s.tables, vec!["app.secret_seq", "orders"]);
+        assert_eq!(
+            tables("UPDATE orders SET a = lastval(s) WHERE id = 1"),
+            vec!["orders", "s"]
+        );
+        assert!(classify("SELECT NEXTVAL(1)").is_err());
+        assert!(classify("SELECT setval((SELECT 's'), 1)").is_err());
+        // A qualified name is a stored function, not MariaDB's.
+        assert_eq!(tables("SELECT app.nextval(1) FROM orders"), vec!["orders"]);
     }
 
     #[test]
