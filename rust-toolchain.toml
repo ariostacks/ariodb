@@ -1,0 +1,6 @@
+# Build with current stable Rust. The oldest supported version is the
+# rust-version in Cargo.toml.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

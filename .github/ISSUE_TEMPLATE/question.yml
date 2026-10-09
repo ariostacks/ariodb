@@ -1,0 +1,21 @@
+name: Question
+description: Ask how to do something with ariodb.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the [documentation](../blob/main/docs/README.md) first, especially [troubleshooting](../blob/main/docs/troubleshooting.md). Remove every password, token and secret from anything you paste.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What are you trying to do, and what have you tried?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: ariodb version, database and version, and the relevant part of your config, with credentials removed.
+      render: text

@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest something ariodb should do.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the suggestion. Please check the [documentation](../blob/main/docs/README.md) and existing issues first; ariodb may already do this, or it may be planned.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today? Describe the situation, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: How you imagine it working. A config snippet or an example session helps.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you have considered
+      description: Workarounds you use now, such as a rule, a plugin or a database grant.
+  - type: textarea
+    id: security
+    attributes:
+      label: Security considerations
+      description: Would this change what agents can do, or what approvers see? How could it be misused?
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I would be willing to send a pull request for this.

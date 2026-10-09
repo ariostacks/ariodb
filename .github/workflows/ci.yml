@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, Monday 03:00 UTC: everything, including single sign-on, and
+    # against whatever the database images' tags point at by then.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install && rustup show active-toolchain
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake
+      - name: Install Rust
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake
+      - name: Install Rust
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - run: cargo test --locked
+
+  dashboard:
+    name: dashboard build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: npm ci
+        working-directory: dashboard
+        run: npm ci --no-audit --no-fund
+      - name: Build
+        working-directory: dashboard
+        run: npm run build
+      - name: Check dashboard/dist is up to date
+        run: |
+          if [ -n "$(git status --porcelain -- dashboard/dist)" ]; then
+            git status --short -- dashboard/dist
+            echo "::error::dashboard/dist differs from a clean build. Run ./scripts/build-dashboard.sh and commit dashboard/dist."
+            exit 1
+          fi
+
+  e2e-postgres:
+    name: e2e Postgres (${{ matrix.image }})
+    needs: [clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["postgres:14", "postgres:16", "postgres:18"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/e2e.sh
+        env:
+          PG_IMAGE: ${{ matrix.image }}
+
+  e2e-compat:
+    name: e2e ${{ matrix.database }}
+    needs: [clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [cockroach, yugabyte]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/e2e-compat.sh ${{ matrix.database }}
+
+  e2e-mysql:
+    name: e2e MySQL (${{ matrix.image }})
+    needs: [clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["mysql:8.4", "mariadb:11.4"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - name: MySQL proxy
+        run: ./scripts/e2e-mysql.sh
+        env:
+          MYSQL_IMAGE: ${{ matrix.image }}
+      - name: MySQL journal and undo
+        run: ./scripts/e2e-mysql-journal.sh
+        env:
+          MYSQL_IMAGE: ${{ matrix.image }}
+
+  e2e-clickhouse:
+    name: e2e ClickHouse
+    needs: [clippy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/e2e-clickhouse.sh
+
+  e2e-plugins:
+    name: e2e plugins
+    needs: [clippy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/e2e-plugins.sh
+
+  sim-undo:
+    name: undo simulation
+    needs: [clippy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/sim-undo.sh
+
+  e2e-sso:
+    name: e2e single sign-on (Keycloak)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/e2e-sso.sh

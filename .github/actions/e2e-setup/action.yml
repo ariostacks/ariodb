@@ -1,0 +1,29 @@
+name: End-to-end setup
+description: >-
+  Install what the scripts in scripts/ need on an Ubuntu runner (a C
+  toolchain with libclang for the build, python3, openssl, curl and nc),
+  then build ariodb into target/debug. Database clients run from the
+  database images, so none are installed here. Docker is already on the
+  runner.
+runs:
+  using: composite
+  steps:
+    - name: Install packages
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential clang libclang-dev cmake \
+          python3 openssl curl netcat-openbsd perl
+    - name: Install Rust
+      shell: bash
+      run: rustup toolchain install && rustup show active-toolchain
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: debug
+    - name: Build ariodb
+      shell: bash
+      run: cargo build --locked
+    - name: Docker
+      shell: bash
+      run: docker version --format 'Docker {{.Server.Version}}'
