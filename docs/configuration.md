@@ -1,0 +1,852 @@
+# Configuration reference
+
+This page describes every section and key of `ariodb.toml`, the environment
+variables ariodb reads, the encrypted secret store, what reloads while
+ariodb runs and what needs a restart, and the validation errors you may see
+when a config does not load. It is for engineers writing or reviewing the
+config for a real deployment. The reference is taken from the code
+([`src/config.rs`](../src/config.rs) and the modules it pulls in), so where
+this page and an older example disagree, this page is right.
+
+## How the file is read
+
+ariodb reads one TOML file: `ariodb.toml` in the current directory, or the
+path given with `-c` / `--config` (see [the CLI reference](cli.md)).
+
+- **Only `[database]` is required.** Every other section has defaults, and
+  the lists (`[[agents]]`, `[[rules]]` and the rest) default to empty. An
+  empty agent list is legal but refuses every agent.
+- **Unknown keys are ignored, not rejected.** A misspelt key such as
+  `lisen = "0.0.0.0:6543"` under `[proxy]` loads without complaint and
+  leaves the default in place. Run `ariodb check` after every edit and read
+  what it prints back.
+- **Top-level keys come first.** `on_failure` is the only top-level key; in
+  TOML it must appear before the first `[section]` header, or it belongs to
+  that section instead.
+- **Values ending in `_env` name an environment variable**, never the value
+  itself. Values named `secret` or ending in `_secret` name an entry in the
+  [secret store](#the-secret-store). Keep real credentials in one of those,
+  not in the file: the config is often kept in Git.
+- **Relative paths** (`[journal] dir`, `tls_cert`, `ca_file`, plugin
+  commands) are relative to ariodb's working directory, not to the config
+  file. Use absolute paths in production.
+
+`ariodb check` loads the file, runs every validation described below, and
+prints a summary:
+
+```text
+$ ariodb check
+database      postgres://ariodb_gw:***@localhost:5432/app
+row limit     500 rows per write
+timeout       5000 ms
+proxy         127.0.0.1:6543
+journal       .ariodb
+if checks fail, refuse the statement (fail closed)
+
+agent coding-agent     read and write  token set  orders, customers
+agent support-bot      read only       no token   orders
+```
+
+`no token` means the agent's environment variable or secret is empty in the
+shell where you ran `check`. That agent cannot log in until it is set where
+`ariodb serve` runs.
+
+## A complete example
+
+A production-shaped config for one Postgres database, two agents, a rule
+that holds large writes for a person, and TLS on both sides. Every
+credential lives in the environment or the secret store.
+
+```toml
+[database]
+url = "postgres://ariodb_gw@db.internal.example:5432/app"   # password comes from ARIODB_DATABASE_URL or the secret
+secret = "database-url"
+tls = "verify"
+
+[limits]
+max_rows_per_write = 200
+statement_timeout_ms = 10000
+
+[proxy]
+listen = "0.0.0.0:6543"
+tls_cert = "/etc/ariodb/proxy.crt"
+tls_key = "/etc/ariodb/proxy.key"
+require_tls = true
+
+[journal]
+dir = "/var/lib/ariodb"
+
+[[agents]]
+name = "coding-agent"
+access = "read_write"
+tables = ["orders", "order_items"]
+token_secret = "coding-agent-token"
+
+[[agents]]
+name = "support-bot"
+access = "read_only"
+tables = ["orders", "customers"]
+token_secret = "support-bot-token"
+credential = "reporting"
+
+[[credentials]]
+name = "reporting"
+secret = "reporting-url"
+
+[[rules]]
+name = "big-writes-need-a-person"
+stage = "after"
+condition = "effects.rows > 50"
+verdict = "approve"
+approve = ["ops"]
+reason = "writes over 50 rows need a person to agree"
+
+[[approvers]]
+name = "ops"
+type = "dashboard"
+
+[approvals]
+timeout_seconds = 120
+
+[dashboard]
+listen = "127.0.0.1:8080"
+public_url = "https://ariodb.internal.example"
+
+[audit]
+retention_days = 90
+redact_literals = true
+```
+
+Store the secrets it names before starting ariodb:
+
+```bash
+printf '%s\n' 'postgres://ariodb_gw:not-a-real-password@db.internal.example:5432/app' | ariodb secret set database-url
+printf '%s\n' 'postgres://ariodb_ro:not-a-real-password@db.internal.example:5432/app'  | ariodb secret set reporting-url
+openssl rand -hex 32 | ariodb secret set coding-agent-token
+openssl rand -hex 32 | ariodb secret set support-bot-token
+ariodb check
+```
+
+## Top level
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `on_failure` | string | `"closed"` | What to do when ariodb's own checks cannot run. Only `"closed"` (refuse the statement) is accepted. `"open"` is refused when the config loads, because letting statements through unchecked would defeat ariodb. The key exists so a config can say so explicitly. |
+
+```toml
+on_failure = "closed"   # must come before the first [section]
+
+[database]
+url = "postgres://ariodb_gw@localhost:5432/app"
+```
+
+## `[database]`
+
+The Postgres database agents work on, and the login their queries run as
+by default (the "gateway" role). The same settings, including the tunnel,
+are used by `setup`, `doctor`, the journal and undo, with the login
+replaced by `ARIODB_JOURNAL_URL` or `ARIODB_ADMIN_URL` when those are set.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `url` | string | required | The gateway login as a `postgres://` URL. It must start with `postgres://` or `postgresql://` even when the real URL comes from `ARIODB_DATABASE_URL` or `secret`. Must include a user; the database defaults to the user name. |
+| `secret` | string | none | Name of a secret holding the URL, used instead of `url`. `ARIODB_DATABASE_URL`, if set, still wins. |
+| `tls` | string | see below | TLS to the database: `disable`, `require` (encrypt, accept any certificate) or `verify` (encrypt and check the certificate and host name). |
+| `ca_file` | string | none | An extra trusted CA certificate (PEM) for `verify`, on top of the built-in public roots. See the limitation below. |
+| `tunnel` | string | none | Name of a [`[[tunnels]]`](#tunnels) entry. ariodb dials the tunnel's `listen` address instead of the URL's host and port; user, password, database and TLS name still come from the URL. |
+| `write_check` | string | `"measured"` | How a write is judged before commit. `measured` asks Postgres which tables the transaction changed and by how many rows (`pg_stat_xact_user_tables`), so triggers, cascades and functions count. `reported` trusts the row counts the database reports per statement, for Postgres-compatible databases that cannot measure (YugabyteDB, CockroachDB). See [compatibility](compatibility.md). |
+
+**The `tls` default** depends on the host in the effective URL: `disable`
+for `localhost`, any `127.x.x.x` address and `::1`; `verify` for everything
+else, including container names such as `db`. A `sslmode` parameter in the
+URL is ignored; only `tls` decides.
+
+**Trusted roots.** `verify` checks against a built-in bundle of public CA
+roots (the Mozilla set), not the operating system's trust store, plus
+`ca_file` if given.
+
+**Limitation: `ca_file` and admin connections.** In the current code,
+`ca_file` is honoured on agents' connections but not on ariodb's own admin
+connections (`ariodb setup`, `ariodb doctor`, the journal and `ariodb
+undo`), which verify against the public roots only. With a private CA and
+`tls = "verify"`, agents connect but those fail with `cannot connect: error
+performing TLS handshake`. Until that is fixed, use a certificate from a
+public CA, or `tls = "require"` (encrypted but unverified), or reach the
+database through a [tunnel](#tunnels) that handles TLS itself.
+
+```toml
+[database]
+url = "postgres://ariodb_gw@db.internal.example:5432/app"
+secret = "database-url"
+tls = "verify"
+ca_file = "/etc/ariodb/db-ca.pem"
+# tunnel = "cloudsql"
+# write_check = "reported"   # only for databases that cannot measure writes
+```
+
+## `[limits]`
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `max_rows_per_write` | integer | `500` | A write that changes more rows than this, counted across every table it touched (including through triggers and cascades), is rolled back. Must be at least 1. Agents can override it. |
+| `statement_timeout_ms` | integer | `5000` | Set as `SET LOCAL statement_timeout` at the start of every transaction ariodb runs for an agent. On ClickHouse it becomes `max_execution_time`, rounded up to whole seconds (at least 1). On Postgres, `0` means no timeout. |
+
+The timeout covers the statement running in the database, not time spent
+waiting for an approval. On Postgres it is a default, not a ceiling: an
+agent may send its own `SET statement_timeout` in the same query string
+and lift it for that transaction. See
+[statement timeouts](postgres.md#statement-timeouts) for a rule that
+stops this.
+
+```toml
+[limits]
+max_rows_per_write = 500
+statement_timeout_ms = 5000
+```
+
+## `[proxy]`
+
+The Postgres wire-protocol listener agents connect to.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `listen` | string | `"127.0.0.1:6543"` | Address and port to listen on. `""` switches the Postgres proxy off (for a ClickHouse-only setup). |
+| `tls_cert` | string | none | Certificate chain (PEM) for TLS between agents and ariodb. Set with `tls_key`. |
+| `tls_key` | string | none | Private key (PEM) for `tls_cert`. |
+| `require_tls` | boolean | `false` | Refuse agents that do not use TLS. Agents send their token as a cleartext password inside the protocol, so turn this on whenever agents connect over a network. Needs `tls_cert` and `tls_key`. |
+
+```toml
+[proxy]
+listen = "0.0.0.0:6543"
+tls_cert = "/etc/ariodb/proxy.crt"
+tls_key = "/etc/ariodb/proxy.key"
+require_tls = true
+```
+
+Agents then connect with `sslmode=require` (or `verify-full` with your CA):
+
+```bash
+psql "postgres://coding-agent@ariodb.internal.example:6543/app?sslmode=verify-full&sslrootcert=/etc/ssl/ariodb-ca.pem"
+```
+
+## `[journal]`
+
+The change journal that undo reads, and the location of ariodb's state
+directory. See [operations](operations.md#the-state-directory) for what
+lives there.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Record every row agents change, for undo. When on, every agent write is tagged with its session (`pg_logical_emit_message`) and `ariodb serve` reads the logical replication slot. Turn it off on databases without logical replication (Postgres 13, YugabyteDB, CockroachDB); reads and checked writes still work, undo does not. |
+| `dir` | string | `".ariodb"` | The state directory: `journal.jsonl`, `ariodb.db` (decisions log, approvals, dashboard users and sessions), `secrets.json` and `master.key`. Used even when the journal is off. Created with mode `0700`. |
+| `slot` | string | `"ariodb"` | The logical replication slot `ariodb setup` creates and the journal reads. Exactly one running `ariodb serve` may use a slot; see [high availability](operations.md#high-availability). |
+| `publication` | string | `"ariodb"` | The publication listing the protected tables (every table some `read_write` agent may change). `ariodb setup` replaces its table list, so give each ariodb instance on the same database its own. |
+
+```toml
+[journal]
+enabled = true
+dir = "/var/lib/ariodb"
+slot = "ariodb"
+publication = "ariodb"
+```
+
+## `[[agents]]`
+
+One entry per agent. An agent logs in with its `name` as the user name and
+its token as the password. The token is never the database password.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `name` | string | required | The user name the agent logs in with. Must be unique. |
+| `access` | string | required | `read_only` or `read_write`. |
+| `tables` | list of strings | required | Tables this agent may touch; at least one. Names ignore case and a `public.` prefix; other schemas are written `schema.table`. `["*"]` means every table. Agents may always read the Postgres catalogue (`pg_catalog`, `information_schema`). |
+| `token_env` | string | none | Environment variable holding the token. |
+| `token_secret` | string | none | Secret holding the token. Exactly one of `token_env` and `token_secret` is required. |
+| `max_rows_per_write` | integer | `[limits]` value | Overrides the row limit for this agent. |
+| `credential` | string | `[database]` | Name of a [`[[credentials]]`](#credentials) entry to run this agent's Postgres queries as. |
+
+The tables that `read_write` agents list are the *protected tables*:
+`ariodb setup` gives them full before-images and adds them to the
+publication. If any `read_write` agent lists `"*"`, every user table is
+protected.
+
+Generate tokens as long random values; they are compared in constant time
+but guesses are not rate limited:
+
+```bash
+openssl rand -hex 32 | ariodb secret set coding-agent-token
+```
+
+```toml
+[[agents]]
+name = "coding-agent"
+access = "read_write"
+tables = ["orders", "sales.invoices"]
+token_secret = "coding-agent-token"
+max_rows_per_write = 100
+
+[[agents]]
+name = "support-bot"
+access = "read_only"
+tables = ["orders"]
+token_env = "ARIODB_TOKEN_SUPPORT_BOT"
+credential = "reporting"
+```
+
+<!-- TODO: document the agent.credential rule fact once merged. -->
+
+### `[agents.clickhouse]`
+
+ClickHouse access, separate from Postgres access. In TOML,
+`[agents.clickhouse]` attaches to the `[[agents]]` entry written just above
+it. Without this block the agent cannot use the ClickHouse listeners.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `access` | string | required | `read_only` or `read_write`. |
+| `tables` | list of strings | required | ClickHouse tables. Unqualified names mean the `default` database; name others as `database.table`. |
+
+```toml
+[[agents]]
+name = "analytics-agent"
+access = "read_only"
+tables = ["orders"]
+token_secret = "analytics-agent-token"
+
+[agents.clickhouse]
+access = "read_only"
+tables = ["events", "analytics.page_views"]
+```
+
+<!-- TODO: document [agents.mysql] once MySQL and MariaDB support is merged. -->
+
+## `[[credentials]]`
+
+Extra database logins, so different agents can run as different Postgres
+roles. Grant each role only what its agents need: the role's privileges are
+the real boundary (see [the security model](security-model.md)).
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `name` | string | required | What agents refer to with `credential = "<name>"`. |
+| `url_env` | string | none | Environment variable holding the `postgres://` URL. |
+| `secret` | string | none | Secret holding the URL. One of `url_env` and `secret` is needed; if both are set, `url_env` wins. |
+| `tls` | string | `[database] tls` | As for `[database]`. When neither is set, the default follows the URL's host. |
+| `ca_file` | string | none | As for `[database]`. |
+| `tunnel` | string | none | A `[[tunnels]]` entry to dial instead of the URL's host and port. |
+
+A missing `url_env` or `secret` is only noticed when an agent that uses the
+credential connects (and by `ariodb doctor`), not when the config loads.
+
+```toml
+[[credentials]]
+name = "reporting"
+url_env = "ARIODB_REPORTING_URL"
+tls = "verify"
+```
+
+## `[[rules]]`
+
+CEL rules on top of each agent's built-in policy. They can refuse a
+statement or hold it for approval; they cannot allow what the built-in
+policy refuses. The rule language, the variables a condition can read and
+how rules combine are in [rules](rules.md); this is the key reference.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `name` | string | required | Unique name, shown in refusals, the decisions log and the dashboard. |
+| `condition` | string | none | A CEL expression. Omitted, the rule matches every statement. A condition that cannot be evaluated counts as a deny. |
+| `verdict` | string | required | `allow`, `deny` or `approve`. |
+| `approve` | list of strings | `[]` | Approvers for `verdict = "approve"`, all of which must allow. Required (non-empty) for `approve`. |
+| `reason` | string | `rule '<name>'` | Text shown to the agent and recorded. |
+| `agents` | list of strings | `[]` (every agent) | Limit the rule to these agents. |
+| `priority` | integer | `0` | Among matching rules, the highest priority decides between `allow` and `approve`; ties keep file order. Any matching `deny` wins regardless. |
+| `stage` | string | `"before"` | `before`: judged on the SQL before it runs. `after`: judged on what a write actually changed, before commit. Rules that read plugin facts must be `before`. |
+
+```toml
+[[rules]]
+name = "no-file-functions"
+# Matches pg_read_file and pg_catalog.pg_read_file alike; see rules.md.
+condition = "sql.functions.exists(f, f.matches('(^|[.])pg_(read_file|read_binary_file|ls_dir|stat_file)$'))"
+verdict = "deny"
+reason = "functions that read server files are off-limits"
+
+[[rules]]
+name = "big-writes-need-a-person"
+stage = "after"
+condition = "effects.rows > 50"
+verdict = "approve"
+approve = ["ops"]
+agents = ["coding-agent"]
+priority = 10
+```
+
+## `[[approvers]]`
+
+Who decides when a rule's verdict is `approve`. How each type behaves, and
+how to set up Slack and webhooks, is in [approvals](approvals.md).
+
+### Keys every approver takes
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `name` | string | required | Unique; rules list it in `approve`. |
+| `type` | string | required | `dashboard`, `slack`, `webhook`, `llm` or `plugin`. |
+| `timeout_seconds` | integer | `[approvals] timeout_seconds` | How long to wait for this approver. Applies to `dashboard`, `slack`, `webhook` and `plugin`. A model approver (`llm`) is not bounded by it; see [model approvers](#llm-a-model). |
+
+<!-- TODO: document further approver channels once merged. -->
+
+### `dashboard`
+
+A person decides in the dashboard, or with `ariodb approve` / `ariodb deny`.
+No other keys.
+
+```toml
+[[approvers]]
+name = "ops"
+type = "dashboard"
+timeout_seconds = 300
+```
+
+### `slack`
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `channel` | string | required | Slack channel ID to post to. |
+| `bot_token_env` / `bot_token_secret` | string | one required | The bot token (`xoxb-...`). |
+| `interactive` | boolean | `false` | Add Approve and Deny buttons. Needs the signing secret, and Slack's interactivity request URL set to `<public_url>/slack/actions`. Without buttons, people decide in the dashboard from the link in the message. |
+| `signing_secret_env` / `signing_secret_secret` | string | required when `interactive` | The Slack app's signing secret, used to check button callbacks. |
+
+```toml
+[[approvers]]
+name = "ops-slack"
+type = "slack"
+channel = "C0123456789"
+bot_token_secret = "slack-bot-token"
+interactive = true
+signing_secret_secret = "slack-signing-secret"
+```
+
+### `webhook`
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `url` | string | required | Where ariodb POSTs the signed JSON request. |
+| `hmac_secret_env` / `hmac_secret_secret` | string | one required | Key for the `x-ariodb-signature` header and the signed approve and deny links. |
+
+```toml
+[[approvers]]
+name = "pager"
+type = "webhook"
+url = "https://hooks.internal.example/ariodb"
+hmac_secret_secret = "webhook-hmac"
+```
+
+### `llm` (a model)
+
+A model judges the statement against a written policy. The statements, the
+policy, the agent's name, the database and the rule are sent to the
+provider with literal values intact.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `policy` | string | required | The written policy the model applies. |
+| `provider` | string | `"anthropic"` | `anthropic`, `openai`, `gemini`, `azure_openai` or `openai_compatible`. |
+| `model` | string | provider default | `claude-opus-5-5` (anthropic), `gpt-6-astra` (openai), `gemini-3.8-flash` (gemini). Required for `azure_openai` (the deployment name) and `openai_compatible`. |
+| `base_url` | string | provider's public API | Required for `azure_openai` (the resource endpoint) and `openai_compatible` (up to and including `/v1`). Must be `https`, except for `localhost`, `*.localhost` and loopback addresses. |
+| `api_key_env` / `api_key_secret` | string | provider variable | Where the API key comes from. Without either, ariodb reads `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` or `AZURE_OPENAI_API_KEY`; `openai_compatible` then sends no key. |
+| `effort` | string | `low` on default models | The provider's reasoning control. anthropic: `low`, `medium`, `high`, `xhigh`, `max`. openai and azure_openai: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. gemini: `minimal`, `low`, `medium`, `high`. Ignored, with a warning, for `openai_compatible`. Sent by default only on each provider's default model and on every Anthropic model. |
+| `api_version` | string | `"v1"` | `azure_openai` only: `v1` or `preview`. |
+
+Each question is tried up to three times on network errors, 408, 429 and
+5xx, with backoff that honours `Retry-After` (a request to wait more than 30
+seconds counts as down). Each attempt may take up to 60 seconds, so a slow
+provider can hold a statement for up to about four minutes before
+`llm_fail_mode` decides. Any other HTTP status, or a redirect, is a
+configuration error and always refuses.
+
+```toml
+[[approvers]]
+name = "model"
+type = "llm"
+policy = "Allow reads of order data. Deny anything that exports personal data in bulk."
+provider = "anthropic"
+api_key_secret = "anthropic-key"
+
+[[approvers]]
+name = "local-model"
+type = "llm"
+provider = "openai_compatible"
+policy = "Allow reads of order data. Deny anything that exports personal data in bulk."
+base_url = "http://127.0.0.1:11434/v1"
+model = "llama3.3"
+```
+
+### `plugin`
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `plugin` | string | required | A [`[[plugins]]`](#plugins) entry that declares the `approver` capability. |
+
+```toml
+[[approvers]]
+name = "office-hours"
+type = "plugin"
+plugin = "office_hours"
+timeout_seconds = 10
+```
+
+## `[approvals]`
+
+Settings shared by all approvers.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `timeout_seconds` | integer | `90` | How long a person or plugin has to decide. No decision in time means the statement is refused. Agents' own client timeouts should be longer than this. |
+| `llm_fail_mode` | string | `"closed"` | When a model cannot be reached (network error, 408, 429, 5xx, or a reply that is not JSON): `closed` refuses, `open` allows and records that the model never answered. Configuration errors always refuse. |
+| `llm_cache_seconds` | integer | `300` | Reuse a model's answer to the same question (same approver, model, address, policy, agent, database, rule and SQL) for this long. Only real answers are cached, never an outage. `0` asks every time. The cache is in memory and per process. |
+
+```toml
+[approvals]
+timeout_seconds = 90
+llm_fail_mode = "closed"
+llm_cache_seconds = 300
+```
+
+An after-stage approval keeps the write's transaction open, and its row
+locks held, while it waits.
+
+## `[dashboard]`
+
+The built-in dashboard, and the endpoints Slack and webhooks call back to.
+See [the dashboard](dashboard.md).
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `listen` | string | `"127.0.0.1:8080"` | Where the dashboard listens. `""` switches it off, along with the Slack and webhook callbacks. It speaks plain HTTP; put TLS in front of it with a reverse proxy. |
+| `public_url` | string | `"http://127.0.0.1:8080"` | The address people, Slack and webhook receivers use to reach the dashboard. Used for links in Slack messages and webhook payloads. When it starts with `https://`, session cookies are marked `Secure`. |
+| `config_writes` | boolean | `false` | Let the dashboard save edits to the config file. Leave it off when the config is managed in Git; the config page then shows the edit to copy. When on, ariodb needs write access to the config file's directory (it writes `<file>.tmp` and keeps `<file>.bak`). |
+
+```toml
+[dashboard]
+listen = "127.0.0.1:8080"
+public_url = "https://ariodb.internal.example"
+config_writes = false
+```
+
+<!-- TODO: document OIDC single sign-on and dashboard roles once merged. -->
+
+## `[audit]`
+
+The decisions log in `<state dir>/ariodb.db`: every statement, verdict,
+rule, row count and latency, hash-chained.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `retention_days` | integer | `30` | Delete entries older than this many days, checked hourly by `ariodb serve`. `0` keeps everything. |
+| `redact_literals` | boolean | `false` | Store statements with literal values replaced by `$1`, `$2`, ..., so customer data in `WHERE` clauses or `VALUES` stays out of the decisions log, notifier plugins and audit-sink plugins. It does not affect approvals: the stored approval request, Slack messages, webhook payloads, and what model and plugin approvers and fact plugins are sent all carry the statement with its literals. See [the security model](security-model.md). |
+
+```toml
+[audit]
+retention_days = 90
+redact_literals = true
+```
+
+## `[clickhouse]`
+
+ariodb in front of ClickHouse's HTTP interface and its native protocol. See
+[ClickHouse](clickhouse.md) for behaviour and limits.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `http_listen` | string | `""` (off) | Where agents send ClickHouse HTTP requests. |
+| `http_url` | string | `"http://127.0.0.1:8123"` | The real ClickHouse HTTP interface. `https://` is supported. |
+| `native_listen` | string | `""` (off) | Where agents connect with the native protocol (`clickhouse-client`). Reads only. |
+| `native_addr` | string | `"127.0.0.1:9000"` | The real native port, as `host:port`. ariodb connects to it without TLS. |
+| `user` | string | `"default"` | The ClickHouse login ariodb uses for every agent. Agents never see it. |
+| `password_env` / `password_secret` | string | none (empty password) | Its password. If both are set, the secret wins. |
+| `accept_invalid_certificate` | boolean | `false` | Skip certificate checks for an `https://` `http_url`, for a private CA. There is no CA-file option. |
+| `tls_cert` / `tls_key` | string | none | Certificate and key (PEM) for agents' connections. When set, both listeners accept TLS only: agents use `https://` and `clickhouse-client --secure`. Set both or neither. |
+| `tunnel` | string | none | Reach ClickHouse (both interfaces) through this `[[tunnels]]` entry. The tunnel must forward to whichever port is used. Through a tunnel, TLS on `http_url` is still checked against the real host name. |
+
+```toml
+[clickhouse]
+http_listen = "0.0.0.0:8124"
+http_url = "https://ch.internal.example:8443"
+native_listen = "0.0.0.0:9441"
+native_addr = "ch.internal.example:9000"
+user = "ariodb"
+password_secret = "clickhouse-password"
+tls_cert = "/etc/ariodb/ch.crt"
+tls_key = "/etc/ariodb/ch.key"
+```
+
+<!-- TODO: ClickHouse native INSERT is refused today; document it once merged. -->
+
+<!-- TODO: document the [mysql] section once MySQL and MariaDB support is merged. -->
+
+## `[[tunnels]]`
+
+Side processes that carry ariodb's connections to a database:
+`cloud-sql-proxy`, an IAP tunnel or an SSH port-forward. `ariodb serve`
+starts each one before accepting agents, waits until its port accepts
+connections, restarts it with backoff (1 s doubling to 30 s, reset after a
+minute of good running) when it exits, and stops it on shutdown. One-off
+commands (`setup`, `doctor`, `undo`, `mcp`) reuse a tunnel that is already
+listening, or start their own.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `name` | string | required | Unique; `[database]`, credentials and `[clickhouse]` refer to it with `tunnel = "<name>"`. |
+| `command` | list of strings | required | The program and its arguments, run directly (not through a shell). |
+| `listen` | string | required | The local address the process listens on, as an IP address and port (`127.0.0.1:5433`, not `localhost:5433`). Must be unique across tunnels. |
+| `ready_probe` | string | `"tcp"` | How ariodb knows the tunnel is up. `tcp` (a connection succeeds) is the only probe. |
+| `ready_timeout_seconds` | integer | `30` | How long to wait for the port at start. Must be at least 1. `ariodb serve` refuses to start if a tunnel misses it. |
+| `restart` | boolean | `true` | Start it again when it exits. |
+
+The tunnel's output appears in ariodb's log prefixed `tunnel <name>:`. Its
+process gets its own process group, and on shutdown receives SIGTERM, then
+SIGKILL five seconds later.
+
+```toml
+[database]
+url = "postgres://ariodb_gw@10.20.0.5:5432/app"
+secret = "database-url"
+tunnel = "cloudsql"
+tls = "disable"   # cloud-sql-proxy encrypts the hop to Cloud SQL itself
+
+[[tunnels]]
+name = "cloudsql"
+command = ["cloud-sql-proxy", "--port", "5433", "my-project:europe-west2:app-db"]
+listen = "127.0.0.1:5433"
+ready_timeout_seconds = 30
+restart = true
+```
+
+With an SSH port-forward the database still speaks TLS end to end, so keep
+`tls = "verify"`: the certificate is checked against the URL's host name,
+not the tunnel's address.
+
+```toml
+[[tunnels]]
+name = "bastion"
+command = ["ssh", "-N", "-L", "127.0.0.1:5434:db.internal.example:5432", "ariodb@bastion.example.com"]
+listen = "127.0.0.1:5434"
+```
+
+## `[[plugins]]`
+
+Programs ariodb starts and talks to over stdin and stdout with
+newline-delimited JSON-RPC 2.0. The protocol and lifecycle are in
+[plugins](plugins.md).
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `name` | string | required | Letters, digits and underscores, starting with a letter. Rules read its facts as `plugin.<name>.<key>`. |
+| `command` | list of strings | required | The program and its arguments, run directly in ariodb's working directory. |
+| `env` | table | `{}` | Variables set for the plugin. Do not put credentials here. |
+| `pass_env` | list of strings | `[]` | Names of ariodb's own environment variables to pass on. |
+| `secret_env` | table | `{}` | Variables filled from the secret store: variable name to secret name. |
+| `timeout_ms` | integer | `5000` | How long one call may take, unless the call has its own limit (approvals use the approver's timeout). Must be at least 1. |
+| `facts_cache_ms` | integer | `0` | Reuse a facts answer for the same request this long. `0` asks every time. |
+
+The plugin's environment is only `PATH`, `HOME`, then `pass_env`, then
+`secret_env`, then `env`.
+
+```toml
+[[plugins]]
+name = "office_hours"
+command = ["python3", "-I", "/opt/ariodb/plugins/ariodb_plugin.py"]
+timeout_ms = 2000
+facts_cache_ms = 10000
+pass_env = ["ARIODB_PAGER_TOKEN"]
+secret_env = { PAGER_KEY = "pager-key" }
+env = { ARIODB_EXAMPLE_CUTOFF_HOUR = "18" }
+```
+
+## Environment variables
+
+| Variable | Read by | What it does |
+|---|---|---|
+| `ARIODB_DATABASE_URL` | every command that connects | The gateway login. Wins over `[database] url` and `[database] secret`. |
+| `ARIODB_JOURNAL_URL` | `setup`, the journal, `doctor` | The login for setup and the journal; needs the `REPLICATION` attribute, and for `setup`, ownership of the protected tables and `CREATE` on the database (to create the publication). Falls back to the gateway URL. See [Postgres roles](postgres.md). |
+| `ARIODB_ADMIN_URL` | `undo`, dashboard undo | The login undo runs as; needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the protected tables. Falls back to the gateway URL. |
+| `ARIODB_AGENT_TOKEN` | `mcp` | The token `ariodb mcp --agent <name>` checks against that agent's. |
+| `ARIODB_MASTER_KEY` | everything that opens the secret store | The secret store's key: 32 bytes, base64. Without it, `<state dir>/master.key` is used, and created on first use. |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AZURE_OPENAI_API_KEY` | model approvers | The provider's key when an approver names neither `api_key_env` nor `api_key_secret`. |
+| `ARIODB_ANTHROPIC_API`, `ARIODB_OPENAI_API`, `ARIODB_GEMINI_API` | model approvers | Replace the provider's public API address when the approver sets no `base_url`. Meant for tests; prefer `base_url`. |
+| `ARIODB_SLACK_API` | Slack approvers | Replace `https://slack.com/api`. Meant for tests. |
+| `USER` | `approve`, `deny`, `undo --apply` | Recorded as the decider, `cli:<user>`. |
+| `PATH`, `HOME` | plugins | Passed to every plugin. |
+| Any name in a `*_env` key | as configured | Agent tokens, credential URLs, approver secrets, ClickHouse password, plugin `pass_env`. |
+
+Environment variables are read from ariodb's own process, so a change
+needs a restart of that process to take effect. Secrets in the store do
+not (see below).
+
+## The secret store
+
+An encrypted file for database URLs, tokens and API keys, so they need not
+live in environment variables or the config file.
+
+- **Where:** `<state dir>/secrets.json`, next to the key in
+  `<state dir>/master.key` (created `0600` on first use) unless
+  `ARIODB_MASTER_KEY` is set.
+- **How:** each value is sealed with XChaCha20-Poly1305 under the 32-byte
+  master key, with the secret's name bound in as associated data, so a
+  sealed value cannot be moved to another name.
+- **Managing it:** `ariodb secret set <name>` (value from stdin, so it stays
+  out of shell history), `ariodb secret list` (names only),
+  `ariodb secret delete <name>`, or the dashboard's settings page.
+- **Keys that take a secret name:** `[database] secret`, `[[credentials]]
+  secret`, `[[agents]] token_secret`, `[clickhouse] password_secret`,
+  `bot_token_secret`, `signing_secret_secret`, `hmac_secret_secret` and
+  `api_key_secret` on approvers, and the values of a plugin's `secret_env`.
+- **When values are read:** at the moment they are used (each new agent
+  connection, each ClickHouse request, each approval), so `ariodb secret
+  set` takes effect for the next use without a restart. Plugins read
+  `secret_env` when they start.
+
+```bash
+printf '%s\n' 'postgres://ariodb_gw:not-a-real-password@db.internal.example:5432/app' | ariodb secret set database-url
+ariodb secret list
+```
+
+To keep secrets safe in backups of the state directory, set
+`ARIODB_MASTER_KEY` from your secrets manager instead of relying on
+`master.key`, and do not back the key up with the directory:
+
+```bash
+export ARIODB_MASTER_KEY="$(openssl rand -base64 32)"   # generate once, store it in your secrets manager
+```
+
+If you switch an existing store to `ARIODB_MASTER_KEY`, use the same key
+that is in `master.key` (`cat <state dir>/master.key`), or set every secret
+again: values sealed under one key cannot be opened with another.
+
+## What reloads while ariodb runs
+
+`ariodb serve` checks the config file's modification time every two
+seconds. When it changes, ariodb loads and validates the whole file. If it
+is valid, the new config is swapped in and the log says
+`ariodb: reloaded <path>`. If not, the previous config stays in force and
+the log says `ariodb: kept the previous config: <error>`. Saving from the
+dashboard (with `config_writes = true`) applies at once.
+
+```mermaid
+flowchart LR
+  edit[File modified] --> load{Loads and validates?}
+  load -- yes --> swap[New config used for the next statement or connection]
+  load -- no --> keep["Previous config kept, error logged"]
+```
+
+| Takes effect without a restart | Needs a restart of `ariodb serve` |
+|---|---|
+| `[[agents]]`: access, tables, row limits, credential, tokens from the secret store (for the next login or statement) | `[proxy] listen`, `tls_cert`, `tls_key` |
+| `[[rules]]`, `[[approvers]]`, `[approvals]` (next statement) | `[dashboard] listen` |
+| `[limits]` (next transaction) | `[clickhouse] http_listen`, `native_listen`, `tls_cert`, `tls_key` |
+| `[[credentials]]` and `[database]` URL, secret and TLS (new connections) | `[[tunnels]]` (any change) |
+| `[database] write_check` (new agent connections) | `[[plugins]]` (any change) |
+| `[proxy] require_tls` (new connections; the certificate must already be loaded) | `[journal]` (any key, including `dir`) |
+| `[dashboard] public_url`, `config_writes` | `[audit] redact_literals` for the decisions log |
+| `[audit] retention_days` (next hourly prune) | Environment variables, including `*_env` tokens |
+| `[clickhouse] http_url`, `native_addr`, `user`, password, `accept_invalid_certificate` (next request) | |
+
+A config that points at a tunnel or plugin added since start-up is valid,
+but connections through that tunnel fail until ariodb restarts. Other
+processes (`ariodb mcp`, one-off commands) read the config when they start.
+
+## Validation errors
+
+These are the messages ariodb prints, prefixed `error:`, when a config does
+not load. `ariodb check`, `serve` and every other command except `classify`
+stop with exit code 1 (`ariodb test` uses 2). During a reload, the same
+text follows `ariodb: kept the previous config:`.
+
+### Reading and parsing
+
+| Message | Fix |
+|---|---|
+| `cannot read ariodb.toml: No such file or directory (os error 2)` | Run from the directory holding the file, or pass `--config /path/to/ariodb.toml`. |
+| `config is not valid TOML: TOML parse error at line 1, column 1` ... `missing field `database`` | Add a `[database]` section with a `url`. |
+| `config is not valid TOML: ...` `unknown variant `superuser`, expected `read_only` or `read_write`` | An enumerated value is misspelt; the message lists the accepted ones. The same applies to `tls`, `verdict`, `stage`, `type`, `write_check` and `llm_fail_mode`. |
+
+### `[database]`, `[limits]` and top level
+
+| Message | Fix |
+|---|---|
+| `database.url must start with postgres:// or postgresql://` | Even with `secret` or `ARIODB_DATABASE_URL`, `url` must hold a `postgres://` URL. |
+| `on_failure = "open" is not supported: ariodb always refuses a statement it cannot check. Remove the line or set it to "closed"` | As it says. |
+| `limits.max_rows_per_write must be at least 1` | Use a positive limit. |
+
+### Agents and credentials
+
+| Message | Fix |
+|---|---|
+| `agent 'coding-agent' is listed twice` | Agent names must be unique. |
+| `agent 'coding-agent' uses credential 'ro', which is not defined` | Add a `[[credentials]]` entry with that name. |
+| `agent 'coding-agent' needs exactly one of token_env or token_secret` | Set one, not both. |
+| `agent 'coding-agent' must list at least one table` | Add tables, or `["*"]`. |
+
+### Rules and approvers
+
+| Message | Fix |
+|---|---|
+| `rule 'r' is defined twice` | Rule names must be unique. |
+| `rule 'r' has verdict approve but no approvers` | Add `approve = ["<approver>"]`. |
+| `rule 'r' uses approver 'ops', which is not defined` | Add the `[[approvers]]` entry. |
+| ``rule 'r': condition does not compile: `sql.kind ==` `` | Fix the CEL; try it with `ariodb explain`. |
+| `rule 'r': plugin facts are only available to before-stage rules` | Remove `stage = "after"`, or move the plugin check to its own rule. |
+| `rule 'r' reads facts from plugin 'x', which is not defined in [[plugins]]` | Define the plugin, or fix the name. |
+| `approver 'ops' is defined twice` | Approver names must be unique. |
+| `approver 's' (Slack) needs channel` | Also: `needs bot_token_secret or bot_token_env`, `needs signing_secret_secret or signing_secret_env for interactive buttons`. |
+| `approver 'w' (Webhook) needs url` | Also: `needs hmac_secret_secret or hmac_secret_env`. |
+| `approver 'm' (Llm) needs policy` | Write the policy the model applies. |
+| `approver 'p' (Plugin) needs plugin` | Name the `[[plugins]]` entry. |
+| `approver 'p' uses plugin 'x', which is not defined in [[plugins]]` | Define the plugin. |
+| `approver 'm': unknown provider 'claude' (expected one of anthropic, openai, gemini, azure_openai, openai_compatible)` | Use one of the listed names. |
+| `approver 'm' (openai_compatible) needs base_url` | Required for `openai_compatible` and `azure_openai`. |
+| `approver 'm': base_url 'http://models.internal:8000/v1' must use https: statements and API keys would cross the network unencrypted (plain http is allowed only for localhost)` | Use `https`, or a local address. |
+| `approver 'az' (azure_openai) needs model (the deployment name)` | Name the deployment; `openai_compatible` likewise `needs model`. |
+| `approver 'm': api_version only applies to azure_openai` | Remove it. Also: `api_version must be "v1" or "preview" (Azure's v1 API)`. |
+| `approver 'm': effort 'huge' is not one of low, medium, high, xhigh, max for anthropic` | Use a value the provider accepts. |
+
+One warning does not stop the load: `ariodb: warning: approver 'y': effort
+is ignored, because openai_compatible servers have no standard reasoning
+control`.
+
+### Tunnels and plugins
+
+| Message | Fix |
+|---|---|
+| `every tunnel needs a name` / `tunnel 'pg' is listed twice` | Give each tunnel a unique name. |
+| `tunnel 'pg' needs a command, such as ["cloud-sql-proxy", "--port", "5433", "project:region:instance"]` | Set `command`. |
+| `tunnel 'pg': listen = "localhost:5433" must be an IP address and port, such as 127.0.0.1:5433` | Use an IP address. |
+| `tunnels 'a' and 'b' both listen on 127.0.0.1:5433` | Give each its own port. |
+| `tunnel 'pg': ready_timeout_seconds must be at least 1` | Use a positive timeout. |
+| `[database] uses tunnel 'pg', which is not defined in [[tunnels]]` | Also reported for `credential '<name>'` and `[clickhouse]`. |
+| `plugin name 'office-hours' must be letters, digits and underscores, starting with a letter (rules read its facts as plugin.<name>)` | Rename it, for example `office_hours`. |
+| `plugin 'x' is listed twice` / `plugin 'x' needs a command, such as ["python3", "plugin.py"]` | As it says. |
+| `plugin 'x': timeout_ms must be at least 1` | Use a positive timeout. |
+| `plugin 'x': 'A=B' is not an environment variable name` | Variable names in `env`, `pass_env` and `secret_env` cannot contain `=`. |
+
+### Errors that appear only when `ariodb serve` starts
+
+These are not checked by `ariodb check`:
+
+| Message | Fix |
+|---|---|
+| `proxy.tls_cert and proxy.tls_key must be set together` | Set both or neither. Likewise `clickhouse.tls_cert and clickhouse.tls_key must be set together`. |
+| `proxy.require_tls needs proxy.tls_cert and proxy.tls_key` | Add the certificate and key. |
+| `/etc/ariodb/proxy.key: no private key found` | The file holds no PEM private key. A missing file gives `/etc/ariodb/proxy.key: No such file or directory (os error 2)`. |
+| `TLS certificate: ...` | The certificate and key do not match, or the certificate is unusable. |
+| `cannot listen on 0.0.0.0:6543: Address already in use (os error 98)` | Something else holds the port; often a second ariodb. |
+| `bad clickhouse.http_url: ...` | Fix the URL. |
+
+## Next
+
+- [CLI reference](cli.md): every command, and which need the database
+- [Operations](operations.md): running ariodb in production
+- [Troubleshooting](troubleshooting.md): symptoms, causes and fixes
+- [Rules](rules.md) and [approvals](approvals.md): the policy keys in depth
+- [Compatibility](compatibility.md): `write_check` and database support
