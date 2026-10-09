@@ -34,9 +34,41 @@ pub struct Section {
 #[derive(Debug, Clone)]
 pub struct Report {
     pub sections: Vec<Section>,
+    /// Postgres, when ariodb fronts it.
+    pub postgres: Option<Guarantees>,
+    /// MySQL or MariaDB, when ariodb fronts it.
+    pub mysql: Option<Guarantees>,
+}
+
+/// The three guarantees, for one engine.
+#[derive(Debug, Clone)]
+pub struct Guarantees {
     pub reads: Result<(), String>,
     pub writes: Result<(), String>,
     pub undo: Result<(), String>,
+}
+
+impl Guarantees {
+    fn lines(&self) -> [(&'static str, &Result<(), String>); 3] {
+        [
+            ("reads, forced read-only", &self.reads),
+            ("writes, checked before commit", &self.writes),
+            ("undo of agent sessions", &self.undo),
+        ]
+    }
+
+    fn summary(&self) -> String {
+        let show = |r: &Result<(), String>| match r {
+            Ok(()) => "yes".to_string(),
+            Err(why) => format!("no ({why})"),
+        };
+        format!(
+            "reads {}; checked writes {}; undo {}",
+            show(&self.reads),
+            show(&self.writes),
+            show(&self.undo)
+        )
+    }
 }
 
 impl Report {
@@ -61,30 +93,30 @@ impl Report {
             println!();
         }
         println!("what works here");
-        for (name, r) in [
-            ("reads, forced read-only", &self.reads),
-            ("writes, checked before commit", &self.writes),
-            ("undo of agent sessions", &self.undo),
-        ] {
-            match r {
-                Ok(()) => println!("  yes  {name}"),
-                Err(why) => println!("  no   {name}: {why}"),
+        // Postgres lines keep their plain wording; MySQL's are named.
+        let engines = [("", &self.postgres), ("MySQL ", &self.mysql)];
+        for (engine, g) in engines {
+            let Some(g) = g else { continue };
+            for (name, r) in g.lines() {
+                match r {
+                    Ok(()) => println!("  yes  {engine}{name}"),
+                    Err(why) => println!("  no   {engine}{name}: {why}"),
+                }
             }
+        }
+        if self.postgres.is_none() && self.mysql.is_none() {
+            println!("  nothing: neither Postgres nor MySQL is configured");
         }
     }
 
     /// One line for the log when ariodb starts.
     pub fn summary(&self) -> String {
-        let show = |r: &Result<(), String>| match r {
-            Ok(()) => "yes".to_string(),
-            Err(why) => format!("no ({why})"),
-        };
-        format!(
-            "reads {}; checked writes {}; undo {}",
-            show(&self.reads),
-            show(&self.writes),
-            show(&self.undo)
-        )
+        match (&self.postgres, &self.mysql) {
+            (Some(p), Some(m)) => format!("{}; MySQL: {}", p.summary(), m.summary()),
+            (Some(p), None) => p.summary(),
+            (None, Some(m)) => format!("MySQL: {}", m.summary()),
+            (None, None) => "neither Postgres nor MySQL is configured".to_string(),
+        }
     }
 }
 
@@ -133,6 +165,25 @@ type Login = (String, Result<(Target, String), String>);
 
 pub async fn run(config: &Config) -> Report {
     let mut sections = Vec::new();
+    // Postgres is configured unless both its proxy and journal are off.
+    let postgres = if !config.proxy.listen.is_empty() || config.journal.enabled {
+        Some(run_postgres(config, &mut sections).await)
+    } else {
+        None
+    };
+    let mysql = if config.mysql.listen.is_empty() {
+        None
+    } else {
+        Some(run_mysql(config, &mut sections).await)
+    };
+    Report {
+        sections,
+        postgres,
+        mysql,
+    }
+}
+
+async fn run_postgres(config: &Config, sections: &mut Vec<Section>) -> Guarantees {
     let mut reads = Ok(());
     let mut writes = Ok(());
 
@@ -227,8 +278,7 @@ pub async fn run(config: &Config) -> Report {
     };
     // Writes are tagged for the journal, so they need the journal's checks
     // on the gateway side too; those ran per login above.
-    Report {
-        sections,
+    Guarantees {
         reads,
         writes,
         undo,
@@ -774,4 +824,263 @@ async fn protected_tables(config: &Config, client: &Client) -> Vec<String> {
         tables.dedup();
     }
     tables
+}
+
+// ---------------------------------------------------------------------------
+// MySQL and MariaDB
+
+/// The gateway login agents' queries run as, then the journal login.
+async fn run_mysql(config: &Config, sections: &mut Vec<Section>) -> Guarantees {
+    let mut checks = Checks { findings: vec![] };
+    let title = format!(
+        "mysql gateway: {}@{}/{}",
+        config.mysql.user, config.mysql.addr, config.mysql.database
+    );
+    let work = check_mysql_gateway(config, &mut checks);
+    let (reads, mut writes) = match tokio::time::timeout(Duration::from_secs(30), work).await {
+        Ok(r) => r,
+        Err(_) => {
+            let why = "the checks took longer than 30 seconds".to_string();
+            checks.fail(why.clone());
+            (Err(why.clone()), Err(why))
+        }
+    };
+    sections.push(Section {
+        title,
+        findings: checks.findings,
+    });
+    let writers = config
+        .agents
+        .iter()
+        .filter_map(|a| a.mysql.as_ref())
+        .any(|m| m.access == Access::ReadWrite);
+    if !writers && writes.is_ok() {
+        writes = Err("no agent has MySQL write access".to_string());
+    }
+    let undo = if config.mysql.journal {
+        let (section, undo) = crate::mysql_journal::doctor(config).await;
+        sections.push(section);
+        undo
+    } else {
+        Err("the MySQL journal is off ([mysql] journal = false)".to_string())
+    };
+    Guarantees {
+        reads,
+        writes,
+        undo,
+    }
+}
+
+/// Run `sql` and expect it to fail; returns the error, or None if it ran.
+async fn mysql_error(conn: &mut mysql_async::Conn, sql: &str) -> Option<mysql_async::Error> {
+    use mysql_async::prelude::Queryable;
+    conn.query_drop(sql).await.err()
+}
+
+async fn check_mysql_gateway(
+    config: &Config,
+    checks: &mut Checks,
+) -> (Result<(), String>, Result<(), String>) {
+    use crate::mysql_journal::{code, message, quote_table};
+    use mysql_async::prelude::Queryable;
+    let fail_both = |checks: &mut Checks, why: String| {
+        checks.fail(why.clone());
+        (Err(why.clone()), Err(why))
+    };
+    let password = match config.mysql_password() {
+        Ok(p) => p,
+        Err(e) => return fail_both(checks, e),
+    };
+    let mut conn = match crate::mysql_journal::connect_as(config, &config.mysql.user, &password).await {
+        Ok(c) => c,
+        Err(e) => return fail_both(checks, e),
+    };
+    let cipher: Option<(String, String)> = conn
+        .query_first("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+        .await
+        .ok()
+        .flatten();
+    let host = config.mysql.addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+    match cipher {
+        Some((_, c)) if !c.is_empty() => checks.ok("connected over TLS"),
+        _ if host == "localhost" || host.starts_with("127.") || host == "[::1]" => {
+            checks.ok("connected (no TLS, local database)")
+        }
+        _ => checks.warn("connected without TLS; set [mysql] tls = \"verify\""),
+    }
+    match conn.query_first::<String, _>("SELECT VERSION()").await {
+        Ok(Some(v)) if v.contains("MariaDB") => {
+            checks.ok(format!("MariaDB {}", v.split('-').next().unwrap_or(&v)))
+        }
+        Ok(Some(v)) => checks.ok(format!("MySQL {v}")),
+        Ok(None) => checks.warn("server version unknown"),
+        Err(e) => checks.warn(format!("server version unknown: {}", message(&e))),
+    }
+    let _ = conn.query_drop("SET SESSION innodb_lock_wait_timeout = 3").await;
+
+    let (db, table) = crate::mysql_journal::tag_table(config);
+    let tag = quote_table(&db, &table);
+    let insert = format!("INSERT INTO {tag} (session, agent) VALUES ('doctor', 'ariodb-doctor')");
+
+    // Reads run in READ ONLY transactions; the server must refuse a write.
+    let reads = match mysql_error(&mut conn, "START TRANSACTION READ ONLY").await {
+        Some(e) => {
+            let why = format!("READ ONLY transactions are not available: {}", message(&e));
+            checks.fail(why.clone());
+            Err(why)
+        }
+        None => {
+            let attempt = mysql_error(&mut conn, &insert).await;
+            let _ = conn.query_drop("ROLLBACK").await;
+            match attempt {
+                Some(e) if code(&e) == Some(1792) => {
+                    checks.ok("reads run in READ ONLY transactions, and the server enforces them");
+                    Ok(())
+                }
+                Some(e) => {
+                    checks.warn(format!(
+                        "reads run in READ ONLY transactions; enforcement could not be tested ({})",
+                        message(&e)
+                    ));
+                    Ok(())
+                }
+                None => {
+                    let why = "the server let a READ ONLY transaction insert a row".to_string();
+                    checks.fail(why.clone());
+                    Err(why)
+                }
+            }
+        }
+    };
+
+    // Writes: tagged for the journal, and counted by InnoDB before commit.
+    let mut writes = Ok(());
+    let _ = conn.query_drop("START TRANSACTION").await;
+    let wrote = if config.mysql.journal {
+        match mysql_error(&mut conn, &insert).await {
+            None => {
+                checks.ok("writes can be tagged with their session for the journal");
+                true
+            }
+            Some(e) => {
+                let why = format!("writes cannot be tagged for the journal: {}", message(&e));
+                let hint = if code(&e) == Some(1146) {
+                    "run `ariodb setup`".to_string()
+                } else {
+                    format!("GRANT INSERT ON {tag} to this login")
+                };
+                checks.fail(format!(
+                    "{why}; every write will fail while the journal is on. {hint}, or set [mysql] journal = false to write without undo"
+                ));
+                writes = Err(why);
+                false
+            }
+        }
+    } else {
+        let made = mysql_error(
+            &mut conn,
+            "CREATE TEMPORARY TABLE ariodb_doctor (x INT) ENGINE = InnoDB",
+        )
+        .await
+        .is_none();
+        made && mysql_error(&mut conn, "INSERT INTO ariodb_doctor VALUES (1)").await.is_none()
+    };
+    // InnoDB refreshes innodb_trx at most every 0.1 seconds after a read.
+    tokio::time::sleep(Duration::from_millis(110)).await;
+    let counted: Result<Option<i64>, _> = conn
+        .query_first(
+            "SELECT CAST(trx_rows_modified AS SIGNED) FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID()",
+        )
+        .await;
+    let _ = conn.query_drop("ROLLBACK").await;
+    let _ = conn.query_drop("DROP TEMPORARY TABLE IF EXISTS ariodb_doctor").await;
+    match counted {
+        Ok(Some(n)) if wrote && n >= 1 => checks.ok(format!(
+            "writes are counted before commit, triggers and cascades included (a 1-row test write counted {n})"
+        )),
+        Ok(_) if !wrote => checks.warn(
+            "InnoDB's count of rows a write changed is readable, but a test write could not confirm it",
+        ),
+        Ok(_) => checks.warn(
+            "InnoDB did not count a test write; writes are judged by the row counts the server reports, so rows changed by triggers and cascades are not seen",
+        ),
+        Err(e) => checks.warn(format!(
+            "InnoDB's count of rows a write changed cannot be read ({}); writes are judged by the row counts the server reports, so rows changed by triggers and cascades are not seen. GRANT PROCESS ON *.* to this login",
+            message(&e)
+        )),
+    }
+
+    // Each agent's MySQL tables exist.
+    let mut missing = 0;
+    for agent in &config.agents {
+        let Some(access) = &agent.mysql else { continue };
+        for t in access.tables.iter().filter(|t| *t != "*") {
+            let (d, name) = match t.split_once('.') {
+                Some((d, n)) => (d.to_string(), n.to_string()),
+                None => (config.mysql.database.clone(), t.clone()),
+            };
+            let found: Result<Option<u8>, _> = conn
+                .exec_first(
+                    "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                    (&d, &name),
+                )
+                .await;
+            if let Ok(None) = found {
+                missing += 1;
+                checks.warn(format!(
+                    "agent '{}': MySQL table '{d}.{name}' does not exist or this login cannot see it",
+                    agent.name
+                ));
+            }
+        }
+    }
+    if missing == 0 {
+        checks.ok("every agent table exists and this login can see it");
+    }
+    let _ = conn.disconnect().await;
+    (reads, writes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_yes() -> Guarantees {
+        Guarantees {
+            reads: Ok(()),
+            writes: Ok(()),
+            undo: Ok(()),
+        }
+    }
+
+    #[test]
+    fn the_summary_names_mysql_and_keeps_postgres_wording() {
+        let postgres_only = Report {
+            sections: vec![],
+            postgres: Some(all_yes()),
+            mysql: None,
+        };
+        assert_eq!(
+            postgres_only.summary(),
+            "reads yes; checked writes yes; undo yes"
+        );
+        let mut mysql = all_yes();
+        mysql.undo = Err("not set up".into());
+        let both = Report {
+            sections: vec![],
+            postgres: Some(all_yes()),
+            mysql: Some(mysql.clone()),
+        };
+        assert_eq!(
+            both.summary(),
+            "reads yes; checked writes yes; undo yes; MySQL: reads yes; checked writes yes; undo no (not set up)"
+        );
+        let mysql_only = Report {
+            sections: vec![],
+            postgres: None,
+            mysql: Some(mysql),
+        };
+        assert!(mysql_only.summary().starts_with("MySQL: "));
+        assert!(!mysql_only.failed());
+    }
 }

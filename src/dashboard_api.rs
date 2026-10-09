@@ -5,7 +5,7 @@ use crate::audit::{self, Filter};
 use crate::config::Config;
 use crate::dashboard::{ApiError, require_user, require_writer};
 use crate::gate::State;
-use crate::{journal, testing, undo};
+use crate::{journal, mysql_journal, mysql_undo, testing, undo};
 use axum::extract::{Path, Query, State as AxState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -52,8 +52,7 @@ async fn overview(
     let since = crate::store::now_ms() - 86_400_000;
     let counts = audit::counts_since(&state_dir(&state), since)?;
     let pending = state.db.approvals(true, 1000)?.len();
-    let records = journal::read_all(&config).unwrap_or_default();
-    let sessions = undo::sessions(&records);
+    let sessions = undo::sessions(&all_records(&config).unwrap_or_default());
     Ok(Json(json!({
         "pending_approvals": pending,
         "decisions_24h": counts.into_iter().map(|(o, n)| json!({ "outcome": o, "count": n })).collect::<Vec<_>>(),
@@ -107,7 +106,7 @@ async fn sessions(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_user(&state, &headers)?;
-    let records = journal::read_all(&state.config())?;
+    let records = all_records(&state.config())?;
     let list: Vec<Value> = undo::sessions(&records)
         .into_iter()
         .map(|s| {
@@ -132,10 +131,38 @@ async fn session_plan(
 ) -> Result<Json<Value>, ApiError> {
     require_user(&state, &headers)?;
     let config = state.config();
+    let mysql_records = mysql_journal::read_all(&config)?;
+    if has_session(&mysql_records, &id) {
+        let mut conn = mysql_undo::connect(&config).await?;
+        let plan = mysql_undo::plan(&mut conn, &config, &mysql_records, &id)
+            .await
+            .map_err(bad)?;
+        return Ok(Json(json!({
+            "session": plan.session,
+            "steps": plan.steps.iter().map(|s| s.description.clone()).collect::<Vec<_>>(),
+            "conflicts": plan.conflicts.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),
+            "blocked": plan.blocked,
+            "warnings": plan.warnings,
+            "already_undone": plan.already_undone,
+        })));
+    }
     let records = journal::read_all(&config)?;
     let client = undo::connect(&config).await?;
     let plan = undo::plan(&client, &records, &id).await.map_err(bad)?;
     Ok(Json(plan_json(&plan)))
+}
+
+/// Every recorded transaction, Postgres and MySQL.
+fn all_records(config: &Config) -> Result<Vec<journal::TxnRecord>, String> {
+    let mut records = journal::read_all(config)?;
+    records.extend(mysql_journal::read_all(config)?);
+    Ok(records)
+}
+
+fn has_session(records: &[journal::TxnRecord], session: &str) -> bool {
+    records
+        .iter()
+        .any(|r| r.session.as_deref() == Some(session))
 }
 
 fn plan_json(plan: &undo::Plan) -> Value {
@@ -162,12 +189,23 @@ async fn session_undo(
 ) -> Result<Json<Value>, ApiError> {
     let user = require_writer(&state, &headers)?;
     let config = state.config();
-    let records = journal::read_all(&config)?;
-    let mut client = undo::connect(&config).await?;
-    let plan = undo::plan(&client, &records, &id).await.map_err(bad)?;
-    let restored = undo::apply(&mut client, &plan, body.skip_conflicts)
-        .await
-        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    let mysql_records = mysql_journal::read_all(&config)?;
+    let restored = if has_session(&mysql_records, &id) {
+        let mut conn = mysql_undo::connect(&config).await?;
+        let plan = mysql_undo::plan(&mut conn, &config, &mysql_records, &id)
+            .await
+            .map_err(bad)?;
+        mysql_undo::apply_plan(&mut conn, &config, &plan, body.skip_conflicts)
+            .await
+            .map_err(|e| ApiError(StatusCode::CONFLICT, e))?
+    } else {
+        let records = journal::read_all(&config)?;
+        let mut client = undo::connect(&config).await?;
+        let plan = undo::plan(&client, &records, &id).await.map_err(bad)?;
+        undo::apply(&mut client, &plan, body.skip_conflicts)
+            .await
+            .map_err(|e| ApiError(StatusCode::CONFLICT, e))?
+    };
     println!(
         "ariodb: {} undid session {id} from the dashboard ({restored} rows)",
         user.name

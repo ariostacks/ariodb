@@ -13,6 +13,7 @@ mod gate;
 mod doctor;
 mod journal;
 mod llm;
+mod mysql_binlog;
 mod mysql_journal;
 mod mysql_proxy;
 mod mysql_sql;
@@ -437,7 +438,7 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
             }
         });
     }
-    if !config.proxy.listen.is_empty() || config.journal.enabled {
+    if !config.proxy.listen.is_empty() || config.journal.enabled || !config.mysql.listen.is_empty() {
         // Say once, at startup, which guarantees this database supports.
         let doctor_config = config.clone();
         tokio::spawn(async move {
