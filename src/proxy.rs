@@ -25,6 +25,11 @@ type CancelMap = Arc<Mutex<HashMap<(i32, i32), (Target, (i32, i32))>>>;
 
 pub async fn serve(state: Arc<State>) -> Result<(), String> {
     let config = state.config();
+    if config.proxy.listen.is_empty() {
+        // The Postgres proxy is switched off (for example a ClickHouse-only
+        // setup). Keep running until ariodb is asked to stop.
+        std::future::pending::<()>().await;
+    }
     let acceptor = match (&config.proxy.tls_cert, &config.proxy.tls_key) {
         (Some(c), Some(k)) => Some(crate::tls::server_acceptor(c, k)?),
         (None, None) => None,

@@ -26,7 +26,18 @@ docker rm -f $CH >/dev/null 2>&1 || true
 docker run -d --name $CH -e CLICKHOUSE_USER=ariodb -e CLICKHOUSE_PASSWORD=ch-local-test-only \
   -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
   -p 127.0.0.1:$CH_HTTP:8123 -p 127.0.0.1:$CH_NATIVE:9000 "$IMAGE" >/dev/null
-until curl -s "http://127.0.0.1:$CH_HTTP/ping" | grep -q Ok; do sleep 0.5; done
+# The image may start a temporary server for first-run setup, then restart.
+# Wait until the server answers queries several times in a row.
+ok=0
+for _ in $(seq 1 240); do
+  if curl -s -u ariodb:ch-local-test-only "http://127.0.0.1:$CH_HTTP/" --data-binary "SELECT 1" 2>/dev/null | grep -q '^1$'; then
+    ok=$((ok + 1)); [ $ok -ge 5 ] && break
+  else
+    ok=0
+  fi
+  sleep 0.5
+done
+[ $ok -ge 5 ] || fail "ClickHouse did not become ready"
 admin() { curl -s -u ariodb:ch-local-test-only "http://127.0.0.1:$CH_HTTP/" --data-binary "$1"; }
 admin "CREATE TABLE events (id UInt32, user String, kind String) ENGINE = MergeTree ORDER BY id"
 admin "CREATE TABLE secrets (note String) ENGINE = MergeTree ORDER BY note"
@@ -45,6 +56,9 @@ enabled = false
 dir = "$WORK/state"
 
 [dashboard]
+listen = ""
+
+[proxy]
 listen = ""
 
 [clickhouse]

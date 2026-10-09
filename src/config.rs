@@ -115,7 +115,8 @@ impl Default for Dashboard {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Proxy {
-    /// Address agents connect to, as if it were Postgres.
+    /// Address agents connect to, as if it were Postgres. Empty turns the
+    /// Postgres proxy off.
     pub listen: String,
     /// Certificate and key (PEM) for TLS between agents and ariodb.
     pub tls_cert: Option<String>,
