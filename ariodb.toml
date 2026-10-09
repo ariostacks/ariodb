@@ -132,13 +132,55 @@ type = "dashboard"           # decide in the dashboard or with `ariodb approve`
 # url = "https://hooks.example.com/ariodb"
 # hmac_secret_env = "ARIODB_WEBHOOK_SECRET"
 #
+#
+# A model judging against a written policy. The statements, the policy and
+# the agent's name are sent to the provider, so they leave your network
+# unless the model runs on your own machines (openai_compatible).
 # [[approvers]]
 # name = "model"
 # type = "llm"
 # policy = "Allow reads of order data. Deny anything that exports personal data in bulk."
-# api_key_env = "ANTHROPIC_API_KEY"
-# # model = "claude-opus-5-5"
-# # effort = "low"
+# provider = "anthropic"                     # default
+# api_key_env = "ANTHROPIC_API_KEY"          # default for anthropic; or api_key_secret
+# # model = "claude-opus-5-5"                # default
+# # effort = "low"                           # default: low, medium, high, xhigh, max
+#
+# [[approvers]]
+# name = "gpt"
+# type = "llm"
+# provider = "openai"                        # the Responses API
+# policy = "Allow reads of order data. Deny anything that exports personal data in bulk."
+# # api_key_env = "OPENAI_API_KEY"           # default
+# # model = "gpt-6-astra"                    # default
+# # effort = "low"                           # reasoning.effort; low by default on the default model
+#
+# [[approvers]]
+# name = "gemini"
+# type = "llm"
+# provider = "gemini"                        # the Interactions API
+# policy = "Allow reads of order data. Deny anything that exports personal data in bulk."
+# # api_key_env = "GEMINI_API_KEY"           # default
+# # model = "gemini-3.8-flash"               # default
+# # effort = "low"                           # thinking level: minimal, low, medium, high
+#
+# [[approvers]]
+# name = "azure"
+# type = "llm"
+# provider = "azure_openai"
+# policy = "Allow reads of order data. Deny anything that exports personal data in bulk."
+# base_url = "https://my-resource.openai.azure.com"   # the resource endpoint
+# model = "judge-gpt"                        # the deployment name
+# # api_key_env = "AZURE_OPENAI_API_KEY"     # default; sent as api-key
+# # api_version = "v1"                       # default; or "preview"
+#
+# [[approvers]]
+# name = "local"
+# type = "llm"
+# provider = "openai_compatible"             # Ollama, vLLM, LM Studio, Mistral, DeepSeek, Groq, OpenRouter...
+# policy = "Allow reads of order data. Deny anything that exports personal data in bulk."
+# base_url = "http://localhost:11434/v1"     # https unless it is this machine
+# model = "llama3.3"
+# # api_key_env = "MISTRAL_API_KEY"          # optional bearer token
 
 [approvals]
 timeout_seconds = 90         # no decision in time means refused

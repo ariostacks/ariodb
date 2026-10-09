@@ -189,6 +189,47 @@ type = "llm"
 api_key_env = "E2E_ANTHROPIC_KEY"
 policy = "Allow reads of orders. Deny anything else."
 
+[[approvers]]
+name = "judge-openai"
+type = "llm"
+provider = "openai"
+api_key_env = "E2E_OPENAI_KEY"
+policy = "Allow reads of orders. Deny anything else."
+
+[[approvers]]
+name = "judge-gemini"
+type = "llm"
+provider = "gemini"
+api_key_env = "E2E_GEMINI_KEY"
+effort = "medium"
+policy = "Allow reads of orders. Deny anything else."
+
+[[approvers]]
+name = "judge-azure"
+type = "llm"
+provider = "azure_openai"
+base_url = "http://127.0.0.1:$MOCK/azure"
+model = "ariodb-judge"
+api_key_env = "E2E_AZURE_KEY"
+policy = "Allow reads of orders. Deny anything else."
+
+[[approvers]]
+name = "judge-local"
+type = "llm"
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:$MOCK/compat/v1"
+model = "llama-test"
+policy = "Allow reads of orders. Deny anything else."
+
+[[approvers]]
+name = "judge-old"
+type = "llm"
+provider = "openai_compatible"
+base_url = "http://localhost:$MOCK/compat-old/v1"
+model = "old-test"
+api_key_env = "E2E_COMPAT_KEY"
+policy = "Allow reads of orders. Deny anything else."
+
 [[rules]]
 name = "ask-dashboard"
 condition = "sql.statement.contains('/*ask-dashboard*/')"
@@ -221,6 +262,36 @@ verdict = "approve"
 approve = ["judge"]
 
 [[rules]]
+name = "ask-openai"
+condition = "sql.statement.contains('/*ask-openai*/')"
+verdict = "approve"
+approve = ["judge-openai"]
+
+[[rules]]
+name = "ask-gemini"
+condition = "sql.statement.contains('/*ask-gemini*/')"
+verdict = "approve"
+approve = ["judge-gemini"]
+
+[[rules]]
+name = "ask-azure"
+condition = "sql.statement.contains('/*ask-azure*/')"
+verdict = "approve"
+approve = ["judge-azure"]
+
+[[rules]]
+name = "ask-local"
+condition = "sql.statement.contains('/*ask-local*/')"
+verdict = "approve"
+approve = ["judge-local"]
+
+[[rules]]
+name = "ask-old"
+condition = "sql.statement.contains('/*ask-old*/')"
+verdict = "approve"
+approve = ["judge-old"]
+
+[[rules]]
 name = "no-file-functions"
 condition = "sets.intersects(sql.functions, ['pg_read_file', 'pg_ls_dir'])"
 verdict = "deny"
@@ -236,7 +307,10 @@ EOF
 export E2E_AGENT_TOKEN=agent-token-local-test-only E2E_BOT_TOKEN=bot-token-local-test-only
 export E2E_SLACK_BOT=xoxb-not-a-real-token E2E_SLACK_SIGNING=slack-signing-test-only
 export E2E_HOOK_KEY=hook-key-test-only E2E_ANTHROPIC_KEY=sk-ant-not-a-real-key
+export E2E_OPENAI_KEY=sk-not-a-real-key-openai E2E_GEMINI_KEY=gemini-key-local-test-only
+export E2E_AZURE_KEY=azure-key-local-test-only E2E_COMPAT_KEY=sk-not-a-real-key-compat
 export ARIODB_SLACK_API=http://127.0.0.1:$MOCK/slack ARIODB_ANTHROPIC_API=http://127.0.0.1:$MOCK/anthropic
+export ARIODB_OPENAI_API=http://127.0.0.1:$MOCK/openai ARIODB_GEMINI_API=http://127.0.0.1:$MOCK/gemini
 export ARIODB_JOURNAL_URL=postgres://ariodb_journal:journal-local-test-only@127.0.0.1:$PORT/app
 unset ARIODB_DATABASE_URL ARIODB_ADMIN_URL
 CFG=(--config "$WORK/ariodb.toml")
@@ -437,7 +511,48 @@ expect "model request: API key header" '"x-api-key": "sk-ant-not-a-real-key"' "$
 expect "model request: API version header" '"anthropic-version": "2023-06-01"' "$LAST"
 expect "model request: default model with fallback" '"anthropic-beta": "server-side-fallback-2026-07-01", "model": "claude-opus-5-5"' "$LAST"
 expect "model request: structured output" '"format": "json_schema"' "$LAST"
-expect "model decisions are recorded" "model:claude-opus-5-5" "$($BIN "${CFG[@]}" approvals --all)"
+expect "model decisions are recorded" "model:anthropic/claude-opus-5-5" "$($BIN "${CFG[@]}" approvals --all)"
+
+echo "model providers"
+# Every provider through the proxy: allowed, denied, and the request it
+# sent. The mocks answer 400 when the auth header, the schema or the SQL as
+# JSON data is missing, so an allow also shows the request was well formed.
+mock_last() { grep "\"service\": \"$1\", \"auth\"" "$WORK/mock.log" | tail -1; }
+for p in openai gemini azure local old; do
+  expect "$p: allows" "(1 row)" "$(agent coding-agent $T "SELECT /*ask-$p*/ count(*) FROM orders")"
+  expect "$p: denies with its reason" "mock judge said deny" "$(agent coding-agent $T "SELECT /*ask-$p*/ 'deny-me' FROM orders")"
+done
+[ -z "$(grep '"wrong"' "$WORK/mock.log")" ] && pass "every provider request passed the mock's checks" || { grep '"wrong"' "$WORK/mock.log"; fail "malformed provider requests"; }
+LAST=$(mock_last openai)
+expect "openai: bearer key" '"auth": "Bearer sk-not-a-real-key-openai"' "$LAST"
+expect "openai: default model at low effort, not stored" '"model": "gpt-6-astra", "api-version": null, "effort": "low", "store": false' "$LAST"
+LAST=$(mock_last gemini)
+expect "gemini: x-goog-api-key" '"auth": "gemini-key-local-test-only"' "$LAST"
+expect "gemini: default model, effort as thinking level, not stored" '"model": "gemini-3.8-flash", "effort": "medium", "store": false' "$LAST"
+LAST=$(mock_last azure)
+expect "azure: api-key header" '"auth": "azure-key-local-test-only"' "$LAST"
+expect "azure: deployment as model, api-version v1" '"model": "ariodb-judge", "api-version": "v1"' "$LAST"
+LAST=$(mock_last compat)
+expect "openai_compatible: no key, JSON schema" '"auth": null, "model": "llama-test", "format": "json_schema"' "$LAST"
+expect "openai_compatible: an old server rejects json_schema" '"rejected": "json_schema"' "$(grep '"compat-old"' "$WORK/mock.log")"
+expect "openai_compatible: and is asked again in JSON mode" '"auth": "Bearer sk-not-a-real-key-compat", "model": "old-test", "format": "json_object"' "$(mock_last compat-old)"
+expect "a refusal is a deny" "declined to review" "$(agent coding-agent $T "SELECT /*ask-openai*/ 'refuse-me' FROM orders")"
+expect "a failed Gemini interaction is a deny" "did not finish" "$(agent coding-agent $T "SELECT /*ask-gemini*/ 'refuse-me' FROM orders")"
+OUT503=$(agent coding-agent $T "SELECT /*ask-openai*/ 'unavailable-503' FROM orders")
+expect "a provider that is down fails closed" "unavailable (HTTP 503); failing closed" "$OUT503"
+expect "and the refusal names provider and model" "model approver 'judge-openai' (model:openai/gpt-6-astra)" "$OUT503"
+[ "$(grep -c 'unavailable-503' "$WORK/mock.log")" = 3 ] && pass "503 is retried three times in all" || fail "expected 3 tries, got $(grep -c 'unavailable-503' "$WORK/mock.log")"
+APPROVALS=$($BIN "${CFG[@]}" approvals --all)
+for d in model:openai/gpt-6-astra model:gemini/gemini-3.8-flash model:azure_openai/ariodb-judge \
+  model:openai_compatible/llama-test model:openai_compatible/old-test; do
+  expect "decisions name $d" "$d" "$APPROVALS"
+done
+sed -e 's|^base_url = "http://localhost:\(.*\)/compat-old/v1"|base_url = "http://192.0.2.10:\1/v1"|' "$WORK/ariodb.toml" > "$WORK/plain-http.toml"
+expect "plain http to another machine is refused at load" "must use https" \
+  "$($BIN --config "$WORK/plain-http.toml" check 2>&1 || true)"
+sed -e 's|^provider = "gemini"|provider = "gemini-pro"|' "$WORK/ariodb.toml" > "$WORK/bad-provider.toml"
+expect "an unknown provider is refused at load" "unknown provider 'gemini-pro'" \
+  "$($BIN --config "$WORK/bad-provider.toml" check 2>&1 || true)"
 
 echo "recorded decisions as tests"
 $BIN "${CFG[@]}" export-fixtures --out "$WORK/recorded" >/dev/null

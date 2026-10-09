@@ -29,8 +29,9 @@ it changed, and lets a person undo one agent session later.
   but before it commits. Rules reload while ariodb runs, and `ariodb test`
   checks them in CI.
 - **Approvals.** A held statement waits for a person in the dashboard, the
-  CLI, Slack (with buttons) or any webhook, or for a Claude model judging it
-  against a written policy.
+  CLI, Slack (with buttons) or any webhook, or for a model (Claude, OpenAI,
+  Gemini, Azure OpenAI or any OpenAI-compatible server) judging it against
+  a written policy.
 - **Records every change.** A logical replication slot feeds a journal of
   before- and after-images, tagged with the agent session that made them.
 - **Undoes one session.** Reverses that session's changes in one
@@ -125,7 +126,7 @@ cargo build --release
 | `ARIODB_ADMIN_URL` | `undo` (CLI and dashboard). Falls back to the gateway URL. |
 | `ARIODB_AGENT_TOKEN` | The token `ariodb mcp` checks against the agent's. |
 | `ARIODB_MASTER_KEY` | 32-byte base64 key for the secret store. Without it, `<state dir>/master.key` is created. |
-| `ANTHROPIC_API_KEY` | Model approvers, when they name no `api_key_env` or `api_key_secret`. |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AZURE_OPENAI_API_KEY` | Model approvers for that provider, when they name no `api_key_env` or `api_key_secret`. |
 | Any `*_env` name in the config | Agent tokens, credential URLs, approver and ClickHouse secrets. |
 
 ## Configuration reference
@@ -325,11 +326,12 @@ hmac_secret_env = "ARIODB_WEBHOOK_SECRET"       # or hmac_secret_secret
 
 [[approvers]]
 name = "model"
-type = "llm"                  # a Claude model judges the statement against a policy
+type = "llm"                  # a model judges the statement against a policy
 policy = "Allow reads of order data. Deny bulk exports of personal data."
-api_key_env = "ANTHROPIC_API_KEY"   # or api_key_secret; default: ANTHROPIC_API_KEY
-model = "claude-opus-5-5"     # default
-effort = "low"                # default
+provider = "anthropic"        # default; see below for the others
+api_key_env = "ANTHROPIC_API_KEY"   # or api_key_secret; default: the provider's usual variable
+model = "claude-opus-5-5"     # default for anthropic
+effort = "low"                # default for anthropic
 ```
 
 - **Slack**: set the Slack app's interactivity request URL to
@@ -342,15 +344,99 @@ effort = "low"                # default
   approve and deny links are signed per request. Opening one shows the
   request and a button; only a POST to the link decides.
 - **Model**: the SQL is passed as JSON data with an instruction not to follow
-  text inside it, and the answer is limited to allow or deny. Not a security
-  boundary on its own (see [SECURITY.md](SECURITY.md)).
+  text inside it, and the answer is limited to allow or deny. A refusal, an
+  empty or cut-short answer, or anything but that one JSON object is a deny.
+  Not a security boundary on its own (see [SECURITY.md](SECURITY.md)).
+
+#### Model providers
+
+`provider` picks the API. Each request carries the same system prompt,
+policy and statement; the answer must be `{"decision": "allow" | "deny",
+"reason": "..."}`, enforced with the provider's own structured output where
+it has one. Decisions are recorded as `model:<provider>/<model>`.
+
+| `provider` | API | Key (default variable) | Default `model` | `effort` sets |
+|---|---|---|---|---|
+| `anthropic` | Messages API | `ANTHROPIC_API_KEY` | `claude-opus-5-5` | `output_config.effort`: low (default), medium, high, xhigh, max |
+| `openai` | Responses API | `OPENAI_API_KEY` | `gpt-6-astra` | `reasoning.effort`: none, minimal, low, medium, high, xhigh, max |
+| `gemini` | Interactions API | `GEMINI_API_KEY` | `gemini-3.8-flash` | `thinking_level`: minimal, low, medium, high |
+| `azure_openai` | Azure OpenAI v1 (Responses) | `AZURE_OPENAI_API_KEY` | none: name your deployment | `reasoning.effort`, as for `openai` |
+| `openai_compatible` | Chat Completions | none (optional) | none: name the model | ignored, with a warning |
+
+`effort` defaults to `low` on each provider's default model (and on every
+Anthropic model); with another model it is sent only when set, because not
+every model takes it. Values the provider does not accept are refused when
+the config loads.
+
+```toml
+[[approvers]]
+name = "gpt"
+type = "llm"
+provider = "openai"
+policy = "Allow reads of order data. Deny bulk exports of personal data."
+api_key_env = "OPENAI_API_KEY"   # default
+# model = "gpt-6-astra"          # default
+# effort = "low"                 # default for the default model
+
+[[approvers]]
+name = "gemini"
+type = "llm"
+provider = "gemini"
+policy = "Allow reads of order data. Deny bulk exports of personal data."
+api_key_secret = "gemini-key"    # or api_key_env; default GEMINI_API_KEY
+# model = "gemini-3.8-flash"     # default
+effort = "low"                   # the thinking level
+
+[[approvers]]
+name = "azure"
+type = "llm"
+provider = "azure_openai"
+policy = "Allow reads of order data. Deny bulk exports of personal data."
+base_url = "https://my-resource.openai.azure.com"   # the resource endpoint (required)
+model = "judge-gpt"              # the deployment name (required)
+api_key_env = "AZURE_OPENAI_API_KEY"   # default; sent as the api-key header
+# api_version = "v1"             # default; or "preview"
+
+[[approvers]]
+name = "local"
+type = "llm"
+provider = "openai_compatible"   # Ollama, vLLM, LM Studio, Mistral, DeepSeek, xAI, Groq, Together, OpenRouter...
+policy = "Allow reads of order data. Deny bulk exports of personal data."
+base_url = "http://localhost:11434/v1"   # up to and including /v1 (required)
+model = "llama3.3"               # required
+# api_key_env = "MISTRAL_API_KEY"   # optional; sent as a bearer token
+```
+
+`openai_compatible` asks for a JSON schema (`response_format` `json_schema`)
+and, if the server rejects that, asks again in JSON mode and reads the
+answer strictly. Hosted examples for `base_url`: `https://api.mistral.ai/v1`,
+`https://api.deepseek.com`, `https://api.x.ai/v1`,
+`https://api.groq.com/openai/v1`, `https://api.together.xyz/v1`,
+`https://openrouter.ai/api/v1`.
+
+`base_url` must be `https` unless it is this machine (`localhost`,
+`127.0.0.1`, `::1`). `anthropic`, `openai` and `gemini` take a `base_url` too,
+for a gateway in front of the provider.
+
+Network errors, 408, 429 and 5xx are tried three times in all, with
+backoff that honours `Retry-After` (a provider asking for more than 30
+seconds counts as down). Then `llm_fail_mode` decides. A wrong key, model
+or setting is a configuration error and always refuses.
+
+**Data leaves your network.** A model approver sends the statements it
+judges, the agent's name, the database, the rule and the policy to the
+provider, with literal values intact (`redact_literals` applies to the
+decisions log only). OpenAI, Azure and Gemini requests ask not to be stored
+(`store: false`), but the provider's own retention and data terms still
+apply. Use a local model through `openai_compatible` to keep statements on
+your own machines.
 
 ### `[approvals]`
 
 ```toml
 [approvals]
 timeout_seconds = 90          # default 90; no decision in time means refused
-llm_fail_mode = "closed"      # closed (default) refuses when the model is unreachable; open allows
+llm_fail_mode = "closed"      # closed (default) refuses when the model is unreachable (network, 408, 429, 5xx); open allows
 llm_cache_seconds = 300       # default 300; reuse a model's answer to the same question
 ```
 
