@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license-file = "LICENSE"
-repository = "https://github.com/roozjalali/ariodb"
+repository = "https://github.com/ariostacks/ariodb"
 publish = false
 
 [dependencies]
