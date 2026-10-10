@@ -8,8 +8,8 @@ blank_issues_enabled: false
 
 contact_links:
   - name: Report a security vulnerability
-    url: https://github.com/roozjalali/ariodb/security/advisories/new
+    url: https://github.com/ariostacks/ariodb/security/advisories/new
     about: Report security problems privately, never in a public issue. See SECURITY.md.
   - name: Documentation
-    url: https://github.com/roozjalali/ariodb/blob/main/docs/README.md
+    url: https://github.com/ariostacks/ariodb/blob/main/docs/README.md
     about: Installation, configuration, every command, troubleshooting and the security model.

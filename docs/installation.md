@@ -40,7 +40,7 @@ you only want to try ariodb on your laptop, the
 ## Building from source
 
 ```bash
-git clone https://github.com/roozjalali/ariodb.git
+git clone https://github.com/ariostacks/ariodb.git
 cd ariodb
 cargo build --release
 ```

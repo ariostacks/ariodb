@@ -355,7 +355,7 @@ jobs:
       - name: Check out ariodb
         uses: actions/checkout@v4
         with:
-          repository: roozjalali/ariodb
+          repository: ariostacks/ariodb
           ref: v0.1.0                   # the version you run in production
           path: ariodb-src
 
