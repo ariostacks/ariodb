@@ -2,6 +2,11 @@
   "name": "dashboard",
   "private": true,
   "license": "SEE LICENSE IN ../LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/roozjalali/ariodb.git",
+    "directory": "dashboard"
+  },
   "version": "0.0.0",
   "type": "module",
   "scripts": {

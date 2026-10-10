@@ -355,10 +355,9 @@ jobs:
       - name: Check out ariodb
         uses: actions/checkout@v4
         with:
-          repository: your-org/ariodb   # where you keep ariodb's source
+          repository: roozjalali/ariodb
           ref: v0.1.0                   # the version you run in production
           path: ariodb-src
-          # token: ${{ secrets.ARIODB_SOURCE_TOKEN }}   # if that repository is private
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

@@ -1,5 +1,7 @@
 # ariodb
 
+[![CI](https://github.com/roozjalali/ariodb/actions/workflows/ci.yml/badge.svg)](https://github.com/roozjalali/ariodb/actions/workflows/ci.yml)
+
 ariodb is a safety proxy between AI agents and your databases. Agents
 connect to it as if it were Postgres, MySQL, MariaDB or ClickHouse, or use
 it as an MCP tool. ariodb checks every statement before it runs, forces
