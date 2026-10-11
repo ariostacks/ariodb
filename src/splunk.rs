@@ -146,8 +146,14 @@ pub fn validate(s: &Settings) -> Result<(), String> {
 
 /// The collector's base address, without a trailing slash.
 fn base_url(url: &str) -> Result<String, String> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| format!("[audit.splunk] url '{url}' is not a URL: {e}"))?;
+    // An unreadable URL is not echoed: it may hold a password.
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("[audit.splunk] url is not a URL: {e}"))?;
+    // HEC takes the token as a Basic password too, so a URL with one would
+    // put the token in the file, the logs and the dashboard API.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("[audit.splunk] url must not contain a user name or password: give the token with token_secret or token_env".to_string());
+    }
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
         return Err(format!(
             "[audit.splunk] url must be an http:// or https:// address, such as https://splunk.example.com:8088, not '{url}'"
@@ -387,6 +393,11 @@ fn network_error(e: &reqwest::Error) -> String {
 // ---------------------------------------------------------------------------
 // Talking to the collector.
 
+/// This process's indexer-acknowledgement channel. Splunk asks each client
+/// to keep to one, and a new one per reload or refusal would leave idle
+/// channels in its memory.
+static CHANNEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// One configured collector. Holds the token, so it is never printed.
 struct Collector {
     http: reqwest::Client,
@@ -422,7 +433,11 @@ impl Collector {
                 .map_err(|e| format!("cannot set up the HTTP client: {e}"))?,
             base: base_url(&s.url)?,
             auth: format!("Splunk {token}"),
-            channel: s.ack.then(|| uuid::Uuid::new_v4().to_string()),
+            channel: s.ack.then(|| {
+                CHANNEL
+                    .get_or_init(|| uuid::Uuid::new_v4().to_string())
+                    .clone()
+            }),
             ack_timeout: Duration::from_millis(s.ack_timeout_ms),
             warned_no_ack: AtomicBool::new(false),
         })
@@ -599,6 +614,31 @@ pub struct Status {
     pub decisions_sent: u64,
     pub events_sent: u64,
     pub events_dropped: u64,
+    /// Entries removed from the log before Splunk got them: pruned by
+    /// `retention_days` during an outage, or deleted by hand.
+    pub missing: u64,
+}
+
+/// The ranges of ids absent between the cursor at `from` and a batch read
+/// after it. Ids rise by one per entry, so a hole means entries removed
+/// before delivery. On the first start (`from` 0) the log may begin
+/// anywhere.
+fn missing(from: i64, ids: &[i64]) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    let mut expected = if from == 0 {
+        ids.first().copied()
+    } else {
+        Some(from + 1)
+    };
+    for &id in ids {
+        if let Some(e) = expected
+            && id > e
+        {
+            out.push((e, id - 1));
+        }
+        expected = Some(id + 1);
+    }
+    out
 }
 
 struct Queued {
@@ -677,6 +717,7 @@ pub fn start(source: Source, decisions: bool) -> Option<Arc<Exporter>> {
             decisions_sent: 0,
             events_sent: 0,
             events_dropped: 0,
+            missing: 0,
         }),
         events,
         events_pending: AtomicU64::new(0),
@@ -899,6 +940,9 @@ async fn deliver_decisions(
     let mut limit: Option<usize> = None;
     let mut quiet = Quiet::default();
     let mut was_failing = false;
+    // The last id a hole was reported up to, so a retried batch does not
+    // report the same one again.
+    let mut holes_to = 0;
     loop {
         let config = source();
         let s = config.audit.splunk.clone();
@@ -969,6 +1013,28 @@ async fn deliver_decisions(
         });
         let meta = Meta::new(&s);
         let ids: Vec<i64> = batch.iter().map(|e| e.decision.id).collect();
+        for (a, b) in missing(from, &ids) {
+            if b <= holes_to {
+                continue;
+            }
+            holes_to = b;
+            let which = if a == b {
+                format!("decision {a} was")
+            } else {
+                format!("decisions {a} to {b} were")
+            };
+            let why = format!(
+                "{which} removed from the log before Splunk received them: pruned by [audit] retention_days during an outage, or deleted (ariodb audit checks the log)"
+            );
+            eprintln!("ariodb: Splunk exporter: {why}");
+            let now = crate::store::now_ms();
+            shared.update(|st| {
+                st.missing += (b - a + 1) as u64;
+                st.last_error = Some(why.clone());
+                st.last_error_ms = Some(now);
+            });
+            record.failure(&why);
+        }
         let body = batch_body(batch.iter().map(|e| decision_event(&meta, e)));
         let answer = tokio::select! {
             a = collector.deliver(body) => a,
@@ -1414,6 +1480,36 @@ mod tests {
         assert!(base_url("https://splunk.example.test:8088/services/collector/event").is_err());
         assert!(base_url("splunk.example.test:8088").is_err());
         assert!(base_url("ftp://splunk.example.test").is_err());
+        // HEC takes the token as a Basic password, so credentials in the
+        // URL would put it in the file, the logs and the dashboard API.
+        let why =
+            base_url("https://x:hec-token-local-test-only@splunk.example.test:8088").unwrap_err();
+        assert!(why.contains("user name or password"), "{why}");
+        assert!(!why.contains("hec-token-local-test-only"), "{why}");
+        assert!(base_url("https://ariodb@splunk.example.test:8088").is_err());
+    }
+
+    #[test]
+    fn a_process_keeps_one_ack_channel() {
+        // SAFETY: the variable is unique to this test.
+        unsafe { std::env::set_var("ARIODB_SPLUNK_TEST_CHANNEL", "hec-token-local-test-only") };
+        let mut s = settings("ack = true").unwrap();
+        s.token_env = Some("ARIODB_SPLUNK_TEST_CHANNEL".into());
+        let dir = std::env::temp_dir();
+        let a = Collector::new(&s, &dir).unwrap();
+        // Rebuilt after a refusal or a reload: still the same channel, as
+        // Splunk asks of a client.
+        s.batch_size = 7;
+        let b = Collector::new(&s, &dir).unwrap();
+        assert!(a.channel.is_some());
+        assert_eq!(a.channel, b.channel);
+    }
+
+    #[test]
+    fn missing_entries_are_counted() {
+        assert_eq!(missing(0, &[5, 6, 7]), Vec::<(i64, i64)>::new());
+        assert_eq!(missing(4, &[5, 6, 7]), Vec::<(i64, i64)>::new());
+        assert_eq!(missing(2, &[5, 6, 9]), vec![(3, 4), (7, 8)]);
     }
 
     #[test]
@@ -1755,7 +1851,7 @@ mod tests {
         stop(exporter).await;
         // Another restart resumes after the cursor.
         record("SELECT 6");
-        let exporter = start(fixed(config), true);
+        let exporter = start(fixed(config.clone()), true);
         for _ in 0..100 {
             if cursor.position(CURSOR).unwrap() == 6 {
                 break;
@@ -1764,6 +1860,31 @@ mod tests {
         }
         assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4, 5, 6]);
         assert_eq!(status().unwrap().backlog, 0);
+        stop(exporter).await;
+        // Entries removed before Splunk got them (by retention, or by hand)
+        // are not passed over in silence.
+        for i in 7..=10 {
+            record(&format!("SELECT {i}"));
+        }
+        rusqlite::Connection::open(dir.join("ariodb.db"))
+            .unwrap()
+            .execute("DELETE FROM decisions WHERE id IN (7, 8)", [])
+            .unwrap();
+        let exporter = start(fixed(config), true);
+        for _ in 0..100 {
+            if cursor.position(CURSOR).unwrap() == 10 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4, 5, 6, 9, 10]);
+        let st = status().unwrap();
+        assert_eq!(st.missing, 2);
+        assert!(
+            st.last_error
+                .unwrap()
+                .contains("decisions 7 to 8 were removed from the log before Splunk received them")
+        );
         stop(exporter).await;
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);

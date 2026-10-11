@@ -323,12 +323,23 @@ impl SinkCursor {
     }
 
     /// How many entries come after `id`: what a sink at `id` has still to get.
+    /// Worked out from the oldest and newest ids, which rise by one per
+    /// entry, rather than counted: a sink catching up asks once per batch,
+    /// and counting a large backlog each time would take longer than
+    /// sending it. Entries deleted from the middle are counted anyway.
     pub fn backlog(&self, id: i64) -> Result<i64, String> {
-        self.conn
-            .query_row("SELECT count(*) FROM decisions WHERE id > ?1", [id], |r| {
-                r.get(0)
-            })
-            .map_err(|e| e.to_string())
+        let (oldest, newest): (Option<i64>, Option<i64>) = self
+            .conn
+            .query_row(
+                "SELECT (SELECT min(id) FROM decisions), (SELECT max(id) FROM decisions)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(match (oldest, newest) {
+            (Some(oldest), Some(newest)) => (newest - id.max(oldest - 1)).max(0),
+            _ => 0,
+        })
     }
 
     /// Entries after `id`, oldest first: at most `limit`, and stopping once
@@ -679,6 +690,14 @@ mod tests {
         assert_eq!(rest[0].decision.sql, "SELECT 3");
         assert_eq!(cursor.backlog(2).unwrap(), 1);
         assert_eq!(cursor.backlog(0).unwrap(), 3);
+        assert_eq!(cursor.backlog(3).unwrap(), 0);
+        // A cursor behind entries pruned since counts only what is left.
+        cursor
+            .conn
+            .execute("DELETE FROM decisions WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(cursor.backlog(0).unwrap(), 2);
+        assert_eq!(cursor.backlog(2).unwrap(), 1);
         // The byte budget stops a batch early, but never empties it.
         assert_eq!(cursor.after(0, 100, 1).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);

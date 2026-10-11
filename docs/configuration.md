@@ -733,7 +733,7 @@ works.
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Turn the exporter on. |
-| `url` | string | required when enabled | The collector's base address, such as `https://splunk.example.com:8088`, without `/services/collector`. |
+| `url` | string | required when enabled | The collector's base address, such as `https://splunk.example.com:8088`, without `/services/collector`, a user name or a password. |
 | `token_secret` / `token_env` | string | none | The HEC token, from the secret store or an environment variable. Exactly one when enabled. A `token` key in the file is refused, enabled or not. |
 | `index` | string | the token's default | The index to write to. |
 | `source` | string | `"ariodb"` | The events' `source`. |
@@ -1135,7 +1135,8 @@ control`.
 |---|---|
 | `[audit.splunk] token must not be written in the config file: ...` | Remove `token`; store it with `ariodb secret set <name>` and set `token_secret`, or set `token_env`. |
 | `[audit.splunk] needs exactly one of token_env or token_secret` | Set one. |
-| `[audit.splunk] url is the collector's base address, such as https://splunk.example.com:8088, without /services/collector or a query: ...` | Drop the path. Also `url must be an http:// or https:// address` and `url '...' is not a URL`. |
+| `[audit.splunk] url is the collector's base address, such as https://splunk.example.com:8088, without /services/collector or a query: ...` | Drop the path. Also `url must be an http:// or https:// address` and `url is not a URL`. |
+| `[audit.splunk] url must not contain a user name or password: ...` | Remove them from `url`; give the token with `token_secret` or `token_env`. |
 | `[audit.splunk] batch_size must be at least 1` | Likewise `flush_interval_ms`, `timeout_ms` and `ack_timeout_ms`. |
 | `[audit.splunk] index must not be empty` | Likewise `host` and `source`; leave the key out for the default. |
 | `unknown field ...` | A misspelt key under `[audit.splunk]`. |

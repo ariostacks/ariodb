@@ -96,9 +96,20 @@ are licensed to use.
    `token_env`. The token cannot be written in `ariodb.toml`: a `token` key
    there is refused when the config loads.
 
-No `props.conf` is needed. The sourcetypes need no timestamp extraction
-(the time is in each event's envelope) and no line breaking (each event is
-its own JSON object).
+No `props.conf` is needed for ordinary statements. The sourcetypes need no
+timestamp extraction (the time is in each event's envelope) and no line
+breaking (each event is its own JSON object). One limit is worth knowing:
+Splunk cuts events longer than `TRUNCATE` bytes (10,000 by default), and a
+cut event no longer parses as JSON, so its fields are not extracted. If
+agents send longer statements, raise it where HEC data is parsed:
+
+```ini
+# props.conf
+[ariodb:decision]
+TRUNCATE = 0
+```
+
+`0` means no limit; a size above your longest statement works too.
 
 ## Configuring ariodb
 
@@ -113,7 +124,7 @@ index = "ariodb"
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Turn the exporter on. |
-| `url` | string | required | The collector's base address, such as `https://splunk.example.com:8088` or `https://http-inputs-<stack>.splunkcloud.com`. Without `/services/collector`: ariodb adds the paths. |
+| `url` | string | required | The collector's base address, such as `https://splunk.example.com:8088` or `https://http-inputs-<stack>.splunkcloud.com`. Without `/services/collector`: ariodb adds the paths. A user name or password in it is refused, since HEC would take the token there too. |
 | `token_secret` | string | none | The name of a secret holding the HEC token. Set this or `token_env`. |
 | `token_env` | string | none | Or: an environment variable holding it. |
 | `index` | string | the token's default | The index to write to. It must be one the token allows. |
@@ -181,7 +192,11 @@ flowchart LR
   which may be up to `[audit] retention_days` of entries.
 - **Retention.** Entries pruned by `[audit] retention_days` before they
   were delivered are lost to Splunk. Keep retention longer than any outage
-  you expect; `doctor` and the dashboard show the backlog.
+  you expect; `doctor` and the dashboard show the backlog. Ids rise by one
+  per entry, so when the exporter finds a hole after its cursor (entries
+  pruned, or deleted by hand) it says so in the log, counts them in the
+  dashboard API's `missing` and records it for `doctor`, then carries on
+  with the entries that are left.
 - **Events are best effort**, as for notifier plugins: up to 1,000 wait in
   memory while the collector is down, further ones are dropped and counted,
   and events still waiting when ariodb stops are lost. Use the decisions
@@ -223,6 +238,7 @@ reports as a refusal saying to set `ack = true`.
 | `Splunk refused decision 11: HTTP 403, code 4 (Invalid token): ... Nothing is dropped: ...` | A configuration problem, logged once until it changes. |
 | `[audit.splunk]: token_env names X, which is not set. Decisions wait in the log; ...` | The token cannot be read. |
 | `delivering again (decisions 6 to 8 accepted)` | Recovered after a failure. |
+| `decisions 7 to 8 were removed from the log before Splunk received them: ...` | Entries pruned by retention during an outage, or deleted. Run `ariodb audit` to check the rest of the log. |
 | `events are not being sent fast enough; N dropped so far` | The event queue was full. |
 
 The token is never logged, and it never appears in a URL: ariodb sends it
@@ -235,12 +251,13 @@ only in the `Authorization: Splunk <token>` header.
 "splunk": {"state": "idle", "url": "https://splunk.example.com:8088", "decisions": true,
            "delivered_to": 412, "backlog": 0, "last_success_ms": 1791548400123,
            "last_error": null, "last_error_ms": null,
-           "decisions_sent": 412, "events_sent": 37, "events_dropped": 0}
+           "decisions_sent": 412, "events_sent": 37, "events_dropped": 0, "missing": 0}
 ```
 
 `state` is `disabled`, `starting`, `sending`, `idle` (everything sent),
 `retrying` (the collector is down or busy) or `refused` (a configuration
-problem: see `last_error`).
+problem: see `last_error`). `missing` counts entries removed from the log
+before they could be sent.
 
 **`ariodb doctor`** adds a section when the exporter is enabled. It asks
 the collector's health endpoint (`GET /services/collector/health`, no token
@@ -329,6 +346,21 @@ index=ariodb sourcetype="ariodb:decision"
 | dedup id
 | stats min(id) as first, max(id) as last, dc(id) as received
 | eval missing = last - first + 1 - received
+```
+
+Breaks in the hash chain: an entry whose `prev` is not the `hash` Splunk
+holds for the entry before it. ariodb's chain is unkeyed, so someone able
+to write `ariodb.db` could rewrite entries and hash the chain again; once
+earlier entries are in Splunk, the next entries delivered after such a
+rewrite no longer link to them, and this search shows where:
+
+```spl
+index=ariodb sourcetype="ariodb:decision"
+| dedup id
+| sort 0 id
+| streamstats current=f window=1 last(id) as before_id, last(hash) as before_hash
+| where before_id = id - 1 AND prev != before_hash
+| table _time id prev before_hash
 ```
 
 ## A starter dashboard

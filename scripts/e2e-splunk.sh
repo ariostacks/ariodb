@@ -243,6 +243,11 @@ expect "a token written in the file is refused" "must not be written in the conf
 sed 's|url = "http://127.0.0.1:'$HEC'"|url = "http://127.0.0.1:'$HEC'/services/collector/event"|' "$WORK/ariodb.toml" > "$WORK/path.toml"
 expect "a url with the endpoint path is refused" "the collector's base address" \
   "$($BIN --config "$WORK/path.toml" check 2>&1 || true)"
+# HEC takes the token as a Basic password, so a URL must not carry one;
+# the refusal is kept with the outputs checked for tokens at the end.
+sed 's|url = "http://127.0.0.1:'$HEC'"|url = "http://x:'$E2E_HEC_TOKEN'@127.0.0.1:'$HEC'"|' "$WORK/ariodb.toml" > "$WORK/creds.toml"
+expect "a url with a password in it is refused" "must not contain a user name or password" \
+  "$(note "$($BIN --config "$WORK/creds.toml" check 2>&1 || true)")"
 
 $BIN "${CFG[@]}" setup >/dev/null
 
