@@ -323,7 +323,10 @@ RESTARTS=$(python3 -c 'import json,sys; print(next(p["restarts"] for p in json.l
 echo "endless line"
 expect "a line that never ends refuses at the cap, not at the timeout" "stopped before answering" \
   "$(agent "SELECT /*ask-broken*/ 'endless'")"
-expect "and restarts the plugin" "plugin 'broken' sent a line longer than 1048576 bytes; restarting it" "$(cat "$WORK/serve.log")"
+# The refusal can reach the agent a moment before the restart is logged.
+endless_logged() { grep -qF "plugin 'broken' sent a line longer than 1048576 bytes; restarting it" "$WORK/serve.log"; }
+wait_for "and restarts the plugin" endless_logged
+pass "and restarts the plugin"
 broken_is_back_again() { [ "$(running_count broken serve.log)" -ge 3 ]; }
 wait_for "the plugin comes back after the endless line" broken_is_back_again
 expect "and it allows again" "(1 row)" "$(agent "SELECT /*ask-broken*/ 4")"
