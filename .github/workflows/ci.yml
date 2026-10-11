@@ -164,6 +164,16 @@ jobs:
       - uses: ./.github/actions/e2e-setup
       - run: ./scripts/e2e-plugins.sh
 
+  e2e-report:
+    name: e2e compliance reports
+    needs: [clippy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/e2e-report.sh
+
   sim-undo:
     name: undo simulation
     needs: [clippy]
