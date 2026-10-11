@@ -90,7 +90,7 @@ impl Framework {
     pub fn source(self) -> &'static str {
         match self {
             Framework::Dora => {
-                "Regulation (EU) 2022/2554 on digital operational resilience for the financial sector (\"DORA Art.\"), and Commission Delegated Regulation (EU) 2024/1774, the regulatory technical standards on the ICT risk management framework (\"RTS 2024/1774 Art.\")"
+                "Regulation (EU) 2022/2554 on digital operational resilience for the financial sector (\"Art.\"), and Commission Delegated Regulation (EU) 2024/1774, the regulatory technical standards on the ICT risk management framework (\"RTS 2024/1774 Art.\")"
             }
             Framework::Soc2 => {
                 "AICPA 2017 Trust Services Criteria for Security, Availability, Processing Integrity, Confidentiality, and Privacy (revised points of focus, 2022): common criteria CC6 to CC8"
@@ -184,25 +184,25 @@ use Section::{
 #[rustfmt::skip]
 pub const CONTROLS: &[Control] = &[
     // DORA and its RTS on the ICT risk management framework.
-    c(Dora, Int, "DORA Art. 9(3)(c)", "ICT solutions prevent impairment of the authenticity and integrity of data"),
+    c(Dora, Int, "Art. 9(3)(c)", "ICT solutions prevent impairment of the authenticity and integrity of data"),
     c(Dora, Int, "RTS 2024/1774 Art. 12(2)(a)", "Logging: the events logged, their retention period and how log data is secured"),
     c(Dora, Int, "RTS 2024/1774 Art. 12(2)(d)", "Logging: logs protected against tampering, deletion and unauthorised access"),
-    c(Dora, Acc, "DORA Art. 9(4)(c)", "Logical access limited to what legitimate, approved functions require"),
+    c(Dora, Acc, "Art. 9(4)(c)", "Logical access limited to what legitimate, approved functions require"),
     c(Dora, Acc, "RTS 2024/1774 Art. 21(a)", "Access rights assigned on need-to-know, need-to-use and least privilege"),
     c(Dora, Acc, "RTS 2024/1774 Art. 21(c)", "User accountability: users identifiable for the actions they perform"),
     c(Dora, Acc, "RTS 2024/1774 Art. 12(2)(c)(i)", "Logging of events related to logical access control"),
-    c(Dora, Ovs, "DORA Art. 9(4)(c)", "Logical access limited to what legitimate, approved functions require"),
+    c(Dora, Ovs, "Art. 9(4)(c)", "Logical access limited to what legitimate, approved functions require"),
     c(Dora, Ovs, "RTS 2024/1774 Art. 21(b)", "Segregation of duties, so access rights cannot be combined to circumvent controls"),
     c(Dora, Ovs, "RTS 2024/1774 Art. 21(c)", "User accountability: users identifiable for the actions they perform"),
-    c(Dora, Chg, "DORA Art. 9(3)(b)", "ICT solutions minimise the risk of corruption or loss of data"),
-    c(Dora, Chg, "DORA Art. 9(3)(d)", "Data protected from poor administration, processing-related risks and human error"),
-    c(Dora, Chg, "DORA Art. 12(1)(b)", "Documented restoration and recovery procedures and methods"),
+    c(Dora, Chg, "Art. 9(3)(b)", "ICT solutions minimise the risk of corruption or loss of data"),
+    c(Dora, Chg, "Art. 9(3)(d)", "Data protected from poor administration, processing-related risks and human error"),
+    c(Dora, Chg, "Art. 12(1)(b)", "Documented restoration and recovery procedures and methods"),
     c(Dora, Chg, "RTS 2024/1774 Art. 12(2)(c)(iv)", "Logging of ICT operations, including ICT system activities"),
-    c(Dora, Pol, "DORA Art. 9(4)(e)", "Changes to systems and security parameters recorded, assessed, approved and verified"),
+    c(Dora, Pol, "Art. 9(4)(e)", "Changes to systems and security parameters recorded, assessed, approved and verified"),
     c(Dora, Pol, "RTS 2024/1774 Art. 17(1)(d)", "Change management: documentation of change details"),
     c(Dora, Pol, "RTS 2024/1774 Art. 12(2)(c)(iii)", "Logging of events related to change management"),
-    c(Dora, Exc, "DORA Art. 10(1)", "Mechanisms to promptly detect anomalous activities"),
-    c(Dora, Exc, "DORA Art. 17(3)(a)", "Incident management process: early warning indicators"),
+    c(Dora, Exc, "Art. 10(1)", "Mechanisms to promptly detect anomalous activities"),
+    c(Dora, Exc, "Art. 17(3)(a)", "Incident management process: early warning indicators"),
     c(Dora, Exc, "RTS 2024/1774 Art. 23(2)(b)", "Identify anomalous activities and behaviour"),
     // SOC 2 common criteria.
     c(Soc2, Int, "CC7.2", "System components monitored for anomalies; anomalies analysed as possible security events"),
@@ -310,6 +310,22 @@ pub fn parse_time(s: &str, end: bool) -> Result<i64, String> {
         return Err(bad());
     }
     Ok(day + (hh as i64 * 3600 + mm as i64 * 60 + ss as i64) * 1000)
+}
+
+/// The period as people read it: whole days with the last one included,
+/// or two instants with the end excluded.
+pub fn period_text(from: i64, to: i64) -> String {
+    if from % 86_400_000 == 0 && to % 86_400_000 == 0 {
+        let last = day_of(to - 86_400_000);
+        let first = day_of(from);
+        if first == last {
+            format!("{first} (UTC)")
+        } else {
+            format!("{first} to {last} inclusive (UTC)")
+        }
+    } else {
+        format!("{} to {} (the end excluded)", when(from), when(to))
+    }
 }
 
 /// `YYYY-MM-DD HH:MM:SS UTC`.
@@ -836,9 +852,72 @@ fn op_index(op: Op) -> usize {
 }
 
 /// Build a pack in `opts.out`, which must not exist or be empty.
+/// The decisions log over the period.
+struct DecisionFacts {
+    integrity: Integrity,
+    outcomes: BTreeMap<String, usize>,
+    agents: BTreeMap<String, AgentActivity>,
+    databases: BTreeSet<(String, String)>,
+    refusals: BTreeMap<(String, String), usize>,
+    rollbacks: BTreeMap<(String, String), usize>,
+    refused_days: BTreeMap<i64, usize>,
+    rollback_days: BTreeMap<i64, usize>,
+    /// Who decided the approvals of logged statements, by kind.
+    deciders: BTreeMap<&'static str, usize>,
+    /// Entries let through by a model that failed open: id, time, agent, decider.
+    failed_open: Vec<(i64, i64, String, String)>,
+}
+
+/// Approval requests over the period.
+struct Oversight {
+    approvals: Vec<ApprovalRow>,
+    by_result: BTreeMap<&'static str, usize>,
+    by_kind: BTreeMap<&'static str, usize>,
+    by_decider: BTreeMap<String, usize>,
+    /// How long people took to decide, in milliseconds, sorted.
+    person_waits: Vec<i64>,
+}
+
+/// An undo: when, engine, session, rows and who (if recorded).
+type Undo = (i64, &'static str, String, usize, Option<String>);
+
+/// The journals over the period.
+struct Journals {
+    transactions: usize,
+    sessions: BTreeMap<String, SessionChanges>,
+    /// Transactions and rows changed outside ariodb.
+    others: [usize; 2],
+    undos: Vec<Undo>,
+    undo_transactions: usize,
+    undo_rows: Vec<Vec<String>>,
+}
+
+/// Everything the HTML report shows.
+struct Facts<'a> {
+    opts: &'a Options,
+    config: &'a Config,
+    config_path: &'a Path,
+    config_sha: String,
+    engines: BTreeSet<String>,
+    agent_names: BTreeSet<String>,
+    decisions: DecisionFacts,
+    oversight: Oversight,
+    journals: Journals,
+    versions_all: Vec<ConfigVersion>,
+    exceptions: Vec<Exception>,
+    refusal_rows: Vec<Vec<String>>,
+    rollback_rows: Vec<Vec<String>>,
+    control_rows: Vec<Vec<String>>,
+}
+
+/// The value at fraction `p` of a sorted list.
+fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
+    (!sorted.is_empty()).then(|| sorted[((sorted.len() - 1) as f64 * p).round() as usize])
+}
+
 pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summary, String> {
     if opts.from_ms >= opts.to_ms {
-        return Err("--from must be before --to".to_string());
+        return Err("the period must start before it ends".to_string());
     }
     if opts.out.exists()
         && std::fs::read_dir(&opts.out)
@@ -862,150 +941,18 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     let redact = config.audit.redact_literals;
     let mut exceptions: Vec<Exception> = Vec::new();
 
-    // The decisions log: walk the period, checking every link, and write
-    // each entry out as it goes.
-    let mut integrity = Integrity::default();
-    let mut outcomes: BTreeMap<String, usize> = BTreeMap::new();
-    let mut agents: BTreeMap<String, AgentActivity> = BTreeMap::new();
-    let mut databases: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut refusals: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let mut rollbacks: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let mut refused_days: BTreeMap<i64, usize> = BTreeMap::new();
-    let mut rollback_days: BTreeMap<i64, usize> = BTreeMap::new();
-    let mut entry_deciders: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut failed_open: Vec<(i64, i64, String, String)> = Vec::new();
-    {
-        let mut csv = pack.create("decisions.csv")?;
-        let header = [
-            "id",
-            "at_utc",
-            "at_ms",
-            "session",
-            "agent",
-            "engine",
-            "database",
-            "kind",
-            "tables",
-            "outcome",
-            "rows",
-            "rule",
-            "reason",
-            "decided_by",
-            "latency_ms",
-            "sql",
-            "prev",
-            "hash",
-        ];
-        csv.write_all(csv_line(&header.map(String::from)).as_bytes())
-            .map_err(|e| e.to_string())?;
-        let mut json = JsonArray::new(pack.create("decisions.json")?)?;
-        if let Some(conn) = &store
-            && has_table(conn, "decisions")?
-        {
-            integrity.oldest_kept = conn
-                .query_row(
-                    "SELECT id, at_ms FROM decisions ORDER BY id LIMIT 1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            let first = one_id(
-                conn,
-                "SELECT min(id) FROM decisions WHERE at_ms >= ?1",
-                from,
-            )?;
-            let last = one_id(conn, "SELECT max(id) FROM decisions WHERE at_ms < ?1", to)?;
-            let (first, last) = match (first, last) {
-                (Some(f), Some(l)) if f <= l => (Some(f), Some(l)),
-                _ => (None, None),
-            };
-            integrity.anchor = match first {
-                Some(f) => one_id(conn, "SELECT max(id) FROM decisions WHERE id < ?1", f)?,
-                None => one_id(conn, "SELECT max(id) FROM decisions WHERE at_ms < ?1", from)?,
-            };
-            integrity.follower = match last {
-                Some(l) => one_id(conn, "SELECT min(id) FROM decisions WHERE id > ?1", l)?,
-                None => one_id(conn, "SELECT min(id) FROM decisions WHERE at_ms >= ?1", to)?,
-            };
-            integrity.first_id = first;
-            integrity.last_id = last;
-            let lo = integrity.anchor.or(first);
-            let hi = integrity.follower.or(last);
-            let mut chain = ChainCheck::default();
-            if let (Some(lo), Some(hi)) = (lo, hi) {
-                crate::audit::walk(conn, lo, hi, |e, intact| {
-                    chain.next(&e, intact);
-                    let d = &e.decision;
-                    let in_period =
-                        first.is_some_and(|f| d.id >= f) && last.is_some_and(|l| d.id <= l);
-                    if !in_period {
-                        return Ok(());
-                    }
-                    integrity.checked += 1;
-                    *outcomes.entry(d.outcome.clone()).or_default() += 1;
-                    let a = agents.entry(d.agent.clone()).or_default();
-                    *a.outcomes.entry(d.outcome.clone()).or_default() += 1;
-                    a.engines.insert(d.engine.clone());
-                    databases.insert((d.engine.clone(), d.database.clone()));
-                    let day = d.at_ms.div_euclid(86_400_000);
-                    let rule = d.rule.clone().unwrap_or_else(|| "policy".to_string());
-                    let reason = d.reason.clone().unwrap_or_default();
-                    match d.outcome.as_str() {
-                        "allowed" => {
-                            a.tables.extend(d.tables.iter().cloned());
-                            if d.kind.contains("write") {
-                                a.writes += 1;
-                                a.rows += d.rows.unwrap_or(0);
-                            }
-                        }
-                        "refused" => {
-                            *refusals.entry((rule, reason)).or_default() += 1;
-                            *refused_days.entry(day).or_default() += 1;
-                        }
-                        "rolled_back" => {
-                            *rollbacks.entry((rule, reason)).or_default() += 1;
-                            *rollback_days.entry(day).or_default() += 1;
-                        }
-                        _ => {}
-                    }
-                    for by in &d.decided_by {
-                        *entry_deciders.entry(decider_kind(by)).or_default() += 1;
-                        if by.starts_with("ariodb:failed-open:") {
-                            failed_open.push((d.id, d.at_ms, d.agent.clone(), by.clone()));
-                        }
-                    }
-                    let row = [
-                        d.id.to_string(),
-                        when(d.at_ms),
-                        d.at_ms.to_string(),
-                        d.session.clone(),
-                        d.agent.clone(),
-                        d.engine.clone(),
-                        d.database.clone(),
-                        d.kind.clone(),
-                        d.tables.join(" "),
-                        d.outcome.clone(),
-                        d.rows.map(|r| r.to_string()).unwrap_or_default(),
-                        d.rule.clone().unwrap_or_default(),
-                        d.reason.clone().unwrap_or_default(),
-                        d.decided_by.join(" "),
-                        d.latency_ms.map(|r| r.to_string()).unwrap_or_default(),
-                        d.sql.clone(),
-                        e.prev.clone(),
-                        e.hash.clone(),
-                    ];
-                    csv.write_all(csv_line(&row).as_bytes())
-                        .map_err(|e| e.to_string())?;
-                    json.push(&serde_json::to_value(&e).map_err(|e| e.to_string())?)
-                })?;
-            }
-            integrity.breaks = chain.breaks;
-            integrity.gaps = chain.gaps;
-        }
-        json.finish()?;
-        csv.flush().map_err(|e| e.to_string())?;
-    }
+    let DecisionFacts {
+        integrity,
+        outcomes,
+        agents,
+        databases,
+        refusals,
+        rollbacks,
+        refused_days,
+        rollback_days,
+        deciders,
+        failed_open,
+    } = read_decisions(store.as_ref(), from, to, &mut pack)?;
     for b in &integrity.breaks {
         exceptions.push(Exception {
             severity: "high",
@@ -1036,123 +983,19 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
         Some(conn) => history::config_versions(conn, to)?,
         None => Vec::new(),
     };
-    // The approver definitions in force at a time: from the config history
-    // where it reaches back that far, otherwise the config now.
-    let parsed: Vec<(i64, Option<Config>)> = versions_all
-        .iter()
-        .map(|v| (v.at_ms, Config::from_toml(&v.text).ok()))
-        .collect();
-    let config_at = |ms: i64| -> &Config {
-        parsed
-            .iter()
-            .rev()
-            .find(|(at, _)| *at <= ms)
-            .and_then(|(_, c)| c.as_ref())
-            .unwrap_or(config)
-    };
-    let mut by_result: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut by_decider: BTreeMap<String, usize> = BTreeMap::new();
-    let mut person_waits: Vec<i64> = Vec::new();
-    let mut approval_rows = Vec::new();
-    let mut approval_json = Vec::new();
-    for a in &approvals {
-        let result = approval_result(a);
-        *by_result.entry(result).or_default() += 1;
-        let kind = a
-            .decided_by
-            .as_deref()
-            .map(decider_kind)
-            .unwrap_or("nobody");
-        if matches!(result, "allowed" | "denied") {
-            *by_kind.entry(kind).or_default() += 1;
-            if let Some(by) = &a.decided_by {
-                *by_decider.entry(by.clone()).or_default() += 1;
-            }
-            if kind == "person"
-                && let Some(d) = a.decided_ms
-            {
-                person_waits.push(d - a.created_ms);
-            }
-        }
-        if let Some(by) = &a.decided_by {
-            let cfg = config_at(a.created_ms);
-            let def = cfg.approvers.iter().find(|x| x.name == a.approver);
-            if let Some(why) = unexpected_decider(def, &a.approver, by) {
-                exceptions.push(Exception {
-                    severity: "high",
-                    section: Section::Oversight,
-                    at_ms: Some(a.created_ms),
-                    what: format!("Approval {}: {why}.", a.id),
-                });
-            } else if by == "webhook" {
-                exceptions.push(Exception {
-                    severity: "low",
-                    section: Section::Oversight,
-                    at_ms: Some(a.created_ms),
-                    what: format!(
-                        "Approval {} was decided through a signed link without signing in, so the person is not identified.",
-                        a.id
-                    ),
-                });
-            }
-        }
-        if result == "not delivered" {
-            exceptions.push(Exception {
-                severity: "low",
-                section: Section::Oversight,
-                at_ms: Some(a.created_ms),
-                what: format!(
-                    "Approval {} could not be delivered to approver '{}' and was refused: {}",
-                    a.id,
-                    a.approver,
-                    a.note.clone().unwrap_or_default()
-                ),
-            });
-        }
-        let sql = crate::audit::stored_sql(&a.sql, redact);
-        let wait = a.decided_ms.map(|d| d - a.created_ms);
-        approval_rows.push(vec![
-            a.id.clone(),
-            when(a.created_ms),
-            a.agent.clone(),
-            a.session.clone(),
-            a.rule.clone(),
-            a.approver.clone(),
-            result.to_string(),
-            a.decided_by.clone().unwrap_or_default(),
-            kind.to_string(),
-            a.decided_ms.map(when).unwrap_or_default(),
-            wait.map(|w| w.to_string()).unwrap_or_default(),
-            a.note.clone().unwrap_or_default(),
-            sql.clone(),
-        ]);
-        approval_json.push(json!({
-            "id": a.id, "created_ms": a.created_ms, "agent": a.agent, "session": a.session,
-            "rule": a.rule, "approver": a.approver, "status": a.status, "result": result,
-            "decided_by": a.decided_by, "decider_kind": kind, "decided_ms": a.decided_ms,
-            "wait_ms": wait, "note": a.note, "sql": sql,
-        }));
-    }
-    pack.table(
-        "approvals",
-        &[
-            "id",
-            "created_utc",
-            "agent",
-            "session",
-            "rule",
-            "approver",
-            "result",
-            "decided_by",
-            "decider_kind",
-            "decided_utc",
-            "wait_ms",
-            "note",
-            "sql",
-        ],
-        &approval_rows,
-        &approval_json,
+    let Oversight {
+        approvals,
+        by_result,
+        by_kind,
+        by_decider,
+        person_waits,
+    } = read_oversight(
+        config,
+        approvals,
+        &versions_all,
+        redact,
+        &mut pack,
+        &mut exceptions,
     )?;
     for (id, at, agent, by) in &failed_open {
         exceptions.push(Exception {
@@ -1164,177 +1007,14 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
             ),
         });
     }
-
-    // The journals: what each session changed, and undo.
-    let mut records: Vec<(&'static str, TxnRecord)> = Vec::new();
-    records.extend(
-        crate::journal::read_all(config)?
-            .into_iter()
-            .map(|r| ("postgres", r)),
-    );
-    records.extend(
-        crate::mysql_journal::read_all(config)?
-            .into_iter()
-            .map(|r| ("mysql", r)),
-    );
-    records.retain(|(_, r)| r.at_ms >= from && r.at_ms < to);
-    records.sort_by_key(|(_, r)| r.at_ms);
-    let undo_records: Vec<UndoRecord> = match &store {
-        Some(conn) => history::undo_records(conn, from, to)?,
-        None => Vec::new(),
-    };
-    let mut sessions: BTreeMap<String, SessionChanges> = BTreeMap::new();
-    let mut others = [0usize; 2];
-    let mut undos: Vec<(i64, &'static str, String, usize, Option<String>)> = Vec::new();
-    let mut change_rows = Vec::new();
-    let mut change_json = Vec::new();
-    let mut used_undo_records: BTreeSet<i64> = BTreeSet::new();
-    let mut undo_transactions = 0;
-    for (engine, r) in &records {
-        let mut ops = [0usize; 4];
-        let mut tables = BTreeSet::new();
-        for ch in &r.changes {
-            ops[op_index(ch.op)] += 1;
-            tables.insert(ch.qualified_table());
-        }
-        match r.session.as_deref() {
-            Some(s) if s.starts_with("undo:") => {
-                let session = s.trim_start_matches("undo:").to_string();
-                // Who: the undo record for this session nearest in time.
-                let by = undo_records
-                    .iter()
-                    .filter(|u| u.session == session && (u.at_ms - r.at_ms).abs() < 600_000)
-                    .min_by_key(|u| (u.at_ms - r.at_ms).abs())
-                    .map(|u| {
-                        used_undo_records.insert(u.id);
-                        u.by.clone()
-                    });
-                undos.push((r.at_ms, engine, session, r.changes.len(), by));
-                undo_transactions += 1;
-            }
-            Some(s) => {
-                let e = sessions.entry(s.to_string()).or_default();
-                if e.transactions == 0 {
-                    e.first_ms = r.at_ms;
-                    e.engine = engine;
-                    e.agent = r.agent.clone().unwrap_or_default();
-                }
-                e.transactions += 1;
-                e.last_ms = r.at_ms;
-                for (i, n) in ops.iter().enumerate() {
-                    e.ops[i] += n;
-                }
-                e.tables.extend(tables.iter().cloned());
-            }
-            None => {
-                others[0] += 1;
-                others[1] += r.changes.len();
-            }
-        }
-        change_rows.push(vec![
-            when(r.at_ms),
-            engine.to_string(),
-            r.xid.to_string(),
-            r.lsn_text.clone(),
-            r.session.clone().unwrap_or_default(),
-            r.agent.clone().unwrap_or_default(),
-            tables.iter().cloned().collect::<Vec<_>>().join(" "),
-            ops[0].to_string(),
-            ops[1].to_string(),
-            ops[2].to_string(),
-            ops[3].to_string(),
-        ]);
-        change_json.push(json!({
-            "at_ms": r.at_ms, "engine": engine, "xid": r.xid, "position": r.lsn_text,
-            "session": r.session, "agent": r.agent, "tables": tables,
-            "inserts": ops[0], "updates": ops[1], "deletes": ops[2], "truncates": ops[3],
-        }));
-    }
-    // Undos ariodb recorded but the journal has not (yet) seen.
-    for u in undo_records
-        .iter()
-        .filter(|u| !used_undo_records.contains(&u.id))
-    {
-        let engine = if u.engine == "mysql" {
-            "mysql"
-        } else {
-            "postgres"
-        };
-        undos.push((
-            u.at_ms,
-            engine,
-            u.session.clone(),
-            u.rows as usize,
-            Some(u.by.clone()),
-        ));
-    }
-    undos.sort_by_key(|u| u.0);
-    for u in undo_records.iter().filter(|u| !u.intact) {
-        exceptions.push(Exception {
-            severity: "high",
-            section: Section::Change,
-            at_ms: Some(u.at_ms),
-            what: format!(
-                "The record of the undo of session {} was changed, or a record before it removed.",
-                u.session
-            ),
-        });
-    }
-    for (at, _, session, _, by) in &undos {
-        if by.is_none() {
-            exceptions.push(Exception {
-                severity: "low",
-                section: Section::Change,
-                at_ms: Some(*at),
-                what: format!(
-                    "Session {session} was undone, but who undid it is not recorded (an undo from before ariodb recorded them)."
-                ),
-            });
-        }
-    }
-    pack.table(
-        "changes",
-        &[
-            "committed_utc",
-            "engine",
-            "xid",
-            "position",
-            "session",
-            "agent",
-            "tables",
-            "inserts",
-            "updates",
-            "deletes",
-            "truncates",
-        ],
-        &change_rows,
-        &change_json,
-    )?;
-    let undo_rows: Vec<Vec<String>> = undos
-        .iter()
-        .map(|(at, engine, s, rows, by)| {
-            vec![
-                when(*at),
-                engine.to_string(),
-                s.clone(),
-                sessions.get(s).map(|x| x.agent.clone()).unwrap_or_default(),
-                rows.to_string(),
-                by.clone().unwrap_or_else(|| "not recorded".into()),
-            ]
-        })
-        .collect();
-    let undo_json: Vec<Value> = undos
-        .iter()
-        .map(|(at, engine, s, rows, by)| {
-            json!({ "at_ms": at, "engine": engine, "session": s, "rows": rows, "by": by })
-        })
-        .collect();
-    pack.table(
-        "undos",
-        &["undone_utc", "engine", "session", "agent", "rows", "by"],
-        &undo_rows,
-        &undo_json,
-    )?;
+    let Journals {
+        transactions,
+        sessions,
+        others,
+        undos,
+        undo_transactions,
+        undo_rows,
+    } = read_journals(config, store.as_ref(), from, to, &mut pack, &mut exceptions)?;
 
     // Policy changes.
     let baseline = versions_all.iter().rev().find(|v| v.at_ms < from);
@@ -1516,12 +1196,7 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     }
     let mut agent_names: BTreeSet<String> = config.agents.iter().map(|a| a.name.clone()).collect();
     agent_names.extend(agents.keys().cloned());
-    let approvals_decided = by_kind.values().sum::<usize>();
-    person_waits.sort();
-    let wait_stat = |p: f64| -> Option<i64> {
-        (!person_waits.is_empty())
-            .then(|| person_waits[((person_waits.len() - 1) as f64 * p).round() as usize])
-    };
+    let wait_stat = |p: f64| percentile(&person_waits, p);
     let summary = json!({
         "generator": format!("ariodb {}", env!("CARGO_PKG_VERSION")),
         "generated_ms": crate::store::now_ms(),
@@ -1533,7 +1208,7 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
             "engines": engines,
             "databases": databases.iter().map(|(e, d)| json!({ "engine": e, "database": d })).collect::<Vec<_>>(),
         },
-        "decisions": { "total": integrity.checked, "by_outcome": outcomes },
+        "decisions": { "total": integrity.checked, "by_outcome": outcomes, "deciders_by_kind": deciders },
         "integrity": {
             "intact": integrity.breaks.is_empty(),
             "checked": integrity.checked,
@@ -1553,7 +1228,7 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
             "person_wait_ms": { "median": wait_stat(0.5), "p90": wait_stat(0.9), "max": person_waits.last() },
         },
         "changes": {
-            "transactions": records.len(),
+            "transactions": transactions,
             "agent_sessions": sessions.len(),
             "undos": undos.len(),
             "rolled_back": outcomes.get("rolled_back").copied().unwrap_or(0),
@@ -1565,6 +1240,604 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     let text = serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?;
     pack.write("summary.json", format!("{text}\n").as_bytes())?;
 
+    let facts = Facts {
+        opts,
+        config,
+        config_path,
+        config_sha,
+        engines,
+        agent_names,
+        decisions: DecisionFacts {
+            integrity,
+            outcomes,
+            agents,
+            databases,
+            refusals,
+            rollbacks,
+            refused_days,
+            rollback_days,
+            deciders,
+            failed_open,
+        },
+        oversight: Oversight {
+            approvals,
+            by_result,
+            by_kind,
+            by_decider,
+            person_waits,
+        },
+        journals: Journals {
+            transactions,
+            sessions,
+            others,
+            undos,
+            undo_transactions,
+            undo_rows,
+        },
+        versions_all,
+        exceptions,
+        refusal_rows,
+        rollback_rows,
+        control_rows,
+    };
+    pack.write("report.html", render(&facts).as_bytes())?;
+
+    let manifest = pack.manifest()?;
+    Ok(Summary {
+        files: pack.files.len(),
+        manifest_sha256: manifest,
+        decisions: facts.decisions.integrity.checked,
+        breaks: facts.decisions.integrity.breaks,
+        exceptions: facts.exceptions.len(),
+    })
+}
+
+/// What the decisions log says about the period. Writes every entry in it
+/// to `decisions.csv` and `decisions.json` while it checks the chain.
+fn read_decisions(
+    store: Option<&Connection>,
+    from: i64,
+    to: i64,
+    pack: &mut Pack,
+) -> Result<DecisionFacts, String> {
+    // The decisions log: walk the period, checking every link, and write
+    // each entry out as it goes.
+    let mut integrity = Integrity::default();
+    let mut outcomes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut agents: BTreeMap<String, AgentActivity> = BTreeMap::new();
+    let mut databases: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut refusals: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut rollbacks: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut refused_days: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut rollback_days: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut entry_deciders: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut failed_open: Vec<(i64, i64, String, String)> = Vec::new();
+    {
+        let mut csv = pack.create("decisions.csv")?;
+        let header = [
+            "id",
+            "at_utc",
+            "at_ms",
+            "session",
+            "agent",
+            "engine",
+            "database",
+            "kind",
+            "tables",
+            "outcome",
+            "rows",
+            "rule",
+            "reason",
+            "decided_by",
+            "latency_ms",
+            "sql",
+            "prev",
+            "hash",
+        ];
+        csv.write_all(csv_line(&header.map(String::from)).as_bytes())
+            .map_err(|e| e.to_string())?;
+        let mut json = JsonArray::new(pack.create("decisions.json")?)?;
+        if let Some(conn) = store
+            && has_table(conn, "decisions")?
+        {
+            integrity.oldest_kept = conn
+                .query_row(
+                    "SELECT id, at_ms FROM decisions ORDER BY id LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let first = one_id(
+                conn,
+                "SELECT min(id) FROM decisions WHERE at_ms >= ?1",
+                from,
+            )?;
+            let last = one_id(conn, "SELECT max(id) FROM decisions WHERE at_ms < ?1", to)?;
+            let (first, last) = match (first, last) {
+                (Some(f), Some(l)) if f <= l => (Some(f), Some(l)),
+                _ => (None, None),
+            };
+            integrity.anchor = match first {
+                Some(f) => one_id(conn, "SELECT max(id) FROM decisions WHERE id < ?1", f)?,
+                None => one_id(conn, "SELECT max(id) FROM decisions WHERE at_ms < ?1", from)?,
+            };
+            integrity.follower = match last {
+                Some(l) => one_id(conn, "SELECT min(id) FROM decisions WHERE id > ?1", l)?,
+                None => one_id(conn, "SELECT min(id) FROM decisions WHERE at_ms >= ?1", to)?,
+            };
+            integrity.first_id = first;
+            integrity.last_id = last;
+            let lo = integrity.anchor.or(first);
+            let hi = integrity.follower.or(last);
+            let mut chain = ChainCheck::default();
+            if let (Some(lo), Some(hi)) = (lo, hi) {
+                crate::audit::walk(conn, lo, hi, |e, intact| {
+                    chain.next(&e, intact);
+                    let d = &e.decision;
+                    let in_period =
+                        first.is_some_and(|f| d.id >= f) && last.is_some_and(|l| d.id <= l);
+                    if !in_period {
+                        return Ok(());
+                    }
+                    integrity.checked += 1;
+                    *outcomes.entry(d.outcome.clone()).or_default() += 1;
+                    let a = agents.entry(d.agent.clone()).or_default();
+                    *a.outcomes.entry(d.outcome.clone()).or_default() += 1;
+                    a.engines.insert(d.engine.clone());
+                    databases.insert((d.engine.clone(), d.database.clone()));
+                    let day = d.at_ms.div_euclid(86_400_000);
+                    let rule = d.rule.clone().unwrap_or_else(|| "policy".to_string());
+                    let reason = d.reason.clone().unwrap_or_default();
+                    match d.outcome.as_str() {
+                        "allowed" => {
+                            a.tables.extend(d.tables.iter().cloned());
+                            if d.kind.contains("write") {
+                                a.writes += 1;
+                                a.rows += d.rows.unwrap_or(0);
+                            }
+                        }
+                        "refused" => {
+                            *refusals.entry((rule, reason)).or_default() += 1;
+                            *refused_days.entry(day).or_default() += 1;
+                        }
+                        "rolled_back" => {
+                            *rollbacks.entry((rule, reason)).or_default() += 1;
+                            *rollback_days.entry(day).or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                    for by in &d.decided_by {
+                        *entry_deciders.entry(decider_kind(by)).or_default() += 1;
+                        if by.starts_with("ariodb:failed-open:") {
+                            failed_open.push((d.id, d.at_ms, d.agent.clone(), by.clone()));
+                        }
+                    }
+                    let row = [
+                        d.id.to_string(),
+                        when(d.at_ms),
+                        d.at_ms.to_string(),
+                        d.session.clone(),
+                        d.agent.clone(),
+                        d.engine.clone(),
+                        d.database.clone(),
+                        d.kind.clone(),
+                        d.tables.join(" "),
+                        d.outcome.clone(),
+                        d.rows.map(|r| r.to_string()).unwrap_or_default(),
+                        d.rule.clone().unwrap_or_default(),
+                        d.reason.clone().unwrap_or_default(),
+                        d.decided_by.join(" "),
+                        d.latency_ms.map(|r| r.to_string()).unwrap_or_default(),
+                        d.sql.clone(),
+                        e.prev.clone(),
+                        e.hash.clone(),
+                    ];
+                    csv.write_all(csv_line(&row).as_bytes())
+                        .map_err(|e| e.to_string())?;
+                    json.push(&serde_json::to_value(&e).map_err(|e| e.to_string())?)
+                })?;
+            }
+            integrity.breaks = chain.breaks;
+            integrity.gaps = chain.gaps;
+        }
+        json.finish()?;
+        csv.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(DecisionFacts {
+        integrity,
+        outcomes,
+        agents,
+        databases,
+        refusals,
+        rollbacks,
+        refused_days,
+        rollback_days,
+        deciders: entry_deciders,
+        failed_open,
+    })
+}
+
+/// Approval requests in the period: counts by result and by kind of
+/// decider, and how long people took. Writes `approvals.csv` and `.json`
+/// and adds unexpected deciders to `exceptions`.
+fn read_oversight(
+    config: &Config,
+    approvals: Vec<ApprovalRow>,
+    versions_all: &[ConfigVersion],
+    redact: bool,
+    pack: &mut Pack,
+    exceptions: &mut Vec<Exception>,
+) -> Result<Oversight, String> {
+    // The approver definitions in force at a time: from the config history
+    // where it reaches back that far, otherwise the config now.
+    let parsed: Vec<(i64, Option<Config>)> = versions_all
+        .iter()
+        .map(|v| (v.at_ms, Config::from_toml(&v.text).ok()))
+        .collect();
+    let config_at = |ms: i64| -> &Config {
+        parsed
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= ms)
+            .and_then(|(_, c)| c.as_ref())
+            .unwrap_or(config)
+    };
+    let mut by_result: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut by_decider: BTreeMap<String, usize> = BTreeMap::new();
+    let mut person_waits: Vec<i64> = Vec::new();
+    let mut approval_rows = Vec::new();
+    let mut approval_json = Vec::new();
+    for a in &approvals {
+        let result = approval_result(a);
+        *by_result.entry(result).or_default() += 1;
+        let kind = a
+            .decided_by
+            .as_deref()
+            .map(decider_kind)
+            .unwrap_or("nobody");
+        if matches!(result, "allowed" | "denied") {
+            *by_kind.entry(kind).or_default() += 1;
+            if let Some(by) = &a.decided_by {
+                *by_decider.entry(by.clone()).or_default() += 1;
+            }
+            if kind == "person"
+                && let Some(d) = a.decided_ms
+            {
+                person_waits.push(d - a.created_ms);
+            }
+        }
+        if let Some(by) = &a.decided_by {
+            let cfg = config_at(a.created_ms);
+            let def = cfg.approvers.iter().find(|x| x.name == a.approver);
+            if let Some(why) = unexpected_decider(def, &a.approver, by) {
+                exceptions.push(Exception {
+                    severity: "high",
+                    section: Section::Oversight,
+                    at_ms: Some(a.created_ms),
+                    what: format!("Approval {}: {why}.", a.id),
+                });
+            } else if by == "webhook" {
+                exceptions.push(Exception {
+                    severity: "low",
+                    section: Section::Oversight,
+                    at_ms: Some(a.created_ms),
+                    what: format!(
+                        "Approval {} was decided through a signed link without signing in, so the person is not identified.",
+                        a.id
+                    ),
+                });
+            }
+        }
+        if result == "not delivered" {
+            exceptions.push(Exception {
+                severity: "low",
+                section: Section::Oversight,
+                at_ms: Some(a.created_ms),
+                what: format!(
+                    "Approval {} could not be delivered to approver '{}' and was refused: {}",
+                    a.id,
+                    a.approver,
+                    a.note.clone().unwrap_or_default()
+                ),
+            });
+        }
+        let sql = crate::audit::stored_sql(&a.sql, redact);
+        let wait = a.decided_ms.map(|d| d - a.created_ms);
+        approval_rows.push(vec![
+            a.id.clone(),
+            when(a.created_ms),
+            a.agent.clone(),
+            a.session.clone(),
+            a.rule.clone(),
+            a.approver.clone(),
+            result.to_string(),
+            a.decided_by.clone().unwrap_or_default(),
+            kind.to_string(),
+            a.decided_ms.map(when).unwrap_or_default(),
+            wait.map(|w| w.to_string()).unwrap_or_default(),
+            a.note.clone().unwrap_or_default(),
+            sql.clone(),
+        ]);
+        approval_json.push(json!({
+            "id": a.id, "created_ms": a.created_ms, "agent": a.agent, "session": a.session,
+            "rule": a.rule, "approver": a.approver, "status": a.status, "result": result,
+            "decided_by": a.decided_by, "decider_kind": kind, "decided_ms": a.decided_ms,
+            "wait_ms": wait, "note": a.note, "sql": sql,
+        }));
+    }
+    pack.table(
+        "approvals",
+        &[
+            "id",
+            "created_utc",
+            "agent",
+            "session",
+            "rule",
+            "approver",
+            "result",
+            "decided_by",
+            "decider_kind",
+            "decided_utc",
+            "wait_ms",
+            "note",
+            "sql",
+        ],
+        &approval_rows,
+        &approval_json,
+    )?;
+    person_waits.sort();
+    Ok(Oversight {
+        approvals,
+        by_result,
+        by_kind,
+        by_decider,
+        person_waits,
+    })
+}
+
+/// What the journals recorded in the period: each agent session's changes,
+/// undos (with who applied them, from the undo records), and changes by
+/// others. Writes `changes.*` and `undos.*`.
+fn read_journals(
+    config: &Config,
+    store: Option<&Connection>,
+    from: i64,
+    to: i64,
+    pack: &mut Pack,
+    exceptions: &mut Vec<Exception>,
+) -> Result<Journals, String> {
+    // The journals: what each session changed, and undo.
+    let mut records: Vec<(&'static str, TxnRecord)> = Vec::new();
+    records.extend(
+        crate::journal::read_all(config)?
+            .into_iter()
+            .map(|r| ("postgres", r)),
+    );
+    records.extend(
+        crate::mysql_journal::read_all(config)?
+            .into_iter()
+            .map(|r| ("mysql", r)),
+    );
+    records.retain(|(_, r)| r.at_ms >= from && r.at_ms < to);
+    records.sort_by_key(|(_, r)| r.at_ms);
+    let undo_records: Vec<UndoRecord> = match store {
+        Some(conn) => history::undo_records(conn, from, to)?,
+        None => Vec::new(),
+    };
+    let mut sessions: BTreeMap<String, SessionChanges> = BTreeMap::new();
+    let mut others = [0usize; 2];
+    let mut undos: Vec<(i64, &'static str, String, usize, Option<String>)> = Vec::new();
+    let mut change_rows = Vec::new();
+    let mut change_json = Vec::new();
+    let mut used_undo_records: BTreeSet<i64> = BTreeSet::new();
+    let mut undo_transactions = 0;
+    for (engine, r) in &records {
+        let mut ops = [0usize; 4];
+        let mut tables = BTreeSet::new();
+        for ch in &r.changes {
+            ops[op_index(ch.op)] += 1;
+            tables.insert(ch.qualified_table());
+        }
+        match r.session.as_deref() {
+            Some(s) if s.starts_with("undo:") => {
+                let session = s.trim_start_matches("undo:").to_string();
+                // Who: the undo record for this session nearest in time.
+                let by = undo_records
+                    .iter()
+                    .filter(|u| u.session == session && (u.at_ms - r.at_ms).abs() < 600_000)
+                    .min_by_key(|u| (u.at_ms - r.at_ms).abs())
+                    .map(|u| {
+                        used_undo_records.insert(u.id);
+                        u.by.clone()
+                    });
+                undos.push((r.at_ms, engine, session, r.changes.len(), by));
+                undo_transactions += 1;
+            }
+            Some(s) => {
+                let e = sessions.entry(s.to_string()).or_default();
+                if e.transactions == 0 {
+                    e.first_ms = r.at_ms;
+                    e.engine = engine;
+                    e.agent = r.agent.clone().unwrap_or_default();
+                }
+                e.transactions += 1;
+                e.last_ms = r.at_ms;
+                for (i, n) in ops.iter().enumerate() {
+                    e.ops[i] += n;
+                }
+                e.tables.extend(tables.iter().cloned());
+            }
+            None => {
+                others[0] += 1;
+                others[1] += r.changes.len();
+            }
+        }
+        change_rows.push(vec![
+            when(r.at_ms),
+            engine.to_string(),
+            r.xid.to_string(),
+            r.lsn_text.clone(),
+            r.session.clone().unwrap_or_default(),
+            r.agent.clone().unwrap_or_default(),
+            tables.iter().cloned().collect::<Vec<_>>().join(" "),
+            ops[0].to_string(),
+            ops[1].to_string(),
+            ops[2].to_string(),
+            ops[3].to_string(),
+        ]);
+        change_json.push(json!({
+            "at_ms": r.at_ms, "engine": engine, "xid": r.xid, "position": r.lsn_text,
+            "session": r.session, "agent": r.agent, "tables": tables,
+            "inserts": ops[0], "updates": ops[1], "deletes": ops[2], "truncates": ops[3],
+        }));
+    }
+    // Undos ariodb recorded but the journal has not (yet) seen.
+    for u in undo_records
+        .iter()
+        .filter(|u| !used_undo_records.contains(&u.id))
+    {
+        let engine = if u.engine == "mysql" {
+            "mysql"
+        } else {
+            "postgres"
+        };
+        undos.push((
+            u.at_ms,
+            engine,
+            u.session.clone(),
+            u.rows as usize,
+            Some(u.by.clone()),
+        ));
+    }
+    undos.sort_by_key(|u| u.0);
+    for u in undo_records.iter().filter(|u| !u.intact) {
+        exceptions.push(Exception {
+            severity: "high",
+            section: Section::Change,
+            at_ms: Some(u.at_ms),
+            what: format!(
+                "The record of the undo of session {} was changed, or a record before it removed.",
+                u.session
+            ),
+        });
+    }
+    for (at, _, session, _, by) in &undos {
+        if by.is_none() {
+            exceptions.push(Exception {
+                severity: "low",
+                section: Section::Change,
+                at_ms: Some(*at),
+                what: format!(
+                    "Session {session} was undone, but who undid it is not recorded (an undo from before ariodb recorded them)."
+                ),
+            });
+        }
+    }
+    pack.table(
+        "changes",
+        &[
+            "committed_utc",
+            "engine",
+            "xid",
+            "position",
+            "session",
+            "agent",
+            "tables",
+            "inserts",
+            "updates",
+            "deletes",
+            "truncates",
+        ],
+        &change_rows,
+        &change_json,
+    )?;
+    let undo_rows: Vec<Vec<String>> = undos
+        .iter()
+        .map(|(at, engine, s, rows, by)| {
+            vec![
+                when(*at),
+                engine.to_string(),
+                s.clone(),
+                sessions.get(s).map(|x| x.agent.clone()).unwrap_or_default(),
+                rows.to_string(),
+                by.clone().unwrap_or_else(|| "not recorded".into()),
+            ]
+        })
+        .collect();
+    let undo_json: Vec<Value> = undos
+        .iter()
+        .map(|(at, engine, s, rows, by)| {
+            json!({ "at_ms": at, "engine": engine, "session": s, "rows": rows, "by": by })
+        })
+        .collect();
+    pack.table(
+        "undos",
+        &["undone_utc", "engine", "session", "agent", "rows", "by"],
+        &undo_rows,
+        &undo_json,
+    )?;
+
+    Ok(Journals {
+        transactions: records.len(),
+        sessions,
+        others,
+        undos,
+        undo_transactions,
+        undo_rows,
+    })
+}
+
+/// The HTML report: one page, styles inline, no scripts, everything from
+/// SQL, the config and names escaped.
+fn render(f: &Facts) -> String {
+    let Facts {
+        opts,
+        config,
+        config_path,
+        config_sha,
+        engines,
+        agent_names,
+        decisions,
+        oversight,
+        journals,
+        versions_all,
+        exceptions,
+        refusal_rows,
+        rollback_rows,
+        control_rows,
+    } = f;
+    let DecisionFacts {
+        integrity,
+        outcomes,
+        agents,
+        databases,
+        failed_open,
+        ..
+    } = decisions;
+    let Oversight {
+        approvals,
+        by_result,
+        by_kind,
+        by_decider,
+        person_waits,
+    } = oversight;
+    let Journals {
+        transactions,
+        sessions,
+        others,
+        undos,
+        undo_transactions,
+        undo_rows,
+    } = journals;
+    let (from, to) = (opts.from_ms, opts.to_ms);
+    let redact = config.audit.redact_literals;
+    let retention = config.audit.retention_days;
+    let baseline = versions_all.iter().rev().find(|v| v.at_ms < from);
+    let changes: Vec<&ConfigVersion> = versions_all.iter().filter(|v| v.at_ms >= from).collect();
+    let approvals_decided = by_kind.values().sum::<usize>();
+    let wait_stat = |p: f64| percentile(person_waits, p);
     // The HTML report.
     let mut html = String::new();
     let section_head = |out: &mut String, s: Section, n: usize| {
@@ -1628,9 +1901,8 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     );
     let _ = write!(
         html,
-        "<header><p class=\"kicker\">ariodb compliance report</p><h1>{} to {}</h1><p class=\"muted\">Frameworks: {}. Generated {} by ariodb {}.</p><p class=\"disclaimer\">{}</p></header>",
-        h(&when(from)),
-        h(&when(to)),
+        "<header><p class=\"kicker\">ariodb compliance report</p><h1>{}</h1><p class=\"muted\">Frameworks: {}. Generated {} by ariodb {}.</p><p class=\"disclaimer\">{}</p></header>",
+        h(&period_text(from, to)),
         h(&frameworks_text),
         h(&when(crate::store::now_ms())),
         h(env!("CARGO_PKG_VERSION")),
@@ -1652,7 +1924,12 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     let scope_rows: Vec<(&str, String)> = vec![
         (
             "Period",
-            format!("{} to {} (the end is exclusive)", when(from), when(to)),
+            format!(
+                "{}: from {} up to {}",
+                period_text(from, to),
+                when(from),
+                when(to)
+            ),
         ),
         ("ariodb version", env!("CARGO_PKG_VERSION").to_string()),
         (
@@ -1681,7 +1958,7 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
         ),
         ("Statements decided", integrity.checked.to_string()),
         ("Approval requests", approvals.len().to_string()),
-        ("Journalled transactions", records.len().to_string()),
+        ("Journalled transactions", transactions.to_string()),
         (
             "Statements as logged",
             if redact {
@@ -1716,12 +1993,17 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
         (Some(f), Some(l)) => notes.push(format!("The period holds entries {f} to {l}.")),
         _ => notes.push("No entries were written in the period.".to_string()),
     }
+    let first_ever = integrity.oldest_kept.is_some_and(|(id, _)| id == 1);
     match integrity.anchor {
         Some(a) => notes.push(format!(
             "Its first entry was checked against entry {a}, the last one before the period."
         )),
+        None if first_ever => notes.push(
+            "The period begins with the first entry ever written, so nothing before it could be missing."
+                .to_string(),
+        ),
         None => notes.push(
-            "No entry before the period is kept, so the first entry's link backwards cannot be checked."
+            "No entry before the period is kept (retention removed them), so the first entry's link backwards cannot be checked."
                 .to_string(),
         ),
     }
@@ -1748,9 +2030,14 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
             "The oldest entry kept is {id}, written {}.",
             when(at)
         ));
-        if at > from {
+        if first_ever {
+            notes.push(
+                "No entry has been pruned yet: the oldest kept is the first ever written."
+                    .to_string(),
+            );
+        } else if at > from {
             notes.push(format!(
-                "The period starts before that, so entries from before {} are not in this report.",
+                "The period starts before that: entries from before {} have been removed by retention and are not in this report.",
                 when(at)
             ));
         }
@@ -1878,7 +2165,7 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     table(
         &mut html,
         &["Rule", "Reason", "Count"],
-        &refusal_rows,
+        refusal_rows,
         "refusals.csv",
     );
     html.push_str("</section>");
@@ -1990,8 +2277,8 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     );
     let _ = write!(
         html,
-        "<p>Rows counted here are measured inside each write's transaction before it commits. The journals recorded {} transactions in the period: {} from agent sessions, {} undos, and {} by others (people and applications outside ariodb), which undo treats as conflicts rather than overwriting.</p>",
-        records.len(),
+        "<p>Rows counted here are measured inside each write's transaction before it commits. The journals recorded {} transactions in the period: {} from agent sessions, {} from undo, and {} by others (people and applications outside ariodb), which undo treats as conflicts rather than overwriting.</p>",
+        transactions,
         sessions.values().map(|s| s.transactions).sum::<usize>(),
         undo_transactions,
         others[0]
@@ -2000,7 +2287,7 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     table(
         &mut html,
         &["Rule", "Reason", "Count"],
-        &rollback_rows,
+        rollback_rows,
         "rollbacks.csv",
     );
     html.push_str("<h3>What agent sessions changed</h3>");
@@ -2048,7 +2335,7 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     table(
         &mut html,
         &["Undone", "Engine", "Session", "Agent", "Rows", "By"],
-        &undo_rows,
+        undo_rows,
         "undos.csv",
     );
     html.push_str("</section>");
@@ -2147,22 +2434,13 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
     table(
         &mut html,
         &["Framework", "Control", "Summary", "Section"],
-        &control_rows,
+        control_rows,
         "controls.csv",
     );
     html.push_str("</section>");
     html.push_str("<section id=\"verify\"><h2>Checking this pack</h2><p><code>manifest.sha256</code> lists every other file in the pack with its SHA-256. Record the manifest's own hash, which <code>ariodb report</code> printed, when you receive the pack. To check later that nothing was changed, confirm the manifest still has that hash, then check every file against it:</p><pre>sha256sum manifest.sha256\nsha256sum -c manifest.sha256</pre><p>(On macOS: <code>shasum -a 256</code> in place of <code>sha256sum</code>.) The CSV files guard cells that a spreadsheet would run as formulas with a leading <code>'</code>; the JSON files hold the exact values.</p></section>");
     html.push_str("</body></html>\n");
-    pack.write("report.html", html.as_bytes())?;
-
-    let manifest = pack.manifest()?;
-    Ok(Summary {
-        files: pack.files.len(),
-        manifest_sha256: manifest,
-        decisions: integrity.checked,
-        breaks: integrity.breaks,
-        exceptions: exceptions.len(),
-    })
+    html
 }
 
 /// `ariodb report`.
@@ -2202,6 +2480,111 @@ pub fn command(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Downloading a pack from the dashboard.
+
+/// A tar archive (POSIX ustar) of the files in `dir`, under `prefix/`.
+/// Packs are flat and small enough to build in memory.
+pub fn tar(dir: &Path, prefix: &str) -> Result<Vec<u8>, String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    names.sort();
+    let mtime = crate::store::now_ms() / 1000;
+    let mut out = Vec::new();
+    for name in names {
+        let path = format!("{prefix}/{name}");
+        if path.len() > 99 {
+            return Err(format!("{path}: name too long for the archive"));
+        }
+        let data = std::fs::read(dir.join(&name)).map_err(|e| e.to_string())?;
+        let mut header = [0u8; 512];
+        let mut put = |at: usize, value: &[u8]| header[at..at + value.len()].copy_from_slice(value);
+        put(0, path.as_bytes());
+        put(100, b"0000644\0");
+        put(108, b"0000000\0");
+        put(116, b"0000000\0");
+        put(124, format!("{:011o}\0", data.len()).as_bytes());
+        put(136, format!("{mtime:011o}\0").as_bytes());
+        put(148, b"        ");
+        put(156, b"0");
+        put(257, b"ustar\0");
+        put(263, b"00");
+        let sum: u32 = header.iter().map(|b| *b as u32).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&data);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+    }
+    out.resize(out.len() + 1024, 0);
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+pub struct DownloadQuery {
+    from: String,
+    to: String,
+    #[serde(default = "all")]
+    framework: String,
+}
+
+fn all() -> String {
+    "all".to_string()
+}
+
+/// `GET /api/report`: build a pack for admins and send it as a tar archive.
+/// The manifest's hash goes in a header, for the dashboard to show.
+pub async fn download(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::gate::State>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<DownloadQuery>,
+) -> Result<axum::response::Response, crate::dashboard::ApiError> {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    let user = crate::dashboard::require_role(&state, &headers, crate::store::Role::Admin)?;
+    let bad = |e: String| crate::dashboard::ApiError(StatusCode::BAD_REQUEST, e);
+    let config = state.config();
+    let opts = Options {
+        from_ms: parse_time(&q.from, false).map_err(bad)?,
+        to_ms: parse_time(&q.to, true).map_err(bad)?,
+        frameworks: Framework::parse(&q.framework).map_err(bad)?,
+        out: std::env::temp_dir().join(format!("ariodb-report-{}", uuid::Uuid::new_v4().simple())),
+    };
+    let name = format!(
+        "ariodb-report-{}-{}",
+        day_of(opts.from_ms),
+        day_of(opts.to_ms - 1)
+    );
+    let file = format!("attachment; filename=\"{name}.tar\"");
+    let path = state.config_path.clone();
+    let (summary, archive) = tokio::task::spawn_blocking(move || {
+        let built = build(&config, &path, &opts).and_then(|s| Ok((s, tar(&opts.out, &name)?)));
+        let _ = std::fs::remove_dir_all(&opts.out);
+        built
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    println!(
+        "ariodb: {} downloaded a report pack for {} to {} (manifest {})",
+        user.name, q.from, q.to, summary.manifest_sha256
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-tar".to_string()),
+            (header::CONTENT_DISPOSITION, file),
+            (
+                header::HeaderName::from_static("x-ariodb-manifest-sha256"),
+                summary.manifest_sha256,
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        archive,
+    )
+        .into_response())
+}
+
 const STYLE: &str = r#"
 :root{--ink:#1b1f24;--muted:#5b6470;--rule:#d7dbe0;--band:#f4f6f8;--accent:#1f4e79;--ok:#256b35;--bad:#a1262c;--warn:#8a5a00}
 *{box-sizing:border-box}
@@ -2232,10 +2615,9 @@ thead{display:table-header-group}
 tr{break-inside:avoid;page-break-inside:avoid}
 code,pre{font:8.5pt/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--band);padding:8px 10px;margin:6px 0}
-.diff .add{color:var(--ok);background:#e6f4ea;display:block}
-.diff .del{color:var(--bad);background:#fbe9ea;display:block}
-.diff .same{display:block}
-.diff .skip{display:block;color:var(--muted)}
+.diff .add{color:var(--ok);background:#e6f4ea}
+.diff .del{color:var(--bad);background:#fbe9ea}
+.diff .skip{color:var(--muted)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:8px 0 12px}
 .tiles div{border:1px solid var(--rule);padding:8px 10px;font-size:9pt;color:var(--muted)}
 .tiles b{display:block;font-size:15pt;color:var(--ink)}
@@ -2366,12 +2748,10 @@ type = "dashboard"
                 .collect::<Vec<_>>()
         };
         let dora = ids(Framework::Dora);
-        assert!(
-            dora.contains(&"DORA Art. 9(4)(e)") && dora.contains(&"RTS 2024/1774 Art. 12(2)(d)")
-        );
+        assert!(dora.contains(&"Art. 9(4)(e)") && dora.contains(&"RTS 2024/1774 Art. 12(2)(d)"));
         assert!(
             dora.iter()
-                .all(|i| i.starts_with("DORA Art. ") || i.starts_with("RTS 2024/1774 Art. "))
+                .all(|i| i.starts_with("Art. ") || i.starts_with("RTS 2024/1774 Art. "))
         );
         assert!(
             ids(Framework::Soc2)
@@ -2397,6 +2777,30 @@ type = "dashboard"
                 );
             }
         }
+    }
+
+    #[test]
+    fn packs_download_as_a_tar_archive() {
+        let dir = state_dir("tar");
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        std::fs::write(dir.join("b.json"), vec![b'x'; 600]).unwrap();
+        let t = tar(&dir, "pack").unwrap();
+        assert_eq!(t.len() % 512, 0);
+        // a.txt: header and one block; b.json: header and two; two empty blocks.
+        assert_eq!(t.len(), 512 * (2 + 3 + 2));
+        let header = &t[..512];
+        assert_eq!(&header[..10], b"pack/a.txt");
+        assert_eq!(&header[124..136], b"00000000005\0");
+        assert_eq!(&header[257..263], b"ustar\0");
+        let stored =
+            u32::from_str_radix(std::str::from_utf8(&header[148..154]).unwrap(), 8).unwrap();
+        let mut blank = header.to_vec();
+        blank[148..156].copy_from_slice(b"        ");
+        assert_eq!(stored, blank.iter().map(|b| *b as u32).sum::<u32>());
+        assert_eq!(&t[512..517], b"hello");
+        assert_eq!(&t[1024..1035], b"pack/b.json");
+        assert!(t[t.len() - 1024..].iter().all(|b| *b == 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2605,9 +3009,7 @@ type = "dashboard"
         let (dora, _) = build_into("dora", vec![Framework::Dora]);
         let html = read(&dora, "report.html");
         assert!(
-            html.contains("DORA Art. 9(4)(c)")
-                && !html.contains("CC6.1")
-                && !html.contains("A.8.15")
+            html.contains("Art. 9(4)(c)") && !html.contains("CC6.1") && !html.contains("A.8.15")
         );
 
         // Edit one entry and remove another: both show, with their ids.

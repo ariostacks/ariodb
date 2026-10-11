@@ -146,7 +146,7 @@ enum Command {
         #[command(subcommand)]
         action: PluginAction,
     },
-    /// Write a compliance report pack for a period: HTML, CSV and JSON, and a manifest of their hashes
+    /// Write a compliance report pack for a period (HTML, CSV, JSON and a manifest)
     Report {
         /// The first day of the period (YYYY-MM-DD, UTC), or an instant (YYYY-MM-DDTHH:MM:SSZ)
         #[arg(long)]

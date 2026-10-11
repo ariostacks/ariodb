@@ -38,6 +38,7 @@ pub fn routes() -> Router<Arc<State>> {
         .route("/api/users/{name}/role", post(set_user_role))
         .route("/api/audit/verify", get(verify_audit))
         .route("/api/plugins", get(list_plugins))
+        .route("/api/report", get(crate::report::download))
 }
 
 fn state_dir(state: &State) -> std::path::PathBuf {
