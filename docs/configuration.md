@@ -710,11 +710,13 @@ warning, because session cookies would then be sent without `Secure`.
 ## `[audit]`
 
 The decisions log in `<state dir>/ariodb.db`: every statement, verdict,
-rule, row count and latency, hash-chained.
+rule, row count and latency, hash-chained. The same settings cover the
+records ariodb keeps for [compliance reports](reports.md): the history of
+config versions and the record of who applied each undo.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `retention_days` | integer | `30` | Delete entries older than this many days, checked hourly by `ariodb serve`. `0` keeps everything. |
+| `retention_days` | integer | `30` | Delete entries older than this many days, checked hourly by `ariodb serve`. `0` keeps everything. Config versions and undo records are pruned by the same window, except the config version in force at the cut-off, which is kept as the baseline for the oldest period still covered. The EU AI Act asks for logs of high-risk AI systems to be kept at least six months (183 days); see [compliance reports](reports.md). |
 | `redact_literals` | boolean | `false` | Store statements with literal values replaced by `$1`, `$2`, ..., so customer data in `WHERE` clauses or `VALUES` stays out of the decisions log, notifier plugins and audit-sink plugins. It does not affect approvals: the stored approval request, Slack messages, webhook payloads, and what model and plugin approvers and fact plugins are sent all carry the statement with its literals. See [the security model](security-model.md). |
 
 ```toml
@@ -965,6 +967,12 @@ is valid, the new config is swapped in and the log says
 `ariodb: reloaded <path>`. If not, the previous config stays in force and
 the log says `ariodb: kept the previous config: <error>`. Saving from the
 dashboard (with `config_writes = true`) applies at once.
+
+Each config that comes into force (at start-up, on a reload, or saved from
+the dashboard) is recorded in `ariodb.db` with its passwords, tokens and
+secrets masked, so [compliance reports](reports.md#what-ariodb-records-for-reports)
+can show policy changes with diffs. A config that fails to load is not
+recorded.
 
 ```mermaid
 flowchart LR

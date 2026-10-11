@@ -8,6 +8,16 @@ changes are listed under "Changed" with what to do.
 
 ## [Unreleased]
 
+### Added
+
+- `ariodb report` and a **Report pack** download on the dashboard's
+  Decisions page: compliance report packs for a period (a print-ready
+  HTML report, CSV and JSON records and a SHA-256 manifest) whose sections
+  name the DORA, SOC 2, ISO/IEC 27001 and EU AI Act controls they give
+  evidence for. ariodb now records each config version in force (masked)
+  and who applied each undo, for these reports. See
+  [compliance reports](docs/reports.md).
+
 ## [0.1.0] - Unreleased
 
 The first public release.

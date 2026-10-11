@@ -33,6 +33,7 @@ Commands:
   dashboard-password  Set a dashboard password (read from stdin). The first user is "root"
   secret              Manage encrypted secrets (database URLs, agent tokens)
   plugin              List plugins, or try one out
+  report              Write a compliance report pack for a period (HTML, CSV, JSON and a manifest)
   explain             Show what the policy would decide for a statement, without running it
   help                Print this message or the help of the given subcommand(s)
 
@@ -64,6 +65,7 @@ first, and stops with exit code 1 if it does not load (2 for `test`). See
 | `undo` | yes | yes, admin login (MySQL: the journal login) | starts or reuses | reads `journal.jsonl` or `mysql-journal.jsonl` | Postgres `--apply` starts them to notify |
 | `approvals`, `approve`, `deny` | yes | no | no | `ariodb.db` | no |
 | `audit`, `export-fixtures` | yes | no | no | `ariodb.db` | no |
+| `report` | yes | no | no | reads `ariodb.db` (read-only), `journal.jsonl` and `mysql-journal.jsonl` | no |
 | `dashboard-password` | yes | no | no | `ariodb.db` | no |
 | `secret set`, `list`, `delete` | yes | no | no | `secrets.json`, `master.key` | no |
 | `plugin list`, `plugin test` | yes | no | no | for `secret_env` | starts them |
@@ -510,6 +512,37 @@ removed or changed)`. The chain is unkeyed, so it detects casual edits, not
 an attacker who controls the host; see [the security
 model](security-model.md).
 
+## Compliance reports
+
+### `ariodb report --from <FROM> --to <TO> [--framework <FRAMEWORK>] --out <OUT>`
+
+Write a compliance report pack for a period into a new or empty directory:
+a self-contained HTML report, CSV and JSON files of the records behind it,
+and `manifest.sha256`, which lists every file with its SHA-256. See
+[compliance reports](reports.md) for what a pack holds and how to check
+one.
+
+| Option | Meaning |
+|---|---|
+| `--from` | The first day of the period, `YYYY-MM-DD` in UTC, or an instant, `YYYY-MM-DDTHH:MM[:SS]Z`. |
+| `--to` | The last day of the period, included, or an instant, excluded. |
+| `--framework` | `dora`, `soc2`, `iso27001`, `eu-ai-act` or `all` (default): whose controls the report names. |
+| `--out` | The directory to write. It is created if missing; one that holds files is refused. |
+
+```text
+$ ariodb report --from 2026-09-01 --to 2026-09-30 --framework dora --out ./pack-2026-09
+wrote 21 files to ./pack-2026-09
+decisions log: 18402 entries in the period, chain intact
+exceptions to follow up: 3
+manifest.sha256: 9b0c4c2e5f...
+```
+
+The last line is the manifest's own SHA-256: record it apart from the pack.
+The command only reads ariodb's state, so it can run while `ariodb serve`
+does. A broken decisions-log chain is reported (on stderr, and in the
+pack) but still exits 0, since the pack is the evidence of it; a bad date,
+an unknown framework or a directory that is not empty exits 1.
+
 ## Dashboard and secrets
 
 ### `ariodb dashboard-password [--user <USER>] [--role <ROLE>]`
@@ -587,4 +620,5 @@ See [plugins](plugins.md#commands).
 - [Operations](operations.md): running `serve` in production
 - [Troubleshooting](troubleshooting.md): what the error messages mean
 - [Testing policies](testing-policies.md): fixtures for `ariodb test`
+- [Compliance reports](reports.md): what `ariodb report` writes and how to check it
 - [Undo](undo.md) and [approvals](approvals.md): the workflows behind these commands
