@@ -741,7 +741,7 @@ fn approval_result(a: &ApprovalRow) -> &'static str {
     match (a.status.as_str(), a.decided_by.as_deref()) {
         ("expired", None) => "timed out",
         ("expired", Some(_)) => "withdrawn",
-        ("denied", Some("ariodb")) => "not delivered",
+        ("denied", Some("ariodb")) => "refused by ariodb",
         ("allowed", _) => "allowed",
         ("denied", _) => "denied",
         ("pending", _) => "pending",
@@ -930,7 +930,15 @@ pub fn build(config: &Config, config_path: &Path, opts: &Options) -> Result<Summ
             opts.out.display()
         ));
     }
-    std::fs::create_dir_all(&opts.out).map_err(|e| format!("{}: {e}", opts.out.display()))?;
+    // Statements can carry customer data, so a new directory is private.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&opts.out)
+            .map_err(|e| format!("{}: {e}", opts.out.display()))?;
+    }
     let mut pack = Pack {
         dir: opts.out.clone(),
         files: Vec::new(),
@@ -1492,14 +1500,21 @@ fn read_oversight(
     for a in &approvals {
         let result = approval_result(a);
         *by_result.entry(result).or_default() += 1;
-        let kind = a
-            .decided_by
-            .as_deref()
-            .map(decider_kind)
-            .unwrap_or("nobody");
+        // A model approver that was down under llm_fail_mode = "open" is
+        // recorded under the model's name, with a note saying so; nobody
+        // decided, so it counts as ariodb's.
+        let failed_open = a.status == "allowed"
+            && a.note
+                .as_deref()
+                .is_some_and(|n| n.contains("failing open"));
+        let kind = match a.decided_by.as_deref() {
+            Some(_) if failed_open => "ariodb",
+            Some(by) => decider_kind(by),
+            None => "nobody",
+        };
         if matches!(result, "allowed" | "denied") {
             *by_kind.entry(kind).or_default() += 1;
-            if let Some(by) = &a.decided_by {
+            if let Some(by) = a.decided_by.as_ref().filter(|_| !failed_open) {
                 *by_decider.entry(by.clone()).or_default() += 1;
             }
             if kind == "person"
@@ -1530,13 +1545,13 @@ fn read_oversight(
                 });
             }
         }
-        if result == "not delivered" {
+        if result == "refused by ariodb" {
             exceptions.push(Exception {
                 severity: "low",
                 section: Section::Oversight,
                 at_ms: Some(a.created_ms),
                 what: format!(
-                    "Approval {} could not be delivered to approver '{}' and was refused: {}",
+                    "Approval {} was refused by ariodb because approver '{}' could not be reached or failed: {}",
                     a.id,
                     a.approver,
                     a.note.clone().unwrap_or_default()
@@ -2185,11 +2200,11 @@ fn render(f: &Facts) -> String {
         results("withdrawn")
     );
     let mut oversight_notes = vec![format!(
-        "{} requests were decided ({} allowed, {} denied); {} could not be delivered and were refused; {} were still pending when this report was made.",
+        "{} requests were decided ({} allowed, {} denied); {} were refused by ariodb because the approver could not be reached or failed; {} were still pending when this report was made.",
         approvals_decided,
         results("allowed"),
         results("denied"),
-        results("not delivered"),
+        results("refused by ariodb"),
         results("pending")
     )];
     if let (Some(m), Some(p), Some(x)) = (wait_stat(0.5), wait_stat(0.9), person_waits.last()) {
@@ -2919,6 +2934,23 @@ type = "dashboard"
         })
         .unwrap();
 
+        db.insert_approval(&crate::store::Approval {
+            id: "a-failed-open".into(),
+            created_ms: now,
+            expires_ms: now,
+            agent: "coding-agent".into(),
+            session: "s-2".into(),
+            sql: "SELECT 1".into(),
+            rule: "ask".into(),
+            approver: "judge".into(),
+            reason: "r".into(),
+            status: "allowed".into(),
+            decided_by: Some("model:openai/gpt-test".into()),
+            note: Some("model approver 'judge' unavailable (down); failing open".into()),
+            decided_ms: Some(now),
+        })
+        .unwrap();
+
         let (from, to) = whole_day();
         let build_into = |name: &str, frameworks: Vec<Framework>| {
             let out = root.join(name);
@@ -2942,6 +2974,9 @@ type = "dashboard"
         assert_eq!(sum["decisions"]["by_outcome"]["refused"], 1);
         assert_eq!(sum["integrity"]["intact"], true);
         assert_eq!(sum["policy"]["versions_in_period"], 2);
+        // A model that failed open decided nothing.
+        assert_eq!(sum["approvals"]["decided_by_kind"]["ariodb"], 1);
+        assert_eq!(sum["approvals"]["decided_by_kind"]["model"], 1);
 
         // The manifest lists every other file with its hash, and the hash
         // printed is the manifest's own.

@@ -527,7 +527,7 @@ one.
 | `--from` | The first day of the period, `YYYY-MM-DD` in UTC, or an instant, `YYYY-MM-DDTHH:MM[:SS]Z`. |
 | `--to` | The last day of the period, included, or an instant, excluded. |
 | `--framework` | `dora`, `soc2`, `iso27001`, `eu-ai-act` or `all` (default): whose controls the report names. |
-| `--out` | The directory to write. It is created if missing; one that holds files is refused. |
+| `--out` | The directory to write. It is created if missing, readable only by its owner (`0700`); one that holds files is refused. |
 
 ```text
 $ ariodb report --from 2026-09-01 --to 2026-09-30 --framework dora --out ./pack-2026-09

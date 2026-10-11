@@ -37,7 +37,7 @@ manifest.sha256: 9b0c4c2e5f...  (64 hex characters)
 | `--from` | The first day of the period, `YYYY-MM-DD` in UTC, or an instant such as `2026-09-01T08:00:00Z`. |
 | `--to` | The last day of the period, included, or an instant, excluded. |
 | `--framework` | `dora`, `soc2`, `iso27001`, `eu-ai-act` or `all` (the default). The records are the same; only the controls named change. |
-| `--out` | A new or empty directory for the pack. ariodb never writes into a directory that already holds files. |
+| `--out` | A new or empty directory for the pack. ariodb creates it readable only by its owner (mode `0700`), and never writes into a directory that already holds files. |
 
 Record the `manifest.sha256` hash the command prints, separately from the
 pack (in the ticket, the email that sends the pack, or your evidence
@@ -107,9 +107,12 @@ decisions log.
 4. **Human oversight.** Approval requests: how many were decided by
    people, by models and by plugins, how long people took (median, 90th
    percentile and longest), how many timed out, were withdrawn because the
-   agent left, or could not be delivered, and every request with who
-   decided it. Decisions by models and plugins are shown apart from
-   people's and are not counted as human oversight.
+   agent left, or were refused by ariodb because the approver could not be
+   reached or failed, and every request with who decided it. Decisions by
+   models and plugins are shown apart from people's and are not counted as
+   human oversight; a model approver that was down under
+   `llm_fail_mode = "open"` decided nothing, so its allows count as
+   ariodb's.
 5. **Change control.** Writes committed and the rows they changed (as
    measured before commit), writes rolled back and why, what each agent
    session changed according to the journals, and every undo with who
@@ -128,8 +131,9 @@ decisions log.
      10 refusals or rollbacks and at least three times the period's median
      day;
    - *low*: an approval decided through a signed link without signing in
-     (the person is not identified); a request that could not be
-     delivered; an undo whose author was not recorded; with the EU AI Act
+     (the person is not identified); a request ariodb refused because the
+     approver could not be reached or failed; an undo whose author was not
+     recorded; with the EU AI Act
      selected, `retention_days` under six months.
 
 The approver definitions used to judge deciders are those of the config
