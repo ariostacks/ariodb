@@ -8,6 +8,14 @@ changes are listed under "Changed" with what to do.
 
 ## [Unreleased]
 
+### Added
+
+- A built-in Splunk exporter (`[audit.splunk]`): every decision goes to
+  Splunk's HTTP Event Collector in order and at least once, from a cursor
+  that survives outages and restarts, with approval and undo events, optional
+  indexer acknowledgement, a `doctor` check, its state in the dashboard API,
+  example searches and a starter dashboard. See [docs/splunk.md](docs/splunk.md).
+
 ## [0.1.0] - Unreleased
 
 The first public release.

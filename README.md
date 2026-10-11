@@ -89,6 +89,10 @@ gets through anyway.
   stdout can approve statements, supply facts for rules, receive
   notifications or receive the decisions log. Examples in Python and
   TypeScript.
+- **Sends the decisions log to Splunk.** A built-in exporter delivers
+  every decision to Splunk's HTTP Event Collector in order and at least
+  once, through outages and restarts, with approval and undo events,
+  example searches and a starter dashboard.
 - **Keeps credentials away from agents.** Agents log in with their own
   tokens; database passwords live in environment variables or an encrypted
   secret store, and each agent can run as its own database role.
@@ -252,6 +256,7 @@ or runs `ariodb mcp --agent coding-agent` with its token in
 | [Dashboard](docs/dashboard.md) | The pages, users and roles, single sign-on and reverse proxies |
 | [MCP](docs/mcp.md) | Giving an agent ariodb as an MCP tool |
 | [Operations](docs/operations.md) | Deployment shapes, logs, backups, retention, credential rotation |
+| [Splunk](docs/splunk.md) | Sending the decisions log, approvals and undo to Splunk |
 | [Troubleshooting](docs/troubleshooting.md) | Symptoms, causes and fixes |
 | [Security model](docs/security-model.md) | Threats, guarantees, accepted risks, the security review and a hardening checklist |
 | [Architecture](docs/architecture.md) | The module map, the request lifecycle and the tests |

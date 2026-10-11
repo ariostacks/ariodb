@@ -723,6 +723,38 @@ retention_days = 90
 redact_literals = true
 ```
 
+### `[audit.splunk]`
+
+The built-in Splunk exporter: every decision to Splunk's HTTP Event
+Collector, in order and at least once, plus approval and undo events. See
+[Splunk](splunk.md) for the Splunk side, what is sent and how delivery
+works.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Turn the exporter on. |
+| `url` | string | required when enabled | The collector's base address, such as `https://splunk.example.com:8088`, without `/services/collector`. |
+| `token_secret` / `token_env` | string | none | The HEC token, from the secret store or an environment variable. Exactly one when enabled. A `token` key in the file is refused, enabled or not. |
+| `index` | string | the token's default | The index to write to. |
+| `source` | string | `"ariodb"` | The events' `source`. |
+| `host` | string | this machine's host name | The events' `host`. |
+| `ca_file` | string | none | An extra trusted CA certificate (PEM), on top of the system's roots. |
+| `accept_invalid_certificate` | boolean | `false` | Skip certificate checks. For test setups only. |
+| `ack` | boolean | `false` | Use indexer acknowledgement: a batch counts as delivered once Splunk reports it indexed. The token must have it on. |
+| `ack_timeout_ms` | integer | `300000` | With `ack`, send a batch again if Splunk has not confirmed it by then. |
+| `events` | boolean | `true` | Send `approval_requested`, `approval_decided` and `undo_applied` events too. |
+| `batch_size` | integer | `100` | The most decisions per request. |
+| `flush_interval_ms` | integer | `1000` | How often to look for new decisions once everything is sent. |
+| `timeout_ms` | integer | `10000` | The limit on each request. |
+
+```toml
+[audit.splunk]
+enabled = true
+url = "https://splunk.example.com:8088"
+token_secret = "splunk-hec"
+index = "ariodb"
+```
+
 ## `[clickhouse]`
 
 ariodb in front of ClickHouse's HTTP interface and its native protocol. See
@@ -983,6 +1015,7 @@ flowchart LR
 | `[proxy] require_tls` (new connections; the certificate must already be loaded) | `[journal]` (any key, including `dir`) |
 | `[dashboard] public_url`, `config_writes`, `approval_links`, and `[dashboard.oidc]` (next request; groups, domains and `password_login` apply to people already signed in) | `[audit] redact_literals` for the decisions log |
 | `[audit] retention_days` (next hourly prune) | Environment variables, including `*_env` tokens |
+| `[audit.splunk]`, every key (next batch; the token is read again) | |
 | `[clickhouse] http_url`, `native_addr`, `user`, password, `accept_invalid_certificate` (next request) | `[mysql] listen`, `tls_cert`, `tls_key`, `journal`, `server_id`, `tag_table`, and the journal login |
 | `[mysql] addr`, `database`, `user`, password, `tls`, `ca_file`, `require_tls` (new agent connections) | |
 
@@ -1095,6 +1128,17 @@ control`.
 | `plugin 'x' is listed twice` / `plugin 'x' needs a command, such as ["python3", "plugin.py"]` | As it says. |
 | `plugin 'x': timeout_ms must be at least 1` | Use a positive timeout. |
 | `plugin 'x': 'A=B' is not an environment variable name` | Variable names in `env`, `pass_env` and `secret_env` cannot contain `=`. |
+
+### `[audit.splunk]`
+
+| Message | Fix |
+|---|---|
+| `[audit.splunk] token must not be written in the config file: ...` | Remove `token`; store it with `ariodb secret set <name>` and set `token_secret`, or set `token_env`. |
+| `[audit.splunk] needs exactly one of token_env or token_secret` | Set one. |
+| `[audit.splunk] url is the collector's base address, such as https://splunk.example.com:8088, without /services/collector or a query: ...` | Drop the path. Also `url must be an http:// or https:// address` and `url '...' is not a URL`. |
+| `[audit.splunk] batch_size must be at least 1` | Likewise `flush_interval_ms`, `timeout_ms` and `ack_timeout_ms`. |
+| `[audit.splunk] index must not be empty` | Likewise `host` and `source`; leave the key out for the default. |
+| `unknown field ...` | A misspelt key under `[audit.splunk]`. |
 
 ### Errors that appear only when `ariodb serve` starts
 

@@ -85,6 +85,7 @@ Each file in [`src/`](../src) and its job.
 | [`channels.rs`](../src/channels.rs) | The Discord, Telegram, Teams, Google Chat, Mattermost, PagerDuty, Opsgenie and email approvers: each channel's message, escaped for its format, sending it (no redirects, errors without URLs), closing PagerDuty incidents and Opsgenie alerts once decided, and their config checks. |
 | [`llm.rs`](../src/llm.rs) | Model approvers: one interface over the Anthropic, OpenAI, Gemini, Azure OpenAI and OpenAI-compatible APIs. |
 | [`plugins.rs`](../src/plugins.rs) | Starting, supervising and talking to plugins over JSON-RPC on stdin and stdout. |
+| [`splunk.rs`](../src/splunk.rs) | The built-in Splunk exporter: the decisions log from a cursor of its own, and approval and undo events, to Splunk's HTTP Event Collector, with retries, indexer acknowledgement and the `doctor` check. |
 
 `agent.credential` is the agent's `credential` setting (or `""`), so a
 rule can single out every agent that shares a database login without
@@ -567,6 +568,12 @@ oldest rows, which the check accepts. The chain is unkeyed: it catches
 edits, not an attacker who can rewrite the whole file. See
 [security model](security-model.md).
 
+Audit-sink plugins and the [Splunk exporter](splunk.md) read the log
+through `SinkCursor`: each keeps its own cursor in the `plugin_cursors`
+table (the exporter's is `builtin:splunk`), reads the entries after it in
+order, and moves it only past what its destination accepted, so delivery
+is in order and at least once without holding anything in memory.
+
 ## The store
 
 [`store.rs`](../src/store.rs) opens `ariodb.db` in WAL mode with a
@@ -700,6 +707,7 @@ MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql.sh           # the same against Mar
 ./scripts/e2e-mysql-journal.sh         # MySQL setup, doctor, the binlog journal and undo
 MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql-journal.sh
 ./scripts/e2e-plugins.sh               # the example plugin, and a broken one
+./scripts/e2e-splunk.sh                # the Splunk exporter against a HEC stand-in: order, outages, restarts, bad tokens, ack, TLS
 ./scripts/e2e-sso.sh                   # single sign-on against Keycloak, roles, approver groups, links that need sign-in
 ./scripts/sim-undo.sh                  # seeded random agent and human writes, then undo
 SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh
@@ -707,6 +715,9 @@ SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh
 
 Helpers used by the scripts:
 
+- [`scripts/hec_standin.py`](../scripts/hec_standin.py): a stand-in for
+  Splunk's HTTP Event Collector, following its documented API and status
+  codes, that records what it receives.
 - [`scripts/pg_raw.py`](../scripts/pg_raw.py): a minimal extended-protocol
   client, for message sequences no driver would send (closing someone
   else's statement, a batch that fails half way).

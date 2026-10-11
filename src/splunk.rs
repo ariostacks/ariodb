@@ -610,8 +610,10 @@ struct Queued {
 struct Shared {
     status: Mutex<Status>,
     events: mpsc::Sender<Queued>,
-    /// The event task holds a batch it has not yet sent.
-    events_in_hand: AtomicBool,
+    /// Events queued or in the event task's hands, not yet sent or given
+    /// up on. Counted from the moment they are queued, so stopping cannot
+    /// miss one the task has just taken.
+    events_pending: AtomicU64,
     dropped: AtomicU64,
 }
 
@@ -677,7 +679,7 @@ pub fn start(source: Source, decisions: bool) -> Option<Arc<Exporter>> {
             events_dropped: 0,
         }),
         events,
-        events_in_hand: AtomicBool::new(false),
+        events_pending: AtomicU64::new(0),
         dropped: AtomicU64::new(0),
     });
     let (stop, _) = watch::channel(false);
@@ -728,9 +730,7 @@ impl Exporter {
     fn events_waiting(&self) -> bool {
         let config = (self.source)();
         let s = &config.audit.splunk;
-        let waiting = self.shared.events.capacity() < EVENT_QUEUE
-            || self.shared.events_in_hand.load(Ordering::Relaxed);
-        waiting && s.enabled && s.events
+        self.shared.events_pending.load(Ordering::Relaxed) > 0 && s.enabled && s.events
     }
 }
 
@@ -763,7 +763,9 @@ pub fn event(name: &str, details: &Value) {
         at_ms: crate::store::now_ms(),
         details: details.clone(),
     };
+    shared.events_pending.fetch_add(1, Ordering::Relaxed);
     if shared.events.try_send(queued).is_err() {
+        shared.events_pending.fetch_sub(1, Ordering::Relaxed);
         let n = shared.dropped.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_power_of_two() || n.is_multiple_of(1000) {
             eprintln!(
@@ -1069,7 +1071,6 @@ async fn deliver_events(
             },
             _ = stop.changed() => return,
         };
-        shared.events_in_hand.store(true, Ordering::Relaxed);
         let mut batch = vec![first];
         while batch.len() < EVENT_BATCH {
             match queue.try_recv() {
@@ -1147,7 +1148,9 @@ async fn deliver_events(
                 return;
             }
         }
-        shared.events_in_hand.store(false, Ordering::Relaxed);
+        shared
+            .events_pending
+            .fetch_sub(batch.len() as u64, Ordering::Relaxed);
     }
 }
 

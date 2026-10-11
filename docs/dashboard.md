@@ -624,7 +624,9 @@ round that review.
   `notifier`, `audit_sink`), its process ID, how many times it has been
   restarted, how many events were dropped because it could not keep up,
   and its last error. Changes to plugins need a restart. See
-  [plugins.md](plugins.md).
+  [plugins.md](plugins.md). The same API (`GET /api/plugins`) also
+  reports the built-in Splunk exporter's state, backlog, last success and
+  last error under `splunk`; see [splunk.md](splunk.md#watching-the-exporter).
 - **This session**: who you are signed in as and how (a local password or
   the provider), your role and, with single sign-on, your groups, and
   **Sign out**. Sessions last 12 hours.

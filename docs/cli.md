@@ -334,6 +334,20 @@ what works here
 Every MySQL line is explained in
 [MySQL and MariaDB](mysql.md#reading-ariodb-doctor).
 
+With `[audit.splunk] enabled = true`, `doctor` also checks the Splunk
+collector: that it answers its health check, that it accepts the token
+(with an empty request, which indexes nothing), and how many decisions
+wait to be delivered, with the exporter's last success and failure. A
+token the collector refuses or a collector that cannot be reached is
+`FAIL`. See [Splunk](splunk.md#watching-the-exporter).
+
+```text
+splunk: https://splunk.example.com:8088, index ariodb
+  ok    the collector answers: HEC is healthy
+  ok    the collector accepts the token
+  ok    every decision is delivered (up to entry 412); the last batch was accepted 3 s ago
+```
+
 `ariodb serve` runs the same checks once at startup and logs a one-line
 summary (see [operations](operations.md#the-startup-summary)).
 

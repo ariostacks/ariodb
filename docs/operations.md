@@ -240,6 +240,7 @@ Lines worth alerting on:
 | `ariodb: plugin '<name>' ...; restarting it in 2 s` | A plugin is down; statements that need it are refused meanwhile. |
 | `ariodb: model approver '<name>' (...) unavailable (...); failing open` | A model approver could not be reached and `llm_fail_mode = "open"` let a statement through. |
 | `ariodb: could not prune the decisions log: ...` | Retention is not running. |
+| `ariodb: Splunk exporter: Splunk refused ...` / `could not deliver ...` | Decisions are not reaching Splunk; they wait in the log. See [Splunk](splunk.md#watching-the-exporter). |
 | `ariodb: <...> saved the config from the dashboard` / `set secret '<name>' from the dashboard` / `undid session ...` | Someone changed policy, secrets or data from the dashboard. |
 
 Routine lines: `ariodb: reloaded <path>`, `ariodb: removed N decisions older

@@ -108,6 +108,8 @@ License.
 
 - [Operations](operations.md): logs, monitoring, the replication slot,
   backups and retention.
+- [Splunk](splunk.md): sending the decisions log, approvals and undo to
+  Splunk's HTTP Event Collector, with example searches and a dashboard.
 - [Troubleshooting](troubleshooting.md): symptoms, causes and fixes.
 - [Security model](security-model.md): threats, guarantees, accepted risks
   and the deployment checklist.
