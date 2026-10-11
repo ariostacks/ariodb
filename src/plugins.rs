@@ -1373,6 +1373,8 @@ pub async fn facts(names: &[String], ctx: &Ctx<'_>, statement: &Statement) -> Pl
 
 /// Tell every notifier about an event. Never waits.
 pub fn notify(event: &str, details: Value) {
+    // The Splunk exporter hears of approvals and undo the same way.
+    crate::splunk::event(event, &details);
     let Some(host) = current() else {
         return;
     };

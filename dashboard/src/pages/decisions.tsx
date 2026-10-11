@@ -4,6 +4,7 @@ import {
   ClipboardCopyIcon,
   CopyIcon,
   EllipsisVerticalIcon,
+  FileDownIcon,
   FilterIcon,
   InfoIcon,
   Loader2Icon,
@@ -13,6 +14,7 @@ import { toast } from "sonner"
 import { CopyDialog } from "@/components/copy-dialog"
 import { columnHelper, DataTable } from "@/components/data-table"
 import { ErrorNote, Loading, PageBody } from "@/components/page"
+import { ReportDialog } from "@/components/report-dialog"
 import { Sql } from "@/components/sql"
 import { StatusBadge } from "@/components/status-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -203,6 +205,7 @@ export function DecisionsPage() {
   const admin = useCan("admin")
   const [blocking, setBlocking] = useState<Decision | null>(null)
   const [fixture, setFixture] = useState<string | null>(null)
+  const [reporting, setReporting] = useState(false)
 
   function submit(e: FormEvent) {
     e.preventDefault()
@@ -416,6 +419,12 @@ export function DecisionsPage() {
             <RotateCcwIcon />
             Reset
           </Button>
+          {admin && (
+            <Button type="button" variant="outline" onClick={() => setReporting(true)}>
+              <FileDownIcon />
+              Report pack
+            </Button>
+          )}
         </div>
       </form>
       {error && <ErrorNote message={error} />}
@@ -433,6 +442,7 @@ export function DecisionsPage() {
       )}
       <BlockDialog key={blocking?.id ?? "none"} decision={blocking} onClose={() => setBlocking(null)} />
       <CopyDialog text={fixture} title="Test fixture" onClose={() => setFixture(null)} />
+      <ReportDialog open={reporting} onClose={() => setReporting(false)} />
     </PageBody>
   )
 }

@@ -11,8 +11,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A release waits for the maintainer's approval like every other run.
+  approve:
+    name: approve
+    runs-on: ubuntu-24.04
+    environment: ci
+    timeout-minutes: 5
+    steps:
+      - run: echo "Approved; building $GITHUB_REF_NAME"
+
   build:
     name: build ${{ matrix.target }}
+    needs: [approve]
+    timeout-minutes: 60
     strategy:
       fail-fast: true
       matrix:
@@ -53,6 +64,11 @@ jobs:
           rustup target add ${{ matrix.target }}
           rustup show active-toolchain
 
+      # The one place macOS is tested.
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --locked
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -80,6 +96,7 @@ jobs:
     name: GitHub release
     needs: [build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:

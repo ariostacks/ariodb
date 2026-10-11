@@ -179,6 +179,9 @@ pub async fn run(config: &Config) -> Report {
     } else {
         Some(run_mysql(config, &mut sections).await)
     };
+    if let Some(section) = crate::splunk::doctor_section(config).await {
+        sections.push(section);
+    }
     Report {
         sections,
         postgres,

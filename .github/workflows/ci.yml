@@ -1,14 +1,34 @@
 name: CI
 
+# Nothing here runs until the maintainer approves it: every run waits at the
+# "approve" job, which uses the "ci" environment with the maintainer as its
+# required reviewer. An approved run does the quick checks; the end-to-end
+# suites run only when asked for, with the "full-ci" label on a pull request
+# or "Run workflow" with "full" ticked.
+
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
   push:
     branches: [main]
-  schedule:
-    # Weekly, Monday 03:00 UTC: everything, including single sign-on, and
-    # against whatever the database images' tags point at by then.
-    - cron: "0 3 * * 1"
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
   workflow_dispatch:
+    inputs:
+      full:
+        description: Also run the end-to-end suites
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,9 +43,21 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  approve:
+    name: approve
+    # Adding any label other than full-ci starts nothing.
+    if: github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+    runs-on: ubuntu-24.04
+    environment: ci
+    timeout-minutes: 5
+    steps:
+      - run: echo "Approved; running for ${{ github.event_name }} on ${{ github.ref }}"
+
   fmt:
     name: rustfmt
+    needs: [approve]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust
@@ -34,7 +66,9 @@ jobs:
 
   clippy:
     name: clippy
+    needs: [approve]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - name: Install build dependencies
@@ -48,17 +82,15 @@ jobs:
           shared-key: debug
       - run: cargo clippy --all-targets --locked -- -D warnings
 
+  # macOS is tested when a release is built, not on every change.
   test:
-    name: cargo test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: cargo test
+    needs: [approve]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev cmake
@@ -71,7 +103,9 @@ jobs:
 
   dashboard:
     name: dashboard build
+    needs: [approve]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -96,6 +130,7 @@ jobs:
   e2e-postgres:
     name: e2e Postgres (${{ matrix.image }})
     needs: [clippy]
+    if: (github.event_name == 'workflow_dispatch' && inputs.full) || contains(github.event.pull_request.labels.*.name, 'full-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +147,7 @@ jobs:
   e2e-compat:
     name: e2e ${{ matrix.database }}
     needs: [clippy]
+    if: (github.event_name == 'workflow_dispatch' && inputs.full) || contains(github.event.pull_request.labels.*.name, 'full-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -126,6 +162,7 @@ jobs:
   e2e-mysql:
     name: e2e MySQL (${{ matrix.image }})
     needs: [clippy]
+    if: (github.event_name == 'workflow_dispatch' && inputs.full) || contains(github.event.pull_request.labels.*.name, 'full-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -147,6 +184,7 @@ jobs:
   e2e-clickhouse:
     name: e2e ClickHouse
     needs: [clippy]
+    if: (github.event_name == 'workflow_dispatch' && inputs.full) || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -157,6 +195,7 @@ jobs:
   e2e-plugins:
     name: e2e plugins
     needs: [clippy]
+    if: (github.event_name == 'workflow_dispatch' && inputs.full) || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -164,9 +203,32 @@ jobs:
       - uses: ./.github/actions/e2e-setup
       - run: ./scripts/e2e-plugins.sh
 
+  e2e-splunk:
+    name: e2e Splunk exporter
+    needs: [clippy]
+    if: (github.event_name == 'workflow_dispatch' && inputs.full) || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/e2e-splunk.sh
+
+  e2e-report:
+    name: e2e compliance reports
+    needs: [clippy]
+    if: (github.event_name == 'workflow_dispatch' && inputs.full) || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/e2e-setup
+      - run: ./scripts/e2e-report.sh
+
   sim-undo:
     name: undo simulation
     needs: [clippy]
+    if: (github.event_name == 'workflow_dispatch' && inputs.full) || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -176,7 +238,8 @@ jobs:
 
   e2e-sso:
     name: e2e single sign-on (Keycloak)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [approve]
+    if: github.event_name == 'workflow_dispatch' && inputs.full
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

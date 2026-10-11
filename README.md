@@ -76,6 +76,11 @@ gets through anyway.
 - **Keeps a decisions log.** Every statement, verdict, rule, row count,
   latency and approver, hash-chained, with retention, optional redaction
   of literal values, and export as test fixtures.
+- **Writes compliance report packs.** `ariodb report` turns the decisions
+  log, approvals, journals, undo and config history into an HTML report
+  with CSV and JSON records and a manifest of hashes, mapped to the DORA,
+  SOC 2, ISO/IEC 27001 and EU AI Act controls it gives evidence for (not
+  a certification). See [compliance reports](docs/reports.md).
 - **Has a dashboard.** Approvals, decisions, sessions and undo, rules,
   config, secrets, users and plugins, built into the binary. Single
   sign-on with any OpenID Connect provider, with viewer, approver and
@@ -89,6 +94,10 @@ gets through anyway.
   stdout can approve statements, supply facts for rules, receive
   notifications or receive the decisions log. Examples in Python and
   TypeScript.
+- **Sends the decisions log to Splunk.** A built-in exporter delivers
+  every decision to Splunk's HTTP Event Collector in order and at least
+  once, through outages and restarts, with approval and undo events,
+  example searches and a starter dashboard.
 - **Keeps credentials away from agents.** Agents log in with their own
   tokens; database passwords live in environment variables or an encrypted
   secret store, and each agent can run as its own database role.
@@ -252,6 +261,7 @@ or runs `ariodb mcp --agent coding-agent` with its token in
 | [Dashboard](docs/dashboard.md) | The pages, users and roles, single sign-on and reverse proxies |
 | [MCP](docs/mcp.md) | Giving an agent ariodb as an MCP tool |
 | [Operations](docs/operations.md) | Deployment shapes, logs, backups, retention, credential rotation |
+| [Splunk](docs/splunk.md) | Sending the decisions log, approvals and undo to Splunk |
 | [Troubleshooting](docs/troubleshooting.md) | Symptoms, causes and fixes |
 | [Security model](docs/security-model.md) | Threats, guarantees, accepted risks, the security review and a hardening checklist |
 | [Architecture](docs/architecture.md) | The module map, the request lifecycle and the tests |

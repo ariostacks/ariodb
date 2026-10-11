@@ -1,0 +1,125 @@
+<form version="1.1" theme="light">
+  <label>ariodb</label>
+  <description>Refusals, approvals, rollbacks and per-agent activity from ariodb's Splunk exporter.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="time" token="range">
+      <label>Time</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="text" token="idx">
+      <label>Index</label>
+      <default>ariodb</default>
+    </input>
+    <input type="text" token="agent">
+      <label>Agent</label>
+      <default>*</default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <single>
+        <title>Statements</title>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:decision" agent="$agent$" | dedup id | stats count</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Refused</title>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:decision" agent="$agent$" outcome=refused | dedup id | stats count</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Rolled back</title>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:decision" agent="$agent$" outcome=rolled_back | dedup id | stats count</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Approvals decided</title>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:event" event=approval_decided agent="$agent$" | stats count</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+      </single>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Activity by agent</title>
+      <chart>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:decision" agent="$agent$" | dedup id | timechart count by agent</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Refusals by rule</title>
+      <chart>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:decision" agent="$agent$" outcome=refused | dedup id | eval rule=coalesce(rule, "built-in policy") | timechart count by rule</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+      </chart>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Approvals</title>
+      <table>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:event" event=approval_decided agent="$agent$" | table _time agent rule approver verdict why sql | sort - _time</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="count">10</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Rolled-back writes</title>
+      <table>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:decision" agent="$agent$" outcome=rolled_back | dedup id | table _time agent session database tables{} rows reason sql | sort - _time</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="count">10</option>
+      </table>
+    </panel>
+    <panel>
+      <title>Undo</title>
+      <table>
+        <search>
+          <query>index="$idx$" sourcetype="ariodb:event" event=undo_applied | table _time session rows by | sort - _time</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="count">10</option>
+      </table>
+    </panel>
+  </row>
+</form>

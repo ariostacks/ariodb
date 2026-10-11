@@ -8,6 +8,21 @@ changes are listed under "Changed" with what to do.
 
 ## [Unreleased]
 
+### Added
+
+- A built-in Splunk exporter (`[audit.splunk]`): every decision goes to
+  Splunk's HTTP Event Collector in order and at least once, from a cursor
+  that survives outages and restarts, with approval and undo events, optional
+  indexer acknowledgement, a `doctor` check, its state in the dashboard API,
+  example searches and a starter dashboard. See [docs/splunk.md](docs/splunk.md).
+- `ariodb report` and a **Report pack** download on the dashboard's
+  Decisions page: compliance report packs for a period (a print-ready
+  HTML report, CSV and JSON records and a SHA-256 manifest) whose sections
+  name the DORA, SOC 2, ISO/IEC 27001 and EU AI Act controls they give
+  evidence for. ariodb now records each config version in force (masked)
+  and who applied each undo, for these reports. See
+  [compliance reports](docs/reports.md).
+
 ## [0.1.0] - Unreleased
 
 The first public release.

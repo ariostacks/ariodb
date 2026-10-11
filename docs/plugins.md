@@ -302,6 +302,8 @@ the `id` of the last entry stored durably:
   it but its acknowledgement was lost; use `id` to discard repeats.
 - A new sink starts from the oldest entry the decisions log still holds.
   Entries pruned by `[audit] retention_days` before delivery are lost.
+- For Splunk, ariodb has a built-in exporter that works the same way with
+  a cursor of its own: see [Splunk](splunk.md).
 
 ### Test calls
 

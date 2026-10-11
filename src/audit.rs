@@ -23,6 +23,8 @@ pub struct Settings {
     /// Store statements with literal values replaced by `$1`, `$2`, ... so
     /// customer data in WHERE clauses or VALUES never reaches the log.
     pub redact_literals: bool,
+    /// `[audit.splunk]`: the built-in Splunk exporter (see splunk.rs).
+    pub splunk: crate::splunk::Settings,
 }
 
 impl Default for Settings {
@@ -30,6 +32,7 @@ impl Default for Settings {
         Settings {
             retention_days: 30,
             redact_literals: false,
+            splunk: crate::splunk::Settings::default(),
         }
     }
 }
@@ -319,6 +322,26 @@ impl SinkCursor {
             .map_err(|e| e.to_string())
     }
 
+    /// How many entries come after `id`: what a sink at `id` has still to get.
+    /// Worked out from the oldest and newest ids, which rise by one per
+    /// entry, rather than counted: a sink catching up asks once per batch,
+    /// and counting a large backlog each time would take longer than
+    /// sending it. Entries deleted from the middle are counted anyway.
+    pub fn backlog(&self, id: i64) -> Result<i64, String> {
+        let (oldest, newest): (Option<i64>, Option<i64>) = self
+            .conn
+            .query_row(
+                "SELECT (SELECT min(id) FROM decisions), (SELECT max(id) FROM decisions)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(match (oldest, newest) {
+            (Some(oldest), Some(newest)) => (newest - id.max(oldest - 1)).max(0),
+            _ => 0,
+        })
+    }
+
     /// Entries after `id`, oldest first: at most `limit`, and stopping once
     /// their statements add up to `max_bytes` (always at least one entry).
     pub fn after(&self, id: i64, limit: usize, max_bytes: usize) -> Result<Vec<Chained>, String> {
@@ -546,6 +569,43 @@ pub fn verify(dir: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
+/// Read the entries with ids from `first` to `last`, oldest first, and hand
+/// each to `f` with whether its own hash still matches it. Unlike `verify`
+/// this goes on past a break, so a report can list every one in a period;
+/// how entries link is left to the caller. `conn` may be read-only.
+pub fn walk(
+    conn: &Connection,
+    first: i64,
+    last: i64,
+    mut f: impl FnMut(Chained, bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT *, prev AS p, hash AS h FROM decisions WHERE id >= ?1 AND id <= ?2 ORDER BY id",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([first, last]).map_err(|e| e.to_string())?;
+    while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+        let decision = row_to_decision(r).map_err(|e| e.to_string())?;
+        let prev: String = r.get("p").map_err(|e| e.to_string())?;
+        let hash: String = r.get("h").map_err(|e| e.to_string())?;
+        let deciders: String = r.get("decided_by").map_err(|e| e.to_string())?;
+        let actual = hex::encode(Sha256::digest(
+            chain_text(decision.at_ms, &prev, &decision).as_bytes(),
+        ));
+        let intact = actual == hash && deciders == deciders_text(&decision.decided_by);
+        f(
+            Chained {
+                decision,
+                prev,
+                hash,
+            },
+            intact,
+        )?;
+    }
+    Ok(())
+}
+
 /// Delete entries older than the retention window.
 pub fn prune(dir: &Path, settings: &Settings) -> Result<usize, String> {
     if settings.retention_days == 0 {
@@ -665,6 +725,16 @@ mod tests {
             .unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].decision.sql, "SELECT 3");
+        assert_eq!(cursor.backlog(2).unwrap(), 1);
+        assert_eq!(cursor.backlog(0).unwrap(), 3);
+        assert_eq!(cursor.backlog(3).unwrap(), 0);
+        // A cursor behind entries pruned since counts only what is left.
+        cursor
+            .conn
+            .execute("DELETE FROM decisions WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(cursor.backlog(0).unwrap(), 2);
+        assert_eq!(cursor.backlog(2).unwrap(), 1);
         // The byte budget stops a batch early, but never empties it.
         assert_eq!(cursor.after(0, 100, 1).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -883,6 +953,7 @@ mod tests {
             &Settings {
                 retention_days: 0,
                 redact_literals: true,
+                ..Default::default()
             },
         )
         .unwrap();

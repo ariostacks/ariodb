@@ -104,7 +104,7 @@ applies at once, and remove a user, which ends their sessions.
 |---|---|
 | viewer | Read every page except Config: the overview, approvals, decisions, sessions and undo plans, rules (and try a statement), the decisions-log check, plugins and their own session |
 | approver | Also decide approvals, within an approver's `groups` if it sets them |
-| admin | Also read and edit the config, block requests like a decision, undo sessions, and manage local users and secrets |
+| admin | Also read and edit the config, block requests like a decision, undo sessions, download compliance report packs, and manage local users and secrets |
 
 Each role can do everything the one before it can. The server checks the
 role on every request, so a role that is too low gets an error such as
@@ -531,6 +531,12 @@ Each row's menu offers:
   `refused` decisions qualify; rollbacks and failures depend on the data,
   not just the policy.
 
+**Report pack** (admins only) downloads a [compliance report
+pack](reports.md) for whole days and the frameworks you choose, as a `.tar`
+archive, built by the same code as `ariodb report`. The dialog shows the
+SHA-256 of the pack's manifest, to record apart from the pack, and the
+server logs who downloaded which pack.
+
 `[audit] retention_days` (30 by default) controls how long decisions are
 kept, and `[audit] redact_literals = true` stores statements with literal
 values replaced by `$1`, `$2`, and so on. See
@@ -624,7 +630,9 @@ round that review.
   `notifier`, `audit_sink`), its process ID, how many times it has been
   restarted, how many events were dropped because it could not keep up,
   and its last error. Changes to plugins need a restart. See
-  [plugins.md](plugins.md).
+  [plugins.md](plugins.md). The same API (`GET /api/plugins`) also
+  reports the built-in Splunk exporter's state, backlog, last success and
+  last error under `splunk`; see [splunk.md](splunk.md#watching-the-exporter).
 - **This session**: who you are signed in as and how (a local password or
   the provider), your role and, with single sign-on, your groups, and
   **Sign out**. Sessions last 12 hours.
