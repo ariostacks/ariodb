@@ -197,7 +197,12 @@ async fn session_undo(
     let user = require_writer(&state, &headers)?;
     let config = state.config();
     let mysql_records = mysql_journal::read_all(&config)?;
-    let restored = if has_session(&mysql_records, &id) {
+    let engine = if has_session(&mysql_records, &id) {
+        "mysql"
+    } else {
+        "postgres"
+    };
+    let restored = if engine == "mysql" {
         let mut conn = mysql_undo::connect(&config).await?;
         let plan = mysql_undo::plan(&mut conn, &config, &mysql_records, &id)
             .await
@@ -217,9 +222,11 @@ async fn session_undo(
         "ariodb: {} undid session {id} from the dashboard ({restored} rows)",
         user.name
     );
+    let by = format!("dashboard:{}", user.name);
+    crate::history::record_undo(&state_dir(&state), &id, engine, restored, &by);
     crate::plugins::notify(
         "undo_applied",
-        json!({ "session": id, "rows": restored, "by": format!("dashboard:{}", user.name) }),
+        json!({ "session": id, "rows": restored, "by": by }),
     );
     Ok(Json(json!({ "restored": restored })))
 }
@@ -398,6 +405,11 @@ async fn put_config(
     let current = std::fs::read_to_string(&state.config_path).map_err(|e| e.to_string())?;
     save_config(&state, &unmask(&body.text, &current))?;
     println!("ariodb: {} saved the config from the dashboard", user.name);
+    crate::history::record_config(
+        &state_dir(&state),
+        &state.config_path,
+        &format!("dashboard:{}", user.name),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -446,6 +458,11 @@ async fn block_like(
     if body.apply {
         save_config(&state, &candidate)?;
         println!("ariodb: {} added rule {name} from the dashboard", user.name);
+        crate::history::record_config(
+            &state_dir(&state),
+            &state.config_path,
+            &format!("dashboard:{}", user.name),
+        );
     }
     Ok(Json(
         json!({ "rule": name, "snippet": snippet, "applied": body.apply }),

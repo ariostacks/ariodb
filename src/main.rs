@@ -13,6 +13,7 @@ mod dashboard_files;
 mod doctor;
 mod exec;
 mod gate;
+mod history;
 mod journal;
 mod limits;
 mod llm;
@@ -30,6 +31,7 @@ mod policy;
 #[cfg(test)]
 mod proptests;
 mod proxy;
+mod report;
 mod rules;
 mod secrets;
 mod store;
@@ -143,6 +145,21 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
+    },
+    /// Write a compliance report pack for a period: HTML, CSV and JSON, and a manifest of their hashes
+    Report {
+        /// The first day of the period (YYYY-MM-DD, UTC), or an instant (YYYY-MM-DDTHH:MM:SSZ)
+        #[arg(long)]
+        from: String,
+        /// The last day of the period, included (YYYY-MM-DD), or an instant, excluded
+        #[arg(long)]
+        to: String,
+        /// dora, soc2, iso27001, eu-ai-act or all
+        #[arg(long, default_value = "all")]
+        framework: String,
+        /// A new or empty directory to write the pack into
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Show what the policy would decide for a statement, without running it
     Explain {
@@ -319,6 +336,12 @@ async fn main() -> ExitCode {
                 println!("{}  (decided by: {rule})  {}", p.verdict, p.reason);
             })
         }
+        Command::Report {
+            from,
+            to,
+            framework,
+            out,
+        } => report::command(&config, &cli.config, &from, &to, &framework, &out),
         Command::Audit => audit::verify(Path::new(&config.journal.dir))
             .map(|n| println!("decisions log intact: {n} entries checked")),
     };
@@ -404,6 +427,11 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
     // Plugins next, so approvers and facts are there for the first agent.
     // Like tunnels, plugin changes in a reloaded config need a restart.
     let plugins = start_plugins(&state.config(), plugins::Roles { audit_sink: true }).await;
+    history::record_config(
+        Path::new(&state.config().journal.dir),
+        &state.config_path,
+        "startup",
+    );
     tokio::spawn(gate::watch_config(state.clone()));
     let prune_state = state.clone();
     tokio::spawn(async move {
@@ -416,6 +444,9 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
                     config.audit.retention_days
                 ),
                 Err(e) => eprintln!("ariodb: could not prune the decisions log: {e}"),
+            }
+            if let Err(e) = history::prune(Path::new(&config.journal.dir), &config.audit) {
+                eprintln!("ariodb: could not prune the config history: {e}");
             }
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
@@ -639,6 +670,13 @@ async fn undo_command(
         let done = mysql_undo::undo(config, &mysql_records, session, apply, skip_conflicts).await;
         if let Ok((_, Some(rows))) = &done {
             let by = format!("cli:{}", std::env::var("USER").unwrap_or_default());
+            history::record_undo(
+                Path::new(&config.journal.dir),
+                session,
+                "mysql",
+                *rows as usize,
+                &by,
+            );
             plugins::notify(
                 "undo_applied",
                 serde_json::json!({ "session": session, "rows": rows, "by": by }),
@@ -677,6 +715,13 @@ async fn undo_command(
     let done = undo::apply(&mut client, &plan, skip_conflicts).await;
     if let Ok(rows) = &done {
         let by = format!("cli:{}", std::env::var("USER").unwrap_or_default());
+        history::record_undo(
+            Path::new(&config.journal.dir),
+            session,
+            "postgres",
+            *rows,
+            &by,
+        );
         plugins::notify(
             "undo_applied",
             serde_json::json!({ "session": session, "rows": rows, "by": by }),
