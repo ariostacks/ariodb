@@ -531,7 +531,10 @@ async fn list_plugins(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_user(&state, &headers)?;
-    Ok(Json(json!({ "plugins": crate::plugins::statuses() })))
+    Ok(Json(json!({
+        "plugins": crate::plugins::statuses(),
+        "splunk": crate::splunk::status(),
+    })))
 }
 
 async fn list_secrets(

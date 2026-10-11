@@ -515,6 +515,7 @@ impl Config {
         crate::approvals::validate(&self.approvers, &self.rules).map_err(ConfigError::Problem)?;
         crate::plugins::validate(self).map_err(ConfigError::Problem)?;
         crate::oidc::validate(self).map_err(ConfigError::Problem)?;
+        crate::splunk::validate(&self.audit.splunk).map_err(ConfigError::Problem)?;
         let mut names = std::collections::HashSet::new();
         for agent in &self.agents {
             if !names.insert(agent.name.as_str()) {

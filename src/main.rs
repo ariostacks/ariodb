@@ -32,6 +32,7 @@ mod proptests;
 mod proxy;
 mod rules;
 mod secrets;
+mod splunk;
 mod store;
 mod testing;
 mod tls;
@@ -255,7 +256,10 @@ async fn main() -> ExitCode {
                 // Approvers and facts are needed here too; the audit sink is
                 // left to `ariodb serve`, which reads the same decisions log.
                 let plugins = start_plugins(&config, plugins::Roles { audit_sink: false }).await;
+                // Likewise, Splunk gets this process's approval events only.
+                let splunk = splunk::start(splunk::fixed(config.clone()), false);
                 let result = with_tunnels(&config, mcp::serve(state, &agent)).await;
+                splunk::stop(splunk).await;
                 stop_plugins(plugins).await;
                 result
             }
@@ -271,11 +275,17 @@ async fn main() -> ExitCode {
             apply,
             skip_conflicts,
         } => {
-            with_tunnels(
+            // Splunk hears about the undo, as notifier plugins do.
+            let splunk = apply
+                .then(|| splunk::start(splunk::fixed(config.clone()), false))
+                .flatten();
+            let result = with_tunnels(
                 &config,
                 undo_command(&config, &session, apply, skip_conflicts),
             )
-            .await
+            .await;
+            splunk::stop(splunk).await;
+            result
         }
         Command::Test { .. } => unreachable!("handled above"),
         Command::Secret { action } => secret_command(&config, action),
@@ -404,6 +414,10 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
     // Plugins next, so approvers and facts are there for the first agent.
     // Like tunnels, plugin changes in a reloaded config need a restart.
     let plugins = start_plugins(&state.config(), plugins::Roles { audit_sink: true }).await;
+    // The Splunk exporter follows the current config, so [audit.splunk]
+    // reloads without a restart.
+    let splunk_state = state.clone();
+    let splunk = splunk::start(Arc::new(move || splunk_state.config()), true);
     tokio::spawn(gate::watch_config(state.clone()));
     let prune_state = state.clone();
     tokio::spawn(async move {
@@ -486,6 +500,7 @@ async fn serve(state: Arc<gate::State>) -> Result<(), String> {
             Ok(())
         }
     };
+    splunk::stop(splunk).await;
     stop_plugins(plugins).await;
     tunnels.stop().await;
     result

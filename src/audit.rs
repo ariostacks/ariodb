@@ -23,6 +23,8 @@ pub struct Settings {
     /// Store statements with literal values replaced by `$1`, `$2`, ... so
     /// customer data in WHERE clauses or VALUES never reaches the log.
     pub redact_literals: bool,
+    /// `[audit.splunk]`: the built-in Splunk exporter (see splunk.rs).
+    pub splunk: crate::splunk::Settings,
 }
 
 impl Default for Settings {
@@ -30,6 +32,7 @@ impl Default for Settings {
         Settings {
             retention_days: 30,
             redact_literals: false,
+            splunk: crate::splunk::Settings::default(),
         }
     }
 }
@@ -316,6 +319,15 @@ impl SinkCursor {
                 params![plugin, id],
             )
             .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// How many entries come after `id`: what a sink at `id` has still to get.
+    pub fn backlog(&self, id: i64) -> Result<i64, String> {
+        self.conn
+            .query_row("SELECT count(*) FROM decisions WHERE id > ?1", [id], |r| {
+                r.get(0)
+            })
             .map_err(|e| e.to_string())
     }
 
@@ -665,6 +677,8 @@ mod tests {
             .unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].decision.sql, "SELECT 3");
+        assert_eq!(cursor.backlog(2).unwrap(), 1);
+        assert_eq!(cursor.backlog(0).unwrap(), 3);
         // The byte budget stops a batch early, but never empties it.
         assert_eq!(cursor.after(0, 100, 1).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -883,6 +897,7 @@ mod tests {
             &Settings {
                 retention_days: 0,
                 redact_literals: true,
+                ..Default::default()
             },
         )
         .unwrap();
