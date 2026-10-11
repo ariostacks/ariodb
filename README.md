@@ -76,6 +76,11 @@ gets through anyway.
 - **Keeps a decisions log.** Every statement, verdict, rule, row count,
   latency and approver, hash-chained, with retention, optional redaction
   of literal values, and export as test fixtures.
+- **Writes compliance report packs.** `ariodb report` turns the decisions
+  log, approvals, journals, undo and config history into an HTML report
+  with CSV and JSON records and a manifest of hashes, mapped to the DORA,
+  SOC 2, ISO/IEC 27001 and EU AI Act controls it gives evidence for (not
+  a certification). See [compliance reports](docs/reports.md).
 - **Has a dashboard.** Approvals, decisions, sessions and undo, rules,
   config, secrets, users and plugins, built into the binary. Single
   sign-on with any OpenID Connect provider, with viewer, approver and

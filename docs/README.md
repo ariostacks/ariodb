@@ -37,6 +37,7 @@ License.
 6. [Operations](operations.md): monitoring, backups and day-to-day running.
 7. [Troubleshooting](troubleshooting.md): what common errors mean.
 8. [CLI](cli.md): every command.
+9. [Compliance reports](reports.md): evidence packs for auditors.
 
 **Contributing?** Read in this order:
 
@@ -98,6 +99,9 @@ License.
 - [Dashboard](dashboard.md): approvals, decisions, sessions, rules, config
   and settings in the browser; roles, and single sign-on with OpenID
   Connect.
+- [Compliance reports](reports.md): report packs for DORA, SOC 2,
+  ISO/IEC 27001 and the EU AI Act, what they hold, and how an auditor
+  checks one.
 
 **Agents as tools**
 

@@ -120,6 +120,8 @@ naming them.
 | [`undo.rs`](../src/undo.rs) | `ariodb sessions` and `ariodb undo`: summarise sessions, plan the inverse of one session's changes, detect conflicts, and apply in one transaction. |
 | [`audit.rs`](../src/audit.rs) | The decisions log: the hash chain, retention, redaction, queries for the dashboard, `ariodb audit`, fixture export and the cursor audit-sink plugins read from. |
 | [`store.rs`](../src/store.rs) | ariodb's SQLite database, `ariodb.db`: approvals, dashboard users with their roles, and sessions (the decisions log lives in the same file). |
+| [`history.rs`](../src/history.rs) | What reports need that nothing else keeps: each config version in force (masked, recorded at start-up, on reload and on dashboard saves) and who applied each undo, both hash-chained and pruned with the decisions log. |
+| [`report.rs`](../src/report.rs) | `ariodb report` and the dashboard's download: reads the decisions log (checking every link in the period), approvals, journals, undo records and config history read-only, and writes the HTML report, CSV and JSON files and the manifest; the control mappings. |
 
 **Dashboard**
 
@@ -586,6 +588,8 @@ five-second busy timeout, so several processes can share it. Its tables:
 | `dashboard_sessions` | SHA-256 hashes of session tokens, with CSRF tokens, expiry, and how the person signed in (`password` or `sso`); for single sign-on, the provider's subject, the verified email and the groups | The dashboard |
 | `decisions` | The decisions log (see above) | `audit.rs` |
 | `plugin_cursors` | How far each audit-sink plugin has read | `plugins.rs` |
+| `config_versions` | Each config version in force, masked, with its SHA-256 and a link hash | `history.rs`, from `serve`, the config watcher and the dashboard |
+| `undo_records` | Who applied each undo, with a link hash | `history.rs`, from `ariodb undo` and the dashboard |
 
 The rest of the state directory is `journal.jsonl`, `secrets.json` and
 `master.key`.
@@ -709,6 +713,7 @@ MYSQL_IMAGE=mariadb:11.4 ./scripts/e2e-mysql-journal.sh
 ./scripts/e2e-plugins.sh               # the example plugin, and a broken one
 ./scripts/e2e-splunk.sh                # the Splunk exporter against a HEC stand-in: order, outages, restarts, bad tokens, ack, TLS
 ./scripts/e2e-sso.sh                   # single sign-on against Keycloak, roles, approver groups, links that need sign-in
+./scripts/e2e-report.sh                # compliance report packs: counts, manifest, masking, a tampered log
 ./scripts/sim-undo.sh                  # seeded random agent and human writes, then undo
 SIM_SEEDS="42 7" SIM_OPS=120 ./scripts/sim-undo.sh
 ```

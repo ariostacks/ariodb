@@ -84,7 +84,11 @@ pub async fn watch_config(state: Arc<State>) {
         last = now;
         match Config::load(&state.config_path) {
             Ok(config) => match state.replace_config(config) {
-                Ok(()) => println!("ariodb: reloaded {}", state.config_path.display()),
+                Ok(()) => {
+                    println!("ariodb: reloaded {}", state.config_path.display());
+                    let dir = std::path::PathBuf::from(&state.config().journal.dir);
+                    crate::history::record_config(&dir, &state.config_path, "reload");
+                }
                 Err(e) => eprintln!("ariodb: kept the previous config: {e}"),
             },
             Err(e) => eprintln!("ariodb: kept the previous config: {e}"),

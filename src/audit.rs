@@ -569,6 +569,43 @@ pub fn verify(dir: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
+/// Read the entries with ids from `first` to `last`, oldest first, and hand
+/// each to `f` with whether its own hash still matches it. Unlike `verify`
+/// this goes on past a break, so a report can list every one in a period;
+/// how entries link is left to the caller. `conn` may be read-only.
+pub fn walk(
+    conn: &Connection,
+    first: i64,
+    last: i64,
+    mut f: impl FnMut(Chained, bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT *, prev AS p, hash AS h FROM decisions WHERE id >= ?1 AND id <= ?2 ORDER BY id",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([first, last]).map_err(|e| e.to_string())?;
+    while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+        let decision = row_to_decision(r).map_err(|e| e.to_string())?;
+        let prev: String = r.get("p").map_err(|e| e.to_string())?;
+        let hash: String = r.get("h").map_err(|e| e.to_string())?;
+        let deciders: String = r.get("decided_by").map_err(|e| e.to_string())?;
+        let actual = hex::encode(Sha256::digest(
+            chain_text(decision.at_ms, &prev, &decision).as_bytes(),
+        ));
+        let intact = actual == hash && deciders == deciders_text(&decision.decided_by);
+        f(
+            Chained {
+                decision,
+                prev,
+                hash,
+            },
+            intact,
+        )?;
+    }
+    Ok(())
+}
+
 /// Delete entries older than the retention window.
 pub fn prune(dir: &Path, settings: &Settings) -> Result<usize, String> {
     if settings.retention_days == 0 {
