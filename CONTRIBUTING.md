@@ -63,10 +63,13 @@ runs (from different worktrees, say) do not collide.
 `tests/sim_undo.rs` does nothing under a plain `cargo test`; it runs only
 with the environment `scripts/sim-undo.sh` sets up.
 
-Continuous integration runs formatting, clippy, the unit and property tests
-on Linux and macOS, the dashboard build, and the end-to-end suites on Linux
-for every pull request; the single sign-on suite runs on a schedule. Run
-the suites that cover your change before you open a pull request:
+Continuous integration does not run on its own: every run waits until the
+maintainer approves it. An approved run checks formatting, clippy, the unit
+and property tests on Linux and the dashboard build. The end-to-end suites
+run only when the maintainer asks for them (the `full-ci` label on a pull
+request, or a manual run), macOS is tested when a release is built, and
+changes to documentation alone run nothing. So run the suites that cover
+your change yourself before you open a pull request, and say which you ran:
 anything touching the Postgres path needs `scripts/e2e.sh`, MySQL changes
 need both MySQL scripts against both images, and so on.
 
